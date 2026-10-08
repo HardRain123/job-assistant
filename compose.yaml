@@ -1,0 +1,185 @@
+name: job-assistant
+
+services:
+  volume-init:
+    image: alpine:3.22
+    user: "0:0"
+    command:
+      - /bin/sh
+      - -ec
+      - >-
+        chown -R 1000:1000 /data /attachments &&
+        chown -R 1000:1001 /evidence &&
+        chmod -R u+rwX,g+rwX,o-rwx /evidence &&
+        chown -R 1001:1001 /browser-profile &&
+        chown -R 10001:10001 /codex
+    volumes:
+      - sqlite_data:/data
+      - attachments:/attachments
+      - evidence:/evidence
+      - browser_profile:/browser-profile
+      - codex_home:/codex
+    restart: "no"
+
+  app:
+    # worker shares this network/UTS namespace. Keep Chromium's lock hostname
+    # stable across container recreation so it can recognize stale local locks.
+    hostname: job-assistant-local
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    init: true
+    depends_on:
+      volume-init:
+        condition: service_completed_successfully
+    environment:
+      HOST: 0.0.0.0
+      PORT: "3000"
+      DATA_DIR: /data
+      ATTACHMENTS_DIR: /attachments
+      WORKER_URL: http://127.0.0.1:3001
+      BRIDGE_URL: http://127.0.0.1:3002
+      INTERNAL_TOKEN_FILE: /run/secrets/internal_token
+      APP_KEY_FILE: /run/secrets/app_key
+      APP_PASSWORD_FILE: /run/secrets/app_password
+    secrets:
+      - internal_token
+      - app_key
+      - app_password
+    volumes:
+      - sqlite_data:/data
+      - attachments:/attachments
+      - evidence:/evidence
+    ports:
+      - "127.0.0.1:3000:3000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=64m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  worker:
+    # Read the app-owned resume files through the read-only attachments mount.
+    group_add: ["1000"]
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+      additional_contexts:
+        app_runtime: service:app
+    network_mode: service:app
+    depends_on:
+      volume-init:
+        condition: service_completed_successfully
+      app:
+        condition: service_started
+    environment:
+      WORKER_PORT: "3001"
+      APP_INTERNAL_URL: http://127.0.0.1:3000
+      BOSS_PROFILE_DIR: /home/pwuser/.cache/ms-playwright-profile
+      BOSS_VIEWER_ENABLED: "true"
+      DISPLAY: :99
+      XDG_CACHE_HOME: /tmp/.cache
+      XDG_CONFIG_HOME: /tmp/.config
+      ATTACHMENTS_DIR: /attachments
+      EVIDENCE_DIR: /evidence
+      VIEWER_URL: http://127.0.0.1:6080
+      INTERNAL_TOKEN_FILE: /run/secrets/internal_token
+    secrets:
+      - internal_token
+    volumes:
+      - browser_profile:/home/pwuser/.cache/ms-playwright-profile
+      - attachments:/attachments:ro
+      - evidence:/evidence
+    shm_size: 1gb
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=256m
+      # Chromium NSS initializes here even with a separate user-data directory.
+      - /home/pwuser/.pki:uid=1001,gid=1001,mode=0700,size=16m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=./deploy/seccomp/chromium.json
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3001/health').then(r=>r.json()).then(v=>process.exit(v.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  bridge:
+    profiles: [chatgpt]
+    build:
+      context: .
+      dockerfile: Dockerfile.bridge
+      args:
+        CODEX_VERSION: ${JOB_ASSISTANT_CODEX_VERSION:-0.156.1}
+    init: true
+    network_mode: service:app
+    depends_on:
+      volume-init:
+        condition: service_completed_successfully
+      app:
+        condition: service_started
+    environment:
+      BRIDGE_PORT: "3002"
+      CODEX_HOME: /var/lib/codex
+      INTERNAL_TOKEN_FILE: /run/secrets/internal_token
+    secrets:
+      - internal_token
+    volumes:
+      - codex_home:/var/lib/codex
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,size=64m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3002/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+secrets:
+  internal_token:
+    file: ./.secrets/internal_token
+  app_key:
+    file: ./.secrets/app_key
+  app_password:
+    file: ./.secrets/app_password
+
+volumes:
+  sqlite_data:
+  attachments:
+  evidence:
+  browser_profile:
+  codex_home:

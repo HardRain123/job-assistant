@@ -1,0 +1,23 @@
+FROM node:24-bookworm-slim AS runtime
+ARG CODEX_VERSION
+ARG NPM_REGISTRY=https://registry.npmjs.org
+WORKDIR /app
+ENV NODE_ENV=production \
+    COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
+    CODEX_HOME=/var/lib/codex \
+    SSL_CERT_FILE=/etc/ssl/certs/job-assistant-ca.pem
+# The slim image lacks the OS CA package. Use Node's bundled public roots for
+# Codex's native TLS client; certificate verification remains enabled.
+RUN mkdir -p /etc/ssl/certs && node -e 'require("fs").writeFileSync(process.env.SSL_CERT_FILE, require("tls").rootCertificates.join("\n"))'
+RUN test -n "$CODEX_VERSION" \
+    && npm install --global --omit=dev pnpm@11.19.0 "@openai/codex@${CODEX_VERSION}" --registry="$NPM_REGISTRY" \
+    && useradd --create-home --uid 10001 --shell /usr/sbin/nologin app \
+    && mkdir -p /var/lib/codex \
+    && chown -R app:app /app /var/lib/codex
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.json ./
+COPY packages ./packages
+RUN --mount=type=cache,id=job-assistant-pnpm,target=/pnpm/store,sharing=locked NODE_USE_ENV_PROXY=1 pnpm install --frozen-lockfile --store-dir /pnpm/store --registry="$NPM_REGISTRY"
+COPY --chown=app:app apps ./apps
+USER app
+EXPOSE 3002
+CMD ["node_modules/.bin/tsx", "apps/codex-bridge/src/index.ts"]

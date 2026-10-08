@@ -1,0 +1,28 @@
+FROM job-assistant-app:latest
+
+USER root
+WORKDIR /app
+ENV NODE_ENV=production \
+    CODEX_HOME=/var/lib/codex \
+    PATH=/opt/codex/bin:$PATH \
+    SSL_CERT_FILE=/etc/ssl/certs/job-assistant-ca.pem
+# Public trust roots already bundled with Node; no download or TLS bypass.
+RUN mkdir -p /etc/ssl/certs && node -e 'require("fs").writeFileSync(process.env.SSL_CERT_FILE, require("tls").rootCertificates.join("\n"))'
+
+# Keep large archives out of the main build context. Docker copies only these
+# explicitly named files, then checks against pinned official npm digests.
+COPY --from=codex_offline codex-0.156.1.tgz /tmp/codex-offline/codex-0.156.1.tgz
+COPY --from=codex_offline codex-0.156.1-linux-x64.tgz /tmp/codex-offline/codex-0.156.1-linux-x64.tgz
+RUN node -e 'const fs=require("fs"), crypto=require("crypto"), path=require("path"); const dir="/tmp/codex-offline"; const expected={"codex-0.156.1.tgz":"sha512-nI1iVl/n2SO2lSvlwEsJx63zdSI4C4Me2gR7AG0OWMJiGSakz2tY2hx43E39Zq5aEoeB5bZjJXzp5Sqhog6vyA==","codex-0.156.1-linux-x64.tgz":"sha512-2ePo0wgOcnONKsuzp8vBjOmNY+IdsKaouaDDIdiKq9HOWNuV/GI22OeXft2A/1GaoL71ictO0/pLAsCEnQ6wew=="}; for (const [name, integrity] of Object.entries(expected)) { const actual="sha512-"+crypto.createHash("sha512").update(fs.readFileSync(path.join(dir,name))).digest("base64"); if (actual!==integrity) throw Error("Codex package integrity mismatch: "+name); }' \
+    && mkdir -p /opt/codex/node_modules/@openai/codex /opt/codex/node_modules/@openai/codex-linux-x64 /opt/codex/bin /var/lib/codex \
+    && tar -xzf /tmp/codex-offline/codex-0.156.1.tgz -C /opt/codex/node_modules/@openai/codex --strip-components=1 \
+    && tar -xzf /tmp/codex-offline/codex-0.156.1-linux-x64.tgz -C /opt/codex/node_modules/@openai/codex-linux-x64 --strip-components=1 \
+    && ln -s /opt/codex/node_modules/@openai/codex/bin/codex.js /opt/codex/bin/codex \
+    && useradd --create-home --uid 10001 --shell /usr/sbin/nologin app \
+    && chown -R app:app /var/lib/codex \
+    && rm -rf /tmp/codex-offline \
+    && codex --version
+
+USER app
+EXPOSE 3002
+CMD ["node_modules/.bin/tsx", "apps/codex-bridge/src/index.ts"]

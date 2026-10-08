@@ -1,0 +1,26 @@
+# Keep this tag aligned with the pinned playwright npm package (1.56.1).
+FROM mcr.microsoft.com/playwright:v1.56.1-noble AS runtime
+# Compose supplies the already-built app as this context, sharing its locked dependencies.
+COPY --from=app_runtime /usr/local/bin/node /usr/local/bin/node
+USER root
+WORKDIR /app
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
+    DISPLAY=:99 \
+    HOME=/home/pwuser
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends nginx-light novnc websockify x11vnc x11-utils xvfb tini \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /home/pwuser/.cache/ms-playwright-profile /tmp/nginx/client_body /tmp/nginx/proxy /tmp/nginx/fastcgi /tmp/nginx/uwsgi /tmp/nginx/scgi \
+    && chown -R pwuser:pwuser /app /home/pwuser /tmp/nginx
+COPY --from=app_runtime --chown=pwuser:pwuser /app/node_modules ./node_modules
+COPY --chown=pwuser:pwuser package.json ./package.json
+COPY --chown=pwuser:pwuser packages ./packages
+COPY --chown=pwuser:pwuser apps ./apps
+COPY --chown=pwuser:pwuser deploy/worker/entrypoint.sh /usr/local/bin/job-assistant-worker
+COPY deploy/worker/nginx.conf /etc/nginx/nginx.conf
+RUN chmod 0555 /usr/local/bin/job-assistant-worker \
+    && nginx -t
+USER pwuser
+EXPOSE 3001
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/job-assistant-worker"]

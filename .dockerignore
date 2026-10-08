@@ -1,0 +1,16 @@
+.git
+.github
+.agents
+.codex
+.secrets
+backups
+node_modules
+.pnpm-store
+dist
+data
+*.sqlite*
+*.log
+test-results
+coverage
+*.part
+README.md

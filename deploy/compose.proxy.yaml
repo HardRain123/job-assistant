@@ -1,0 +1,7 @@
+# Optional outbound proxy for ChatGPT only. Never forwards local service traffic.
+services:
+  bridge:
+    environment:
+      HTTP_PROXY: ${JOB_ASSISTANT_PROXY:?Set JOB_ASSISTANT_PROXY to a reachable HTTP proxy}
+      HTTPS_PROXY: ${JOB_ASSISTANT_PROXY:?Set JOB_ASSISTANT_PROXY to a reachable HTTP proxy}
+      NO_PROXY: localhost,127.0.0.1,::1

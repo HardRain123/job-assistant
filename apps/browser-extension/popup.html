@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>求职助手</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <p class="eyebrow">JOB ASSISTANT</p>
+          <h1>职位导入</h1>
+        </div>
+        <span id="connectionBadge" class="badge">正在检查</span>
+      </header>
+      <section id="pairPanel" class="panel hidden">
+        <h2>连接本地工作台</h2>
+        <p>在本地工作台生成配对码后，粘贴到这里。配对码仅可使用一次。</p>
+        <form id="pairForm">
+          <label for="pairCode">32 位配对码</label
+          ><input
+            id="pairCode"
+            name="pairCode"
+            autocomplete="off"
+            spellcheck="false"
+            maxlength="32"
+            placeholder="例如：a1b2…"
+          /><button type="submit">连接工作台</button>
+        </form>
+      </section>
+      <section id="importPanel" class="panel hidden">
+        <h2>自动收集</h2>
+        <p>本地工作台启动的任务会在扩展专用页面中依次读取公开职位；不会发送消息或投递简历。</p>
+        <p id="automationStatus" class="automation-status" aria-live="polite"></p>
+        <button id="checkAutomationButton" type="button">检查自动任务</button>
+      </section>
+      <section id="manualImportPanel" class="panel hidden">
+        <h2>从当前页面读取</h2>
+        <p>只读取已渲染的公开职位信息；不会读取聊天、Cookie 或页面请求数据。</p>
+        <button id="readButton" type="button">读取当前职位</button>
+        <div id="preview" class="preview hidden" aria-live="polite"></div>
+        <button id="importButton" class="secondary hidden" type="button">
+          导入预览中的职位
+        </button>
+      </section>
+      <p id="notice" class="notice" role="status" aria-live="polite"></p>
+      <footer>
+        <a href="http://127.0.0.1:3000/" target="_blank" rel="noreferrer"
+          >打开本地工作台</a
+        ><button id="openBossButton" class="link-button" type="button">
+          打开 BOSS 直聘</button
+        ><button id="retryButton" class="link-button hidden" type="button">
+          重试连接</button
+        ><button id="disconnectButton" class="link-button hidden" type="button">
+          断开连接
+        </button>
+      </footer>
+    </main>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

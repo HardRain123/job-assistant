@@ -1,0 +1,7 @@
+services:
+  bridge:
+    image: job-assistant-bridge:latest
+    build:
+      dockerfile: Dockerfile.bridge.offline
+      additional_contexts:
+        codex_offline: ./data/offline
