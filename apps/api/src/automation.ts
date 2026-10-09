@@ -43,7 +43,7 @@ interface Run {
   scored: number;
   failed: number;
   unreadableJobs?: { url: string; reason: string }[];
-  fieldReadings?: { url: string; reading: z.infer<typeof fieldReadingSchema>; message: string }[];
+  fieldReadings?: { url: string; reading: z.infer<typeof fieldReadingSchema>; message: string; evidence?: z.infer<typeof pageEvidenceSchema> }[];
   consecutiveUnreadable?: number;
   eligible: number;
   review: number;
@@ -144,6 +144,18 @@ function diagnosticMessage(diagnostic: z.infer<typeof diagnosticSchema>) {
     : "";
   return `诊断：${diagnosticStages[diagnostic.stage]}；${diagnosticCodes[diagnostic.code]}${tabState}。`;
 }
+const pageEvidenceSchema = z.object({
+  title: z.string().max(160),
+  company: z.string().max(160),
+  descriptionPresent: z.boolean(),
+  clientLabelSeen: z.boolean(),
+  clientNames: z.array(z.string().max(160)).max(3),
+  headerLines: z.array(z.string().max(160)).max(20),
+  companySections: z.array(z.object({
+    lines: z.array(z.string().max(160)).max(16),
+    links: z.array(z.object({ text: z.string().max(160), path: z.string().max(200).regex(/^\/gongsi\/[a-zA-Z0-9_-]+\.html$/) }).strict()).max(8),
+  }).strict()).max(3),
+}).strict();
 const fieldReadingSchema = z.object({
   route: z.enum(["split", "standalone", "supplement"]),
   merge: z.enum(["not-needed", "merged", "conflict", "title-mismatch", "company-mismatch", "detail-unavailable", "standalone-selected"]),
@@ -185,6 +197,7 @@ const resultSchema = z
       .optional(),
     diagnostic: diagnosticSchema.optional(),
     fieldReading: fieldReadingSchema.optional(),
+    pageEvidence: pageEvidenceSchema.optional(),
     detailContext: z.object({
       jobUrl: z.string().max(2000),
       title: z.string().trim().min(1).max(500),
@@ -334,6 +347,8 @@ export function createAutomation(o: Options) {
       cmd.leaseToken !== b.leaseToken
     )
       throw new Error("任务已暂停或命令租约已失效");
+    if (b.pageEvidence && (cmd.kind !== "detail" || b.outcome !== "ok" || !b.fieldReading))
+      throw new Error("页面字段证据必须绑定成功的岗位详情诊断");
     if (b.outcome !== "ok") {
       const message = reasons[b.reason ?? "page-unrecognized"]!;
       if (cmd.kind === "detail" && b.outcome === "error" && b.reason === "page-unrecognized" &&
@@ -394,7 +409,7 @@ export function createAutomation(o: Options) {
         }
         const imported = o.importJobs({ jobs: b.jobs }, true);
         if (b.fieldReading) {
-          (r.fieldReadings ??= []).push({ url: cmd.url, reading: b.fieldReading, message: fieldReadingMessage(b.fieldReading) });
+          (r.fieldReadings ??= []).push({ url: cmd.url, reading: b.fieldReading, message: fieldReadingMessage(b.fieldReading), ...(b.pageEvidence ? { evidence: b.pageEvidence } : {}) });
           r.fieldReadings = r.fieldReadings.slice(-50);
         }
         r.jobIds = [...new Set([...r.jobIds, ...imported.jobIds])];

@@ -173,6 +173,7 @@ test("同页缺字段时核验独立详情，保留完整雇主记录，拒绝�
   const searchUrl = "https://www.zhipin.com/web/geek/jobs?query=AI&city=101020100";
   const base = { url, title: "AI工程师", company: "示例公司", description: "企业 AI 应用开发", detail: true, location: "上海", salaryText: "", industry: "" };
   const detail = { ...base, company: "示例公司有限公司", salaryText: "25-35K", industry: "计算机软件" };
+  const evidence = { title: base.title, company: base.company, descriptionPresent: true, clientLabelSeen: false, clientNames: [], headerLines: ["25-35K"], companySections: [] };
   const reports: Array<Record<string, any>> = [];
   try {
     globalThis.setTimeout = ((fn: () => void) => { queueMicrotask(fn); return 1 as unknown as ReturnType<typeof setTimeout>; }) as typeof setTimeout;
@@ -180,7 +181,7 @@ test("同页缺字段时核验独立详情，保留完整雇主记录，拒绝�
       if (path.endsWith("/result")) { reports.push(JSON.parse(String(options.body))); return response({ ok: true }); }
       return response({ run: { id: "r", state: "running" } });
     }) as typeof fetch;
-    const run = async (inlineJob: typeof base, standalone: typeof detail, page = {}) => {
+    const run = async (inlineJob: typeof base, standalone: typeof detail, page = {}, extractedUrl = url) => {
       reports.length = 0;
       scriptNames = [];
       store.jobAssistantAutomationTabs = { runId: "r", searchTabId: 7 };
@@ -190,7 +191,7 @@ test("同页缺字段时核验独立详情，保留完整雇主记录，拒绝�
         inspectSplitSearch: { recognized: true, links: [url] },
         clickAndReadSplitDetail: { ok: true, job: inlineJob, detailContext: { jobUrl: url, title: inlineJob.title, company: inlineJob.company } },
         inspectDetail: { recognized: true, ...page },
-        extractJobs: { jobs: standalone ? [standalone] : [], fieldReading: { salary: "encoded", industry: "section-missing", location: "readable", private: "should-not-leak" } },
+        extractJobs: { pageUrl: extractedUrl, pageEvidence: evidence, jobs: standalone ? [standalone] : [], fieldReading: { salary: "encoded", industry: "section-missing", location: "readable", private: "should-not-leak" } },
       };
       await worker.execute({ ...command, kind: "detail", url, searchUrl }, "token");
       assert.equal(reports.length, 1);
@@ -207,6 +208,9 @@ test("同页缺字段时核验独立详情，保留完整雇主记录，拒绝�
     assert.equal(scriptNames.filter((name) => name === "extractJobs").length, 1);
     assert.deepEqual(supplemented.fieldReading, { route: "supplement", merge: "merged", salary: "encoded", industry: "section-missing", location: "readable", finalSalary: true, finalLocation: true, finalIndustry: true });
     assert.ok(!JSON.stringify(supplemented).includes("should-not-leak"));
+    assert.deepEqual(supplemented.pageEvidence, evidence);
+    const wrongEvidence = await run(base, detail, {}, "https://www.zhipin.com/job_detail/other.html");
+    assert.equal(wrongEvidence.pageEvidence, undefined);
     const conflict = await run({ ...base, salaryText: "20-30K", industry: "保险", location: "" }, detail);
     assert.equal(conflict.outcome, "ok");
     assert.equal(conflict.jobs[0].salaryText, "");
@@ -227,9 +231,11 @@ test("同页缺字段时核验独立详情，保留完整雇主记录，拒绝�
     const missing = await run(base, null as unknown as typeof detail);
     assert.equal(missing.outcome, "ok");
     assert.equal(missing.jobs[0].salaryText ?? "", "");
+    assert.deepEqual(missing.pageEvidence, evidence);
     const wrongUrl = await run(base, { ...detail, url: "https://www.zhipin.com/job_detail/b.html" });
     assert.equal(wrongUrl.outcome, "error");
     assert.equal(wrongUrl.jobs, undefined);
+    assert.equal(wrongUrl.pageEvidence, undefined);
     const login = await run(base, detail, { login: true });
     assert.equal(login.outcome, "blocked");
   } finally { globalThis.fetch = originalFetch; globalThis.setTimeout = originalTimeout; scriptResults = null; }

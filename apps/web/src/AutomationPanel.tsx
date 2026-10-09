@@ -20,7 +20,11 @@ type Run = {
   scored: number;
   failed: number;
   unreadableJobs?: { url: string; reason: string }[];
-  fieldReadings?: { url: string; message: string }[];
+  fieldReadings?: { url: string; message: string; evidence?: {
+    title: string; company: string; descriptionPresent: boolean; clientLabelSeen: boolean;
+    clientNames: string[]; headerLines: string[];
+    companySections: { lines: string[]; links: { text: string; path: string }[] }[];
+  } }[];
   eligible: number;
   review: number;
   skipped: number;
@@ -156,7 +160,19 @@ export function AutomationPanel({ mutate, onPolicy, onConnect }: { mutate: Mutat
       <p>已发现 {run.discovered} 个，已浏览 {run.visited} 个，已导入 {run.imported} / {run.config.maxJobs} 个；评分已处理 {run.scored + run.failed} / {run.imported} 个（成功 {run.scored} 个）。符合门槛 {run.eligible} 个，待复核 {run.review} 个，跳过 {run.skipped} 个。</p>
       {run.failed > 0 && <p className="muted">有 {run.failed} 个岗位未能处理，系统已继续处理其余岗位。</p>}
       {!!run.unreadableJobs?.length && <details><summary>{run.unreadableJobs.length} 个岗位信息不完整，未导入</summary><ul>{run.unreadableJobs.map((item) => <li key={item.url}><a href={item.url} target="_blank" rel="noreferrer">查看原岗位</a>：{item.reason}</li>)}</ul></details>}
-      {!!run.fieldReadings?.length && <details><summary>字段读取情况（{run.fieldReadings.length} 条）</summary><ul>{run.fieldReadings.map((item) => <li key={item.url}><a href={item.url} target="_blank" rel="noreferrer">查看原岗位</a>：{item.message}</li>)}</ul></details>}
+      {!!run.fieldReadings?.length && <details><summary>字段读取情况（{run.fieldReadings.length} 条）</summary><ul>{run.fieldReadings.map((item) => <li key={item.url}>
+        <a href={item.url} target="_blank" rel="noreferrer">查看原岗位</a>：{item.message}
+        {item.evidence && <details><summary>页面字段证据</summary>
+          <p className="muted">仅为该岗位头部和公司信息区的可见文字，用于检查读取问题；不代表字段已经核实，不参与评分。</p>
+          <p>标题：{item.evidence.title || "未识别"}；公司：{item.evidence.company || "未识别"}；正文：{item.evidence.descriptionPresent ? "已读取" : "未读取"}</p>
+          <p>客户公司标签：{item.evidence.clientLabelSeen ? "存在" : "未识别"}；客户名称：{item.evidence.clientNames.join("、") || "未识别"}</p>
+          <p>岗位头部：{item.evidence.headerLines.join(" / ") || "未识别"}</p>
+          {item.evidence.companySections.map((section, index) => <div key={index}>
+            <p>公司区域 {index + 1}：{section.lines.join(" / ")}</p>
+            <p>公司链接：{section.links.map((link) => `${link.text || "无文字"} (${link.path})`).join(" / ") || "未识别"}</p>
+          </div>)}
+        </details>}
+      </li>)}</ul></details>}
       <p className="muted">暂停或取消会阻止后续操作；当前正在读取的一个岗位可能会先完成。</p>
       <div className="button-row">
         {run.state === "running" && <><button className="quiet" disabled={busy} onClick={() => void control("pause")}>暂停</button><button className="danger" disabled={busy} onClick={() => void control("cancel")}>取消</button></>}

@@ -85,6 +85,7 @@ export function extractJobs() {
   };
   const isDetail = /\/job_detail\/[^/?#]+\.html/i.test(location.pathname);
   if (isDetail) {
+    result.pageUrl = location.href;
     const title = textFrom(
       document,
       [
@@ -160,6 +161,24 @@ export function extractJobs() {
       } catch { return ""; }
     }));
     const displayCompany = unique(companySections.map(linkedCompanyName));
+    // Bounded public field evidence helps diagnose real layouts without reading
+    // page HTML, hidden state, chat history or unrelated page text.
+    const evidenceSections = companySections.map(({ lines, root }) => ({
+      lines: lines.slice(0, 16).map((line) => clean(line, 160)),
+      links: [...root.querySelectorAll("a[href]")].filter(visible).flatMap((link) => {
+        try {
+          const url = new URL(link.href, location.href);
+          if (url.origin !== location.origin || url.username || url.password || !/^\/gongsi\/[a-zA-Z0-9_-]+\.html$/.test(url.pathname)) return [];
+          return [{ text: renderedText(link, 160), path: url.pathname }];
+        } catch { return []; }
+      }).slice(0, 8),
+    }));
+    result.pageEvidence = {
+      title, company, descriptionPresent: Boolean(description), clientLabelSeen,
+      clientNames: [...clientNames].slice(0, 3),
+      headerLines: [...new Set(headers.flatMap(linesOf))].slice(0, 20).map((line) => clean(line, 160)),
+      companySections: [...new Map(evidenceSections.map((section) => [JSON.stringify(section), section])).values()].slice(0, 3),
+    };
     const companyAliases = !clientLabelSeen && !/某|匿名|保密/.test(company) && displayCompany && displayCompany !== company ? [displayCompany] : [];
     let matchingCompanySection = false;
     if (!clientLabelSeen && !/某|匿名|保密/.test(company)) {

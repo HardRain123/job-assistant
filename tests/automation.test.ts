@@ -96,6 +96,37 @@ test("字段诊断仅接受固定状态、绑定岗位回执，持久化且重�
   } finally { await f.close(); }
 });
 
+test("页面字段证据严格限量并绑定详情回执，重复及重启不丢失或扩大记录", async () => {
+  const f = await fixture();
+  const reading = { route: "supplement", merge: "standalone-selected", salary: "readable", location: "missing", industry: "company-mismatch", finalSalary: true, finalLocation: true, finalIndustry: false };
+  const evidence = { title: "工程师", company: "公司", descriptionPresent: true, clientLabelSeen: false, clientNames: [], headerLines: ["工程师", "25-35K"], companySections: [{ lines: ["公司基本信息", "展示名"], links: [{ text: "展示名", path: "/gongsi/example.html" }] }] };
+  try {
+    await f.start({ maxJobs: 1 });
+    const search = await f.claim();
+    assert.equal((await f.result(search, { links: [url("a")], fieldReading: reading, pageEvidence: evidence })).statusCode, 400);
+    await f.result(search, { links: [url("a")], hasNext: false });
+    const detail = await f.claim();
+    for (const bad of [
+      { ...evidence, rawHtml: "private" },
+      { ...evidence, headerLines: Array(21).fill("line") },
+      { ...evidence, company: "x".repeat(161) },
+      { ...evidence, companySections: [{ lines: [], links: [{ text: "bad", path: "https://evil.example" }] }] },
+      { ...evidence, companySections: [{ lines: [], links: [{ text: "bad", path: "/gongsi/example.html?token=secret" }] }] },
+    ]) assert.equal((await f.result(detail, { jobs: [job("a")], fieldReading: reading, pageEvidence: bad })).statusCode, 400);
+    assert.equal((await f.result(detail, { jobs: [job("a")], pageEvidence: evidence })).statusCode, 400);
+    assert.equal((await f.result(detail, { jobs: [job("b")], fieldReading: reading, pageEvidence: evidence })).statusCode, 400);
+    assert.equal((await f.state()).fieldReadings.length, 0);
+    const payload = { jobs: [job("a")], fieldReading: reading, pageEvidence: evidence };
+    assert.equal((await f.result(detail, payload)).statusCode, 200);
+    assert.equal((await f.result(detail, payload)).statusCode, 200);
+    await f.restart();
+    const records = (await f.state()).fieldReadings;
+    assert.equal(records.length, 1);
+    assert.deepEqual(records[0].evidence, evidence);
+    assert.ok(!JSON.stringify(f.store.jobs()).includes("展示名"));
+  } finally { await f.close(); }
+});
+
 test("岗位上限与自动评分统计覆盖可投、复核、跳过和不可用，错误不泄露配置", async () => {
   const decisions = ["eligible", "review", "skip"];
   const f = await fixture(async () => { const decision = decisions.shift(); if (!decision) throw new Error("private-provider-secret"); return { decision } as Assessment; });

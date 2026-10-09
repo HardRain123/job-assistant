@@ -2,7 +2,7 @@ import { extractJobs } from "./extract.mjs";
 import { inspectSplitSearch, clickAndReadSplitDetail } from "./split-page.mjs";
 
 const API_BASE = "http://127.0.0.1:3000";
-const VERSION = "0.2.14";
+const VERSION = "0.2.15";
 const STATE_KEY = "jobAssistantAutomationTabs";
 const DIAGNOSTIC_KEY = "jobAssistantAutomationDiagnostic";
 const ALARM = "job-assistant-automation-poll";
@@ -300,6 +300,7 @@ async function submitResult(tokenValue, command, payload) {
 export async function execute(command, tokenValue) {
   let stage = "status-check";
   let inlineFallback = null;
+  let pageEvidence;
   const fieldReading = { route: "standalone", merge: "not-needed", salary: "unchecked", location: "unchecked", industry: "unchecked" };
   const mark = async (value, status = "working", reason = "") => {
     if (["status-check", "opening-tab", "navigating", "waiting-page", "reading-page", "advancing-page", "reporting"].includes(value)) stage = value;
@@ -307,6 +308,7 @@ export async function execute(command, tokenValue) {
   };
   const report = (tokenValue, command, payload) => submitResult(tokenValue, command, {
     ...payload,
+    ...(command.kind === "detail" && payload.outcome === "ok" && pageEvidence ? { pageEvidence } : {}),
     ...(command.kind === "detail" && payload.outcome === "ok" ? { fieldReading: {
       ...fieldReading,
       finalSalary: Boolean(payload.jobs?.[0]?.salaryText),
@@ -408,6 +410,9 @@ export async function execute(command, tokenValue) {
       const currentUrl = await actualUrl(tabId);
       if (page?.login || page?.challenge) return report(tokenValue, command, { outcome: "blocked", url: currentUrl || command.url, reason: page.login ? "login-required" : "verification-required" });
       const [result] = await chrome.scripting.executeScript({ target: { tabId }, world: "ISOLATED", func: extractJobs });
+      // Only attach evidence from the exact commanded detail document. It is
+      // separate from the job and must never become matching input or a fact.
+      if (matchesIntendedUrl(currentUrl, command.url, "detail") && matchesIntendedUrl(result?.result?.pageUrl, command.url, "detail")) pageEvidence = result?.result?.pageEvidence;
       for (const [key, allowed] of Object.entries({
         salary: ["readable", "encoded", "unrecognized", "missing"],
         location: ["readable", "missing"],

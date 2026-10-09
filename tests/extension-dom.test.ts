@@ -264,6 +264,23 @@ test("公司名称仅去除明确标签前缀，保留普通名称主体", () =>
   }
 });
 
+test("字段证据限定公开头部和公司区域，移除外链、查询参数与隐藏内容", () => {
+  const layout = screenshotLayout();
+  const publicLink = node("示例智造"); publicLink.href = "https://www.zhipin.com/gongsi/example.html?tracking=PRIVATE_QUERY#fragment";
+  const externalLink = node("外部链接"); externalLink.href = "https://evil.example/gongsi/example.html";
+  const hiddenLink = node("隐藏公司", true); hiddenLink.href = "https://www.zhipin.com/gongsi/hidden.html";
+  const section = node("公司基本信息\n示例智造\n100-499人\n互联网\n查看全部职位", false, { "a[href]": [publicLink, externalLink, hiddenLink] });
+  layout.heading.parentElement = section;
+  const result = run(layout.document);
+  assert.equal(result.pageUrl, "https://www.zhipin.com/job_detail/example.html");
+  assert.equal(result.pageEvidence.descriptionPresent, true);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.pageEvidence.companySections[0].links)), [{ text: "示例智造", path: "/gongsi/example.html" }]);
+  const evidence = JSON.stringify(result.pageEvidence);
+  for (const value of ["PRIVATE_QUERY", "HIDDEN_PRIVATE_CONTENT", "隐藏公司", "evil.example", "fragment"]) assert.ok(!evidence.includes(value));
+  section.innerText = "公司基本信息\n" + Array.from({ length: 25 }, (_, i) => `行${i}`).join("\n");
+  assert.equal(run(layout.document).pageEvidence.companySections[0].lines.length, 16);
+});
+
 test("猎头隐藏头部不会遮蔽可见客户公司或泄漏中介行业", () => {
   const client = node("客户公司：上海某大型公司");
   const banner = node("公开职位头部", false, { "p, span, a, div": [client] });

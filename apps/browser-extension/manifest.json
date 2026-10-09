@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "求职助手 · BOSS 职位导入",
-  "version": "0.2.14",
+  "version": "0.2.15",
   "minimum_chrome_version": "120",
   "description": "从 BOSS 直聘公开职位页面导入职位，并在本地工作台启动时协助收集。",
   "action": { "default_title": "导入职位", "default_popup": "popup.html" },
