@@ -37,6 +37,7 @@ import { assessJob } from "../../../packages/matching/src/index.ts";
 import { decrypt, encrypt, equal } from "./security.ts";
 import { createExtensionAccess } from "./extension.ts";
 import { createAutomation } from "./automation.ts";
+import { attachmentManifest, registerExtensionApplication } from "./extension-application.ts";
 import {
   policySchema,
   providerSchema,
@@ -569,7 +570,7 @@ export async function createApp(o: AppOptions) {
       }))
       .sort((a, b) => b.similarity - a.similarity);
   });
-  function draft(ids: string[]): Application[] {
+  function draft(ids: string[], manualReviewedId?: string): Application[] {
     const r = resume();
     if (!r) throw new Error("请先导入简历");
     const t = template();
@@ -581,7 +582,14 @@ export async function createApp(o: AppOptions) {
       if (o.store.applications().some((a) => a.jobId === id))
         throw new Error("该岗位已有投递记录");
       const a = assessment(j);
-      if (a?.decision !== "eligible")
+      const manualReviewAllowed =
+        id === manualReviewedId &&
+        a?.decision === "review" &&
+        a.score !== null &&
+        a.score >= policy().autoThreshold &&
+        a.gates.length > 0 &&
+        a.gates.every((gate) => gate.status === "pass");
+      if (a?.decision !== "eligible" && !manualReviewAllowed)
         throw new Error("岗位尚未达到自动投递要求，请先完成匹配评估");
       const messages = renderTemplate(t, {
         company: j.company,
@@ -639,6 +647,17 @@ export async function createApp(o: AppOptions) {
       };
     });
   }
+  registerExtensionApplication(app, {
+    store: o.store,
+    attachmentsDir: o.attachmentsDir,
+    status: extension.status,
+    draft,
+    assessment,
+    policy,
+    configurationKey: () =>
+      fingerprint({ resume: resume(), template: template(), policy: policy(),
+        attachment: attachmentManifest(o.attachmentsDir, resume()?.attachmentName ?? null) }),
+  });
   app.post("/api/batches/preview", (req) => {
     const b = z
       .object({ jobIds: z.array(z.string()).min(1).max(10) })

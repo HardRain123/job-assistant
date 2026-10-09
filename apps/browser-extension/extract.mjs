@@ -1,5 +1,11 @@
 /** Standalone DOM extractor: safe to pass to chrome.scripting.executeScript. */
-export function extractJobs() {
+export function extractJobs(options) {
+  // Reuse this reader in the isolated world for the last pre-click check.
+  if (options?.readerKey && /^__jobAssistantReader[a-f0-9]{32}$/.test(options.readerKey) &&
+    location.origin === "https://www.zhipin.com" && /^\/job_detail\/[a-zA-Z0-9_-]+\.html$/.test(location.pathname)) {
+    globalThis[options.readerKey] = extractJobs;
+    return { registered: true };
+  }
   const MAX_JOBS = 30;
   const clean = (value, max = 3000) =>
     String(value || "")

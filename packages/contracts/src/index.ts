@@ -125,6 +125,8 @@ export interface ApplicationAction {
 }
 export interface Application {
   id: string;
+  executor?: "worker" | "extension";
+  stopReason?: string;
   batchId: string;
   jobId: string;
   job: Job;

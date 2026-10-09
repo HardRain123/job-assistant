@@ -6,6 +6,7 @@ type ExtensionStatus = {
   lastSeen: string | null;
   lastImport: string | null;
   importedCount: number;
+  version?: string | null;
 };
 
 type PairCode = {
@@ -82,7 +83,8 @@ export function ExtensionPanel({ mutate }: { mutate: Mutate }) {
           </button>
         </div>
         <p>
-          扩展用于“自动找岗位”：在你已登录的 BOSS 职位列表中读取岗位和完整职位描述，导入本地工作台后按匹配策略评分。手动导入可见岗位仍可使用。它不会读取其他网站，也不会发送消息、投递或上传简历。
+          扩展在已登录的 BOSS
+          浏览器中自动采集岗位并导入本地评分。在“岗位库”选择一个岗位并确认预览后，可启动单岗位投递验证：核对会话，先发送话术，再发送简历，结果不明确时暂停。
         </p>
         <ol className="steps">
           <li>在 Chrome 或 Edge 的“扩展程序”页面开启开发者模式。</li>
@@ -91,8 +93,8 @@ export function ExtensionPanel({ mutate }: { mutate: Mutate }) {
             文件夹。
           </li>
           <li>
-            更新扩展后，请在扩展程序页面点击“重新加载”。在扩展弹窗输入下面生成的一次性配对码，然后打开 BOSS
-            职位列表页；配对后可关闭扩展弹窗。
+            更新扩展后，请在扩展程序页面点击“重新加载”。在扩展弹窗输入下面生成的一次性配对码，然后打开
+            BOSS 职位列表页；配对后可关闭扩展弹窗。
           </li>
         </ol>
       </section>
@@ -113,7 +115,8 @@ export function ExtensionPanel({ mutate }: { mutate: Mutate }) {
           {status?.paired ? "已配对" : "尚未配对"}；最近上报：
           {dateTime(status?.lastSeen ?? null)}；最近导入：
           {dateTime(status?.lastImport ?? null)}；已导入{" "}
-          {status?.importedCount ?? 0} 个岗位。
+          {status?.importedCount ?? 0} 个岗位。 扩展版本：
+          {status?.version ?? "尚未上报"}。
         </p>
         <div className="button-row">
           <button onClick={() => void createCode()}>生成一次性配对码</button>

@@ -25,6 +25,7 @@ interface Resume {
 }
 interface Job {
   id: string;
+  contentHash: string;
   company: string;
   title: string;
   location: string | null;
@@ -100,6 +101,7 @@ interface Policy {
 }
 interface Application {
   id: string;
+  stopReason?: string;
   job: Job;
   status: string;
   frozenMessages: string[];
@@ -468,7 +470,9 @@ function Home({
   return (
     <div className="grid home">
       <Card title="自动找岗位">
-        <p>让已配对的浏览器扩展逐个读取 BOSS 职位描述，导入本地并按你的策略评分。</p>
+        <p>
+          让已配对的浏览器扩展逐个读取 BOSS 职位描述，导入本地并按你的策略评分。
+        </p>
         <p className="muted">不会自动发送消息、投递或上传简历。</p>
         <button onClick={() => select("自动找岗位")}>开始自动找岗位</button>
       </Card>
@@ -1030,7 +1034,14 @@ function Jobs({
     [preview, setPreview] = useState<{
       previewId: string;
       applications: Application[];
-    } | null>(null);
+    } | null>(null),
+    [singlePreview, setSinglePreview] = useState<{
+      application: Application;
+      configurationKey: string;
+      expectedContentHash: string;
+      acceptReview: boolean;
+    } | null>(null),
+    [startingSingle, setStartingSingle] = useState(false);
   const jobs = results ?? s.jobs;
   const search = async (e: FormEvent) => {
     e.preventDefault();
@@ -1045,6 +1056,25 @@ function Jobs({
       { jobIds: selected },
     );
     if (r) setPreview(r);
+  };
+  const makeSinglePreview = async () => {
+    const job = s.jobs.find((item) => item.id === selected[0]);
+    if (selected.length !== 1 || !job) return;
+    const acceptReview = job.assessment?.decision === "review";
+    const r = await mutate<{
+      application: Application;
+      configurationKey: string;
+    }>("/api/extension-application/preview", "POST", {
+      jobId: job.id,
+      expectedContentHash: job.contentHash,
+      acceptReview,
+    });
+    if (r)
+      setSinglePreview({
+        ...r,
+        expectedContentHash: job.contentHash,
+        acceptReview,
+      });
   };
   return (
     <>
@@ -1120,6 +1150,12 @@ function Jobs({
         >
           生成投递预览
         </button>
+        <button
+          disabled={selected.length !== 1 || !s.resume}
+          onClick={() => void makeSinglePreview()}
+        >
+          普通浏览器单岗位验证
+        </button>
       </div>
       {!jobs.length ? (
         <Empty
@@ -1175,6 +1211,65 @@ function Jobs({
           </button>
         </Dialog>
       )}
+      {singlePreview && (
+        <Dialog
+          title="单岗位投递确认"
+          onClose={() => {
+            if (!startingSingle) setSinglePreview(null);
+          }}
+        >
+          <p>
+            <strong>
+              {singlePreview.application.job.company} ·{" "}
+              {singlePreview.application.job.title}
+            </strong>
+          </p>
+          {singlePreview.acceptReview && (
+            <p>
+              该岗位处于匹配度复核区间，硬条件均已通过。确认后只允许这个岗位进入投递，不改变全局匹配策略。
+            </p>
+          )}
+          <p>
+            扩展将核对岗位和收件人，先执行平台原生打招呼，再依次发送以下话术：
+          </p>
+          {singlePreview.application.frozenMessages.map((message, index) => (
+            <p key={index} style={{ whiteSpace: "pre-wrap" }}>
+              {message}
+            </p>
+          ))}
+          <p>
+            {singlePreview.application.actions.some(
+              (action) => action.kind === "attachment",
+            )
+              ? "话术确认发送后，再发送当前简历附件。等待对方同意或发送结果不明确时会暂停，并记录实际状态。"
+              : "当前话术配置只发送消息。"}
+          </p>
+          {s.paused && <p>投递队列已暂停，请先通过页面顶部恢复队列。</p>}
+          <button
+            disabled={startingSingle || s.paused}
+            onClick={async () => {
+              setStartingSingle(true);
+              try {
+                const r = await mutate<{ applicationId: string }>(
+                  "/api/extension-application/start",
+                  "POST",
+                  {
+                    jobId: singlePreview.application.job.id,
+                    expectedContentHash: singlePreview.expectedContentHash,
+                    acceptReview: singlePreview.acceptReview,
+                    expectedConfigurationKey: singlePreview.configurationKey,
+                  },
+                );
+                if (r) setSinglePreview(null);
+              } finally {
+                setStartingSingle(false);
+              }
+            }}
+          >
+            {startingSingle ? "正在启动…" : "确认发送并启动"}
+          </button>
+        </Dialog>
+      )}
     </>
   );
 }
@@ -1226,7 +1321,12 @@ function AssessmentView({
   assessment: Assessment | null | undefined;
 }) {
   if (!assessment) return <p className="muted">尚未评估适配度。</p>;
-  const decisionLabels: Record<string, string> = { eligible: "符合门槛", review: "待复核", skip: "不符合条件", unavailable: "评估失败" };
+  const decisionLabels: Record<string, string> = {
+    eligible: "符合门槛",
+    review: "待复核",
+    skip: "不符合条件",
+    unavailable: "评估失败",
+  };
   return (
     <details>
       <summary>
@@ -1236,7 +1336,9 @@ function AssessmentView({
         {assessment.score === null
           ? assessment.decision === "skip"
             ? "未通过必要条件，未调用模型"
-            : assessment.decision === "unavailable" ? "模型评分暂不可用" : "尚无评分"
+            : assessment.decision === "unavailable"
+              ? "模型评分暂不可用"
+              : "尚无评分"
           : `适配度 ${assessment.score}`}
       </summary>
       <div className="assessment">
@@ -1651,6 +1753,15 @@ function ChatGPT({
   );
 }
 function Records({ s }: { s: State }) {
+  const stopReasons: Record<string, string> = {
+    "recipient-mismatch": "当前会话与目标岗位或公司无法对应，已停止。",
+    "page-unrecognized": "未能可靠识别目标页面，已停止。",
+    "login-required": "需要登录 BOSS 后人工核对。",
+    "verification-required": "需要完成 BOSS 页面验证后人工核对。",
+    "send-unconfirmed": "未观察到明确发送回执，不会自动重发。",
+    "attachment-pending": "简历请求正在等待对方同意，尚未确认附件送达。",
+    cancelled: "暂停、配置变化或发送前授权失效，已停止。",
+  };
   const [busy, setBusy] = useState(false),
     [downloadError, setDownloadError] = useState("");
   const save = async (
@@ -1719,6 +1830,9 @@ function Records({ s }: { s: State }) {
                   <span className={`badge ${a.status}`}>{a.status}</span> ·{" "}
                   {new Date(a.createdAt).toLocaleString()}
                 </p>
+                {a.stopReason && (
+                  <p>{stopReasons[a.stopReason] ?? "投递需人工核对。"}</p>
+                )}
               </div>
               <div>
                 {a.actions.map((x, i) => (

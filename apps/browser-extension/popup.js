@@ -28,6 +28,7 @@ function showAutomationDiagnostic(value) {
     failed: "自动任务上次未完成，请在工作台检查。",
     connection: "暂时无法连接本地工作台。",
     idle: "当前没有正在执行的扩展步骤。",
+    application: "单岗位投递已暂停，请到工作台查看动作回执；不确定的发送不会自动重试。",
   };
   const reasons = {
     "login-required": "需要在自动任务标签页完成登录。",
@@ -36,6 +37,10 @@ function showAutomationDiagnostic(value) {
     "navigation-failed": "职位页面未能完成加载。",
     "tab-closed": "自动任务标签页已关闭或发生变化。",
     "page-repeated": "下一页与当前页相同，任务已停止。",
+    "recipient-mismatch": "未能核对当前会话与目标岗位及公司，已停止发送。",
+    "send-unconfirmed": "未观察到明确的新发送回执，已停止且不会自动重发。",
+    "attachment-pending": "简历请求正在等待对方同意，尚未确认附件送达。",
+    cancelled: "发送前授权未通过或任务已暂停，请到工作台核对。",
   };
   automationStatus.textContent = reasons[value?.reason] || messages[value?.phase] || "";
 }

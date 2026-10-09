@@ -11,7 +11,7 @@
       <header>
         <div>
           <p class="eyebrow">JOB ASSISTANT</p>
-          <h1>职位导入</h1>
+          <h1>求职助手</h1>
         </div>
         <span id="connectionBadge" class="badge">正在检查</span>
       </header>
@@ -31,9 +31,15 @@
         </form>
       </section>
       <section id="importPanel" class="panel hidden">
-        <h2>自动收集</h2>
-        <p>本地工作台启动的任务会在扩展专用页面中依次读取公开职位；不会发送消息或投递简历。</p>
-        <p id="automationStatus" class="automation-status" aria-live="polite"></p>
+        <h2>自动任务</h2>
+        <p>
+          采集任务会读取公开职位。工作台单独确认的投递任务会核对收件人、依次发送话术和简历，并记录发送结果；结果不明确时停止。
+        </p>
+        <p
+          id="automationStatus"
+          class="automation-status"
+          aria-live="polite"
+        ></p>
         <button id="checkAutomationButton" type="button">检查自动任务</button>
       </section>
       <section id="manualImportPanel" class="panel hidden">

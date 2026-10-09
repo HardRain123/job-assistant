@@ -1,8 +1,9 @@
 import { extractJobs } from "./extract.mjs";
 import { inspectSplitSearch, clickAndReadSplitDetail } from "./split-page.mjs";
+import { runExtensionApplication } from "./application.mjs";
 
 const API_BASE = "http://127.0.0.1:3000";
-const VERSION = "0.2.15";
+const VERSION = "0.3.0";
 const STATE_KEY = "jobAssistantAutomationTabs";
 const DIAGNOSTIC_KEY = "jobAssistantAutomationDiagnostic";
 const ALARM = "job-assistant-automation-poll";
@@ -511,7 +512,10 @@ export async function wake() {
     if (!tokenValue) return;
     for (let step = 0; step < STEP_LIMIT; step += 1) {
       const claim = await api("/extension/v1/claim", { method: "POST", token: tokenValue, version: true });
-      if (!claim.command) break;
+      if (!claim.command) {
+        await runExtensionApplication(api, tokenValue);
+        break;
+      }
       await execute(claim.command, tokenValue);
       if (claim.command.intervalSeconds > 0) await sleep(Math.min(claim.command.intervalSeconds * 1000, 30_000));
     }

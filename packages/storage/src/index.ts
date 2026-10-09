@@ -182,7 +182,7 @@ export class Store {
       }
     }
   }
-  claim(): Task | null {
+  claim(executor: "worker" | "extension" = "worker"): Task | null {
     return this.transaction(() => {
       this.recoverExpired();
       if (this.get("paused", false) || this.get("takeover", false)) return null;
@@ -190,7 +190,9 @@ export class Store {
         return null;
       const row = this.db
         .prepare(
-          "SELECT * FROM tasks WHERE status='queued' ORDER BY created_at LIMIT 1",
+          executor === "extension"
+            ? "SELECT * FROM tasks WHERE status='queued' AND kind='apply' AND json_extract(payload,'$.executor')='extension' ORDER BY created_at LIMIT 1"
+            : "SELECT * FROM tasks WHERE status='queued' AND (kind!='apply' OR coalesce(json_extract(payload,'$.executor'),'worker')='worker') ORDER BY created_at LIMIT 1",
         )
         .get();
       if (!row) return null;
@@ -234,6 +236,7 @@ export class Store {
     token: string,
     appId: string,
     action: ApplicationAction,
+    onTransition?: (changed: boolean) => void,
   ) {
     return this.transaction(() => {
       const task = this.requireLease(taskId, token);
@@ -254,7 +257,10 @@ export class Store {
         old.text !== action.text
       )
         throw new Error("动作与冻结批次不一致");
-      if (old.state === action.state) return app;
+      if (old.state === action.state) {
+        onTransition?.(false);
+        return app;
+      }
       const transitions: Record<string, string[]> = {
         pending: ["started", "skipped"],
         started: ["confirmed", "unknown", "failed", "awaiting-acceptance"],
@@ -283,6 +289,7 @@ export class Store {
       );
       this.updateApplication(app);
       this.audit("action", { appId, actionId: action.id, state: action.state });
+      onTransition?.(true);
       return app;
     });
   }
