@@ -86,6 +86,7 @@ export async function runExtensionApplication(api, token) {
   let actionStarted = null;
   let interrupted = false;
   let stopReason;
+  let pageDiagnostic;
   let activeAction = null;
   let authorization = null;
   const heartbeat = async () => {
@@ -180,6 +181,7 @@ export async function runExtensionApplication(api, token) {
       args: [{ ...request, job: application.job, authorization, readerKey }],
     });
     authorization = null;
+    if (result?.result?.diagnostic) pageDiagnostic = result.result.diagnostic;
     return result?.result || { ok: false, reason: "page-unrecognized" };
   };
   const waitConversation = async (originTab) => {
@@ -325,7 +327,11 @@ export async function runExtensionApplication(api, token) {
     if (actionStarted)
       await progress(actionStarted, "unknown", reason).catch(() => undefined);
     await diagnostic(reason).catch(() => undefined);
-    await call("result", { ...identity, reason }).catch(() => undefined);
+    await call("result", {
+      ...identity,
+      reason,
+      ...(pageDiagnostic ? { diagnostic: pageDiagnostic } : {}),
+    }).catch(() => undefined);
     return true;
   } finally {
     clearInterval(timer);

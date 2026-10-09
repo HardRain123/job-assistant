@@ -266,6 +266,39 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
     });
     return { applicationId: draft.id };
   });
+  app.post("/api/extension-application/retry", (req) => {
+    const body = z
+      .object({ applicationId: z.string().uuid() })
+      .strict()
+      .parse(req.body);
+    requireConnection();
+    return store.transaction(() => {
+      requireReady();
+      const application = store.application(body.applicationId);
+      if (
+        !application ||
+        application.executor !== "extension" ||
+        application.status !== "needs-review" ||
+        !["page-unrecognized", "recipient-mismatch"].includes(
+          application.stopReason ?? "",
+        ) ||
+        !application.actions.length ||
+        application.actions.some((action) => action.state !== "pending")
+      )
+        throw new Error("只有所有动作尚未执行的页面识别失败任务可以重试");
+      requireBeginReady(application);
+      store.audit("extensionApplication.unsentRetry", {
+        applicationId: application.id,
+        reason: application.stopReason,
+      });
+      application.status = "queued";
+      delete application.stopReason;
+      delete application.pageDiagnostic;
+      store.updateApplication(application);
+      store.enqueue("apply", application);
+      return { applicationId: application.id };
+    });
+  });
   app.post("/extension/v1/application/claim", () => {
     requireConnection();
     const candidate = store
@@ -427,6 +460,18 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
   app.post("/extension/v1/application/result", (req) => {
     const body = identitySchema
       .extend({
+        diagnostic: z
+          .object({
+            stage: z.literal("detail-entry"),
+            controlCount: z.number().int().min(0).max(20),
+            knownControlCount: z.number().int().min(0).max(20),
+            titleCount: z.number().int().min(0).max(20),
+            tags: z
+              .array(z.enum(["a", "button", "div", "span", "other"]))
+              .max(5),
+          })
+          .strict()
+          .optional(),
         reason: z
           .enum([
             "recipient-mismatch",
@@ -471,6 +516,8 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
       application.status = status;
       if (body.reason && status !== "completed")
         application.stopReason = body.reason;
+      if (body.diagnostic && status !== "completed")
+        application.pageDiagnostic = body.diagnostic;
       store.updateApplication(application);
       store.finishTask(
         body.taskId,

@@ -127,6 +127,7 @@ export interface Application {
   id: string;
   executor?: "worker" | "extension";
   stopReason?: string;
+  pageDiagnostic?: { stage: "detail-entry"; controlCount: number; knownControlCount: number; titleCount: number; tags: string[] };
   batchId: string;
   jobId: string;
   job: Job;

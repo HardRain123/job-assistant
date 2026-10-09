@@ -344,7 +344,7 @@ function App() {
     ) : tab === "模型连接" ? (
       <Models s={state} mutate={mutate} />
     ) : tab === "投递记录" ? (
-      <Records s={state} />
+      <Records s={state} mutate={mutate} />
     ) : (
       <Browser s={state} mutate={mutate} />
     );
@@ -1752,7 +1752,13 @@ function ChatGPT({
     </div>
   );
 }
-function Records({ s }: { s: State }) {
+function Records({
+  s,
+  mutate,
+}: {
+  s: State;
+  mutate: <T>(p: string, m: string, b?: unknown) => Promise<T | undefined>;
+}) {
   const stopReasons: Record<string, string> = {
     "recipient-mismatch": "当前会话与目标岗位或公司无法对应，已停止。",
     "page-unrecognized": "未能可靠识别目标页面，已停止。",
@@ -1833,6 +1839,26 @@ function Records({ s }: { s: State }) {
                 {a.stopReason && (
                   <p>{stopReasons[a.stopReason] ?? "投递需人工核对。"}</p>
                 )}
+                {a.status === "needs-review" &&
+                  ["page-unrecognized", "recipient-mismatch"].includes(
+                    a.stopReason ?? "",
+                  ) &&
+                  a.actions.length > 0 &&
+                  a.actions.every((action) => action.state === "pending") && (
+                    <button
+                      className="quiet"
+                      disabled={s.paused}
+                      onClick={() =>
+                        void mutate(
+                          "/api/extension-application/retry",
+                          "POST",
+                          { applicationId: a.id },
+                        )
+                      }
+                    >
+                      重试尚未发送的任务
+                    </button>
+                  )}
               </div>
               <div>
                 {a.actions.map((x, i) => (

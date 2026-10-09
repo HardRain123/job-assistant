@@ -15,6 +15,87 @@ import {
 import { fingerprint } from "../packages/templates/src/index.ts";
 
 const origin = `chrome-extension://${"a".repeat(32)}`;
+test("only an entirely unsent layout failure can retry, retaining the original task receipt", async () => {
+  const f = await fixture("eligible");
+  try {
+    const selection = { ...f.selection, acceptReview: false };
+    const preview = (
+      await f.workbench("/api/extension-application/preview", selection)
+    ).json();
+    await f.workbench("/api/extension-application/start", {
+      ...selection,
+      expectedConfigurationKey: preview.configurationKey,
+    });
+    const task = (await f.extension("/extension/v1/application/claim")).json()
+      .task;
+    const identity = {
+      taskId: task.id,
+      leaseToken: task.leaseToken,
+      applicationId: task.application.id,
+    };
+    const diagnostic = {
+      stage: "detail-entry",
+      controlCount: 1,
+      knownControlCount: 1,
+      titleCount: 1,
+      tags: ["div"],
+    };
+    assert.equal(
+      (
+        await f.extension("/extension/v1/application/result", {
+          ...identity,
+          reason: "page-unrecognized",
+          diagnostic,
+        })
+      ).statusCode,
+      200,
+    );
+    assert.equal(
+      f.store.application(identity.applicationId)?.pageDiagnostic?.controlCount,
+      1,
+    );
+    assert.equal(
+      (
+        await f.workbench("/api/extension-application/retry", {
+          applicationId: identity.applicationId,
+        })
+      ).statusCode,
+      200,
+    );
+    assert.equal(f.store.tasks().length, 2);
+    assert.equal(
+      f.store.tasks().find((old) => old.id === task.id)?.status,
+      "needs-review",
+    );
+    const next = (await f.extension("/extension/v1/application/claim")).json()
+      .task;
+    const nextIdentity = {
+      ...identity,
+      taskId: next.id,
+      leaseToken: next.leaseToken,
+    };
+    await f.extension("/extension/v1/application/action", {
+      ...nextIdentity,
+      actionId: next.application.actions[0].id,
+      state: "started",
+      evidence: "before-action",
+    });
+    await f.extension("/extension/v1/application/result", {
+      ...nextIdentity,
+      reason: "page-unrecognized",
+    });
+    assert.equal(
+      (
+        await f.workbench("/api/extension-application/retry", {
+          applicationId: identity.applicationId,
+        })
+      ).statusCode,
+      400,
+    );
+  } finally {
+    await f.close();
+  }
+});
 async function fixture(
   decision: Assessment["decision"] = "review",
   gates: Assessment["gates"] = [

@@ -160,7 +160,9 @@ test("native contact must match the frozen URL and existing-contact state before
   let clicks = 0;
   const control = element("继续沟通");
   control.click = () => clicks++;
-  const banner = element(job.title, { "a, button": [control] });
+  const banner = element(job.title, {
+    "a, button, .btn-startchat, .op-btn-chat, [role='button']": [control],
+  });
   const document = element("", { ".job-banner": [banner] });
   assert.equal(
     (
@@ -231,7 +233,9 @@ test("contact rechecks the full live job after authorization, before any click",
   let clicks = 0;
   const control = element("立即沟通");
   control.click = () => clicks++;
-  const banner = element(job.title, { "a, button": [control] });
+  const banner = element(job.title, {
+    "a, button, .btn-startchat, .op-btn-chat, [role='button']": [control],
+  });
   const document = element("", { ".job-banner": [banner] });
   let live = { ...job, detail: true, salaryText: "20-30K" };
   const result = await runPage(

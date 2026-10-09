@@ -116,7 +116,10 @@ export async function applicationPageStep(request) {
   const contactControl = () => {
     if (canonical(location.href) !== canonical(job.url)) return null;
     const roots = new Set(nodes(document, ".job-banner"));
-    for (const h1 of nodes(document, "h1")) {
+    for (const h1 of nodes(
+      document,
+      ".job-banner .job-name, .job-detail .job-name, h1",
+    )) {
       if (text(h1) !== clean(job.title)) continue;
       for (
         let parent = h1.parentElement, depth = 0;
@@ -133,7 +136,10 @@ export async function applicationPageStep(request) {
     }
     for (const root of roots) {
       if (!text(root).includes(clean(job.title))) continue;
-      const controls = nodes(root, "a, button").filter(
+      const controls = nodes(
+        root,
+        "a, button, .btn-startchat, .op-btn-chat, [role='button']",
+      ).filter(
         (node) => enabled(node) && /^(立即沟通|继续沟通)$/.test(text(node)),
       );
       if (controls.length === 1) return controls[0];
@@ -208,6 +214,41 @@ export async function applicationPageStep(request) {
         existingContact: text(control) === "继续沟通",
       };
     const current = conversation();
+    if (!current && canonical(location.href) === canonical(job.url)) {
+      const controls = nodes(document, "a, button, div, span").filter((node) =>
+        /^(立即沟通|继续沟通)$/.test(text(node)),
+      );
+      return {
+        ...stop("page-unrecognized"),
+        diagnostic: {
+          stage: "detail-entry",
+          controlCount: Math.min(controls.length, 20),
+          tags: controls
+            .slice(0, 5)
+            .map((node) =>
+              ["a", "button", "div", "span"].includes(
+                node.tagName?.toLowerCase(),
+              )
+                ? node.tagName.toLowerCase()
+                : "other",
+            ),
+          knownControlCount: Math.min(
+            nodes(
+              document,
+              ".btn-startchat, .op-btn-chat, [role='button']",
+            ).filter((node) => /^(立即沟通|继续沟通)$/.test(text(node))).length,
+            20,
+          ),
+          titleCount: Math.min(
+            nodes(
+              document,
+              ".job-banner .job-name, .job-detail .job-name, h1",
+            ).filter((node) => text(node) === clean(job.title)).length,
+            20,
+          ),
+        },
+      };
+    }
     return current
       ? {
           ok: true,
