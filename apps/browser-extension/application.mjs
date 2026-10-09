@@ -63,6 +63,22 @@ export function matchesFrozenJob(found, expected) {
     Number(salary[2]) * 1000 === expected.salaryMax
   );
 }
+export function applicationNavigationState(tab, expectedUrl) {
+  const expected = canonicalApplicationUrl(expectedUrl);
+  if (!expected) return "reject";
+  if (tab.pendingUrl && canonicalApplicationUrl(tab.pendingUrl) !== expected)
+    return "reject";
+  const committed = canonicalApplicationUrl(tab.url);
+  if (committed && committed !== expected) return "reject";
+  if (
+    !committed &&
+    tab.url &&
+    !["about:blank", "chrome://newtab/"].includes(tab.url)
+  )
+    return "reject";
+  if (committed === expected && tab.status === "complete") return "ready";
+  return tab.status === "complete" ? "reject" : "wait";
+}
 
 /** One leased application at a time; no browser side effect is retried. */
 export async function runExtensionApplication(api, token) {
@@ -227,12 +243,12 @@ export async function runExtensionApplication(api, token) {
     for (let attempt = 0; attempt < 30; attempt++) {
       if (!(await heartbeat())) throw new Error("cancelled");
       const current = await chrome.tabs.get(tabId);
-      if (
-        canonicalApplicationUrl(current.url) !==
-        canonicalApplicationUrl(application.job.url)
-      )
-        throw new Error("recipient-mismatch");
-      if (current.status === "complete") {
+      const navigation = applicationNavigationState(
+        current,
+        application.job.url,
+      );
+      if (navigation === "reject") throw new Error("recipient-mismatch");
+      if (navigation === "ready") {
         const [read] = await chrome.scripting.executeScript({
           target: { tabId },
           world: "ISOLATED",

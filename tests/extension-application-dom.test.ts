@@ -27,6 +27,32 @@ const job = {
   salaryMin: 20000,
   salaryMax: 30000,
 };
+test("new Chrome tabs may have a pending URL before commit; wait without injecting or rejecting", () => {
+  const run = (tab: any) =>
+    runInNewContext(
+      runnerScript + "\napplicationNavigationState(tab, expected)",
+      { URL, tab, expected: job.url },
+    );
+  assert.equal(run({ status: "loading", pendingUrl: job.url }), "wait");
+  assert.equal(
+    run({ status: "loading", url: "about:blank", pendingUrl: job.url }),
+    "wait",
+  );
+  assert.equal(run({ status: "loading", url: job.url }), "wait");
+  assert.equal(run({ status: "complete", url: job.url }), "ready");
+  assert.equal(
+    run({ status: "loading", pendingUrl: "https://evil.example/" }),
+    "reject",
+  );
+  assert.equal(
+    run({
+      status: "loading",
+      url: "https://www.zhipin.com/job_detail/other.html",
+    }),
+    "reject",
+  );
+  assert.equal(run({ status: "complete", url: "about:blank" }), "reject");
+});
 function element(
   value = "",
   selectors: Record<string, any[]> = {},
