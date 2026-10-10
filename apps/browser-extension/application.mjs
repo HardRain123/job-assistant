@@ -190,15 +190,18 @@ export async function runExtensionApplication(api, token) {
         func: extractJobs,
         args: [{ readerKey }],
       });
-    const [result] = await chrome.scripting.executeScript({
-      target: { tabId },
-      world: "ISOLATED",
-      func: applicationPageStep,
-      args: [{ ...request, job: application.job, authorization, readerKey }],
-    });
-    authorization = null;
-    if (result?.result?.diagnostic) pageDiagnostic = result.result.diagnostic;
-    return result?.result || { ok: false, reason: "page-unrecognized" };
+    try {
+      const [result] = await chrome.scripting.executeScript({
+        target: { tabId },
+        world: "ISOLATED",
+        func: applicationPageStep,
+        args: [{ ...request, job: application.job, authorization, readerKey }],
+      });
+      if (result?.result?.diagnostic) pageDiagnostic = result.result.diagnostic;
+      return result?.result || { ok: false, reason: "page-unrecognized" };
+    } finally {
+      authorization = null;
+    }
   };
   const waitConversation = async (originTab) => {
     for (let attempt = 0; attempt < 24; attempt++) {
@@ -211,7 +214,15 @@ export async function runExtensionApplication(api, token) {
       );
       if (relevant.length === 1) tabId = relevant[0].id;
       else if (relevant.length > 1) return false;
-      const view = await page({ mode: "inspect" });
+      let view;
+      try {
+        view = await page({ mode: "inspect" });
+      } catch {
+        // A committed navigation destroys the old isolated context. Wait and
+        // inspect the same tab or its one opener-linked chat; never click again.
+        await sleep(500);
+        continue;
+      }
       if (view.ok && view.page === "conversation") return true;
       if (
         ["login-required", "verification-required", "cancelled"].includes(
@@ -231,7 +242,15 @@ export async function runExtensionApplication(api, token) {
       !application.actions.length
     )
       throw new Error("page-unrecognized");
-    if (application.actions.some((action) => action.state !== "pending"))
+    const resolvedContact = (action) =>
+      action.kind === "native-greeting" &&
+      action.state === "unknown" &&
+      action.resolution === "contact-exists";
+    if (
+      application.actions.some(
+        (action) => action.state !== "pending" && !resolvedContact(action),
+      )
+    )
       throw new Error("send-unconfirmed");
     if (!(await heartbeat())) throw new Error("cancelled");
     const tab = await chrome.tabs.create({
@@ -268,20 +287,33 @@ export async function runExtensionApplication(api, token) {
       activeAction = action;
       if (!(await heartbeat())) throw new Error("cancelled");
       const key = `jobAssistantApplicationAttempt:${task.id}:${action.id}`;
-      if ((await chrome.storage.local.get(key))[key])
+      if (
+        !resolvedContact(action) &&
+        (await chrome.storage.local.get(key))[key]
+      )
         throw new Error("send-unconfirmed");
       if (action.kind === "native-greeting") {
         const view = await page({ mode: "inspect" });
         if (!view.ok || view.page !== "detail")
           throw new Error(view.reason || "recipient-mismatch");
+        if (resolvedContact(action) && !view.existingContact)
+          throw new Error("recipient-mismatch");
         if (view.existingContact) {
-          await progress(action, "skipped", "existing-contact");
-          const contact = await page({
-            mode: "contact",
-            expectedExisting: true,
-          });
-          if (!contact.ok || !(await waitConversation(tabId)))
-            throw new Error(contact.reason || "recipient-mismatch");
+          if (!resolvedContact(action))
+            await progress(action, "skipped", "existing-contact");
+          const originalTab = tabId;
+          let contact;
+          try {
+            contact = await page({ mode: "contact", expectedExisting: true });
+          } catch {
+            // Continue is navigation only. Its context can disappear while the
+            // new chat loads; confirm the recipient read-only without replay.
+          }
+          if (
+            (contact && !contact.ok) ||
+            !(await waitConversation(originalTab))
+          )
+            throw new Error(contact?.reason || "recipient-mismatch");
           continue;
         }
       } else {
@@ -334,6 +366,7 @@ export async function runExtensionApplication(api, token) {
     await call("result", {
       ...identity,
       ...(stopReason ? { reason: stopReason } : {}),
+      ...(pageDiagnostic ? { diagnostic: pageDiagnostic } : {}),
     });
     return true;
   } catch (error) {

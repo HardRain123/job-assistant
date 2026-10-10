@@ -148,12 +148,11 @@ export async function applicationPageStep(request) {
   };
   // The current editor's ancestors must contain this exact job link AND a
   // matching employer in the conversation header. A sidebar match is not enough.
+  const editorSelector =
+    ".chat-editor .chat-input[contenteditable='true'], div.chat-input[contenteditable='true'], #chat-input[contenteditable='true']";
   const conversation = () => {
     if (!/^\/web\/geek\/chat\/?$/.test(location.pathname)) return null;
-    const editors = nodes(
-      document,
-      ".chat-editor .chat-input[contenteditable='true'], div.chat-input[contenteditable='true']",
-    );
+    const editors = nodes(document, editorSelector);
     if (editors.length !== 1) return null;
     const editor = editors[0];
     for (
@@ -195,6 +194,76 @@ export async function applicationPageStep(request) {
     }
     return null;
   };
+  const conversationDiagnostic = () => {
+    const editors = nodes(document, editorSelector);
+    let activeJobCardCount = 0,
+      exactJobLinkCount = 0,
+      employerFieldMatchCount = 0;
+    for (const editor of editors) {
+      for (
+        let root = editor.parentElement, depth = 0;
+        root && depth < 7;
+        root = root.parentElement, depth++
+      ) {
+        if (
+          root === document.body ||
+          root === document.documentElement ||
+          nodes(root, ".user-list, .chat-user-list, .friend-list").length
+        )
+          break;
+        const outsideHistory = (node) =>
+          !node.closest(
+            ".message-item, .user-list, .chat-user-list, .friend-list",
+          );
+        const headers = nodes(
+          root,
+          ".title-box, .name-box, .chat-title",
+        ).filter(outsideHistory);
+        const cards = [
+          ...new Set([
+            ...headers,
+            ...nodes(
+              root,
+              ".chat-job-card, .chat-job-info, .job-card, .job-info",
+            ).filter(outsideHistory),
+          ]),
+        ];
+        const links = nodes(root, "a[href*='/job_detail/']").filter(
+          (link) =>
+            outsideHistory(link) && cards.some((card) => card.contains(link)),
+        );
+        activeJobCardCount = Math.max(activeJobCardCount, cards.length);
+        exactJobLinkCount = Math.max(
+          exactJobLinkCount,
+          links.filter((link) => canonical(link.href) === canonical(job.url))
+            .length,
+        );
+        employerFieldMatchCount = Math.max(
+          employerFieldMatchCount,
+          headers.filter((header) => {
+            const fields = nodes(
+              header,
+              ".company-name, .company-text, .company",
+            );
+            return (fields.length ? fields : [header]).some((field) =>
+              companies.includes(normCompany(text(field))),
+            );
+          }).length,
+        );
+      }
+    }
+    return {
+      stage: "conversation",
+      editorCount: Math.min(editors.length, 20),
+      activeJobCardCount: Math.min(activeJobCardCount, 20),
+      exactJobLinkCount: Math.min(exactJobLinkCount, 20),
+      employerFieldMatchCount: Math.min(employerFieldMatchCount, 20),
+    };
+  };
+  const unknownConversation = () => ({
+    ...stop("recipient-mismatch"),
+    diagnostic: conversationDiagnostic(),
+  });
   const outgoing = (root) => nodes(root, ".message-item.item-myself");
   const sent = (item) =>
     !nodes(item, ".message-fail, .send-fail, .retry").length &&
@@ -255,7 +324,7 @@ export async function applicationPageStep(request) {
           page: "conversation",
           outgoingCount: outgoing(current.root).length,
         }
-      : stop("recipient-mismatch");
+      : unknownConversation();
   }
   if (request.mode === "contact") {
     if (!fullJobMatches()) return stop("page-unrecognized");
@@ -306,7 +375,7 @@ export async function applicationPageStep(request) {
     return { ok: true, clicked: true, existingContact, contactConfirmed };
   }
   const current = conversation();
-  if (!current) return stop("recipient-mismatch");
+  if (!current) return unknownConversation();
   if (request.mode === "message") {
     if (
       typeof request.text !== "string" ||

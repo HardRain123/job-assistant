@@ -9,6 +9,11 @@ import type {
   ApplicationAction,
 } from "../../contracts/src/index.ts";
 
+export const actionCompleteForExistingContact = (action: ApplicationAction) =>
+  action.state === "confirmed" || action.state === "skipped" ||
+  (action.kind === "native-greeting" && action.state === "unknown" &&
+    action.evidence === "send-unconfirmed" && action.resolution === "contact-exists");
+
 export class Store {
   db: DatabaseSync;
   constructor(path: string) {
@@ -278,7 +283,7 @@ export class Store {
         app.actions.some(
           (a) =>
             a.index < action.index &&
-            !["confirmed", "skipped"].includes(a.state),
+            !actionCompleteForExistingContact(a),
         )
       )
         throw new Error("前序话术尚未确认发送");

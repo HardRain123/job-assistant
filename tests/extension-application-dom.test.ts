@@ -100,7 +100,7 @@ function chatFixture() {
   root.parentElement = body;
   editor.parentElement = root;
   const document = element("", {
-    ".chat-editor .chat-input[contenteditable='true'], div.chat-input[contenteditable='true']":
+    ".chat-editor .chat-input[contenteditable='true'], div.chat-input[contenteditable='true'], #chat-input[contenteditable='true']":
       [editor],
   });
   document.body = body;
@@ -376,12 +376,29 @@ test("attachment requires matching local bytes and records recipient acceptance 
   assert.equal(changes, 1);
 });
 function runnerFixture(
-  options: { wrongJob?: boolean; execute?: boolean; journal?: boolean } = {},
+  options: {
+    wrongJob?: boolean;
+    execute?: boolean;
+    journal?: boolean;
+    resolvedContact?: boolean;
+    unresolvedContact?: boolean;
+    navigationError?: boolean;
+    missingContact?: boolean;
+  } = {},
 ) {
   const calls: any[] = [];
   let stage = "detail";
   const actions = [
-    { id: "greeting", kind: "native-greeting", index: 0, state: "pending" },
+    {
+      id: "greeting",
+      kind: "native-greeting",
+      index: 0,
+      state:
+        options.resolvedContact || options.unresolvedContact
+          ? "unknown"
+          : "pending",
+      ...(options.resolvedContact ? { resolution: "contact-exists" } : {}),
+    },
     {
       id: "message",
       kind: "message",
@@ -448,11 +465,24 @@ function runnerFixture(
               },
             },
           ];
-        calls.push({ mode: args[0].mode });
+        calls.push({
+          mode: args[0].mode,
+          expectedExisting: args[0].expectedExisting,
+        });
         if (args[0].mode === "inspect")
-          return [{ result: { ok: true, page: stage, existingContact: true } }];
+          return [
+            {
+              result: {
+                ok: true,
+                page: stage,
+                existingContact: !options.missingContact,
+              },
+            },
+          ];
         if (args[0].mode === "contact") {
           stage = "conversation";
+          if (options.navigationError)
+            throw new Error("Frame context destroyed during navigation");
           return [{ result: { ok: true, existingContact: true } }];
         }
         return [{ result: { ok: false, reason: "send-unconfirmed" } }];
@@ -497,6 +527,67 @@ test("runner never starts a side effect when the live job differs or a local att
       1,
     );
   }
+});
+test("verified existing contact preserves the unknown greeting and only navigates once", async () => {
+  for (const navigationError of [false, true]) {
+    const f = runnerFixture({
+      resolvedContact: true,
+      navigationError,
+      journal: true,
+    });
+    await f.run();
+    assert.equal(f.calls.filter((call) => call.mode === "contact").length, 1);
+    assert.equal(
+      f.calls.find((call) => call.mode === "contact")?.expectedExisting,
+      true,
+    );
+    assert.equal(
+      f.calls.some((call) => call.body?.actionId === "greeting"),
+      false,
+    );
+    assert.equal(f.calls.filter((call) => call.mode === "message").length, 1);
+    assert.equal(
+      f.calls.some((call) => call.mode === "attachment"),
+      false,
+    );
+  }
+});
+test("unknown greeting without a resolution or without a live Continue control cannot be replayed", async () => {
+  for (const options of [
+    { unresolvedContact: true },
+    { resolvedContact: true, missingContact: true },
+  ]) {
+    const f = runnerFixture(options);
+    await f.run();
+    assert.equal(
+      f.calls.some(
+        (call) =>
+          call.mode === "contact" ||
+          call.mode === "message" ||
+          call.body?.state === "started",
+      ),
+      false,
+    );
+  }
+});
+test("failed conversation inspection reports only bounded counts, excluding history", async () => {
+  const f = chatFixture();
+  f.header.innerText = "其他公司";
+  const result = await runPage(f.document, { mode: "inspect" });
+  assert.equal(result.ok, false);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.diagnostic)), {
+    stage: "conversation",
+    editorCount: 1,
+    activeJobCardCount: 1,
+    exactJobLinkCount: 1,
+    employerFieldMatchCount: 0,
+  });
+  f.link.closest = () => element("旧消息");
+  assert.equal(
+    (await runPage(f.document, { mode: "inspect" })).diagnostic
+      .exactJobLinkCount,
+    0,
+  );
 });
 test("runner refuses duplicate begin permission and stops after an uncertain message before attachment", async () => {
   const denied = runnerFixture({ execute: false });

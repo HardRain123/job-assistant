@@ -50,10 +50,12 @@ test("only an entirely unsent layout failure can retry, retaining the original t
       ).statusCode,
       200,
     );
-    assert.equal(
-      f.store.application(identity.applicationId)?.pageDiagnostic?.controlCount,
-      1,
-    );
+    const savedDiagnostic = f.store.application(
+      identity.applicationId,
+    )?.pageDiagnostic;
+    assert.equal(savedDiagnostic?.stage, "detail-entry");
+    if (savedDiagnostic?.stage === "detail-entry")
+      assert.equal(savedDiagnostic.controlCount, 1);
     assert.equal(
       (
         await f.workbench("/api/extension-application/retry", {
@@ -83,7 +85,18 @@ test("only an entirely unsent layout failure can retry, retaining the original t
     await f.extension("/extension/v1/application/result", {
       ...nextIdentity,
       reason: "page-unrecognized",
+      diagnostic: {
+        stage: "conversation",
+        editorCount: 1,
+        activeJobCardCount: 0,
+        exactJobLinkCount: 0,
+        employerFieldMatchCount: 0,
+      },
     });
+    assert.equal(
+      f.store.application(identity.applicationId)?.pageDiagnostic?.stage,
+      "conversation",
+    );
     assert.equal(
       (
         await f.workbench("/api/extension-application/retry", {
@@ -204,7 +217,7 @@ async function fixture(
   const extHeaders = {
     origin,
     authorization: `Bearer ${token}`,
-    "x-extension-version": "0.3.0",
+    "x-extension-version": "0.3.3",
   };
   await app.inject({
     method: "POST",
@@ -236,6 +249,224 @@ async function fixture(
     },
   };
 }
+
+async function stageExistingContact(f: Awaited<ReturnType<typeof fixture>>) {
+  const selection = { ...f.selection, acceptReview: false };
+  const preview = (
+    await f.workbench("/api/extension-application/preview", selection)
+  ).json();
+  await f.workbench("/api/extension-application/start", {
+    ...selection,
+    expectedConfigurationKey: preview.configurationKey,
+  });
+  const task = (await f.extension("/extension/v1/application/claim")).json()
+    .task;
+  const identity = {
+    taskId: task.id,
+    leaseToken: task.leaseToken,
+    applicationId: task.application.id,
+  };
+  const native = task.application.actions[0];
+  assert.equal(
+    (
+      await f.extension("/extension/v1/application/action", {
+        ...identity,
+        actionId: native.id,
+        state: "started",
+        evidence: "before-action",
+      })
+    ).json().execute,
+    true,
+  );
+  assert.equal(
+    (
+      await f.extension("/extension/v1/application/action", {
+        ...identity,
+        actionId: native.id,
+        state: "unknown",
+        evidence: "send-unconfirmed",
+      })
+    ).statusCode,
+    200,
+  );
+  assert.equal(
+    (
+      await f.extension("/extension/v1/application/result", {
+        ...identity,
+        reason: "send-unconfirmed",
+      })
+    ).json().status,
+    "needs-review",
+  );
+  const inspectionRunId = randomUUID();
+  const inspectedJob = f.store.job(f.job.id)!;
+  const run = {
+    id: inspectionRunId,
+    state: "completed",
+    phase: "done",
+    inspectionJobId: f.job.id,
+    updatedAt: new Date().toISOString(),
+    config: { maxJobs: 1, maxPages: 1, autoAssess: false },
+    discovered: 1,
+    visited: 1,
+    imported: 1,
+    seenUrls: [],
+    jobIds: [f.job.id],
+    fieldReadings: [
+      {
+        url: inspectedJob.url,
+        evidence: {
+          title: inspectedJob.title,
+          company: inspectedJob.company,
+          descriptionPresent: true,
+          headerLines: ["感兴趣 继续沟通"],
+        },
+      },
+    ],
+  };
+  f.store.set("automation.current", run);
+  return { identity, native, run, inspectionRunId };
+}
+
+test("fresh exact read-only inspection resumes only pending messages while native remains unknown", async () => {
+  const f = await fixture("eligible");
+  try {
+    const staged = await stageExistingContact(f);
+    const latest = f.store.upsertJob({
+      ...f.job,
+      company: "示例公司有限公司",
+      lastSeen: new Date().toISOString(),
+    });
+    staged.run.fieldReadings[0]!.evidence.company = latest.company;
+    f.store.set("automation.current", staged.run);
+    const response = await f.workbench(
+      "/api/extension-application/resume-existing-contact",
+      {
+        applicationId: staged.identity.applicationId,
+        inspectionRunId: staged.inspectionRunId,
+      },
+    );
+    assert.equal(response.statusCode, 200, response.body);
+    const restored = f.store.application(staged.identity.applicationId)!;
+    assert.equal(restored.actions[0]!.state, "unknown");
+    assert.equal(restored.actions[0]!.evidence, "send-unconfirmed");
+    assert.equal(restored.actions[0]!.resolution, "contact-exists");
+    assert.equal(restored.job.contentHash, latest.contentHash);
+    const next = (await f.extension("/extension/v1/application/claim")).json()
+      .task;
+    const identity = {
+      taskId: next.id,
+      leaseToken: next.leaseToken,
+      applicationId: restored.id,
+    };
+    assert.equal(
+      (
+        await f.extension("/extension/v1/application/authorize", {
+          ...identity,
+          actionId: staged.native.id,
+        })
+      ).json().allowed,
+      true,
+    );
+    assert.equal(
+      (
+        await f.extension("/extension/v1/application/action", {
+          ...identity,
+          actionId: staged.native.id,
+          state: "started",
+          evidence: "before-action",
+        })
+      ).statusCode,
+      400,
+    );
+    const message = next.application.actions[1];
+    assert.equal(
+      (
+        await f.extension("/extension/v1/application/action", {
+          ...identity,
+          actionId: message.id,
+          state: "started",
+          evidence: "before-action",
+        })
+      ).json().execute,
+      true,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("resume rejects wrong or expired inspection and any previously started later action", async () => {
+  const f = await fixture("eligible");
+  try {
+    const staged = await stageExistingContact(f);
+    const request = (inspectionRunId = staged.inspectionRunId) =>
+      f.workbench("/api/extension-application/resume-existing-contact", {
+        applicationId: staged.identity.applicationId,
+        inspectionRunId,
+      });
+    const connection = f.store.get<any>("browserExtension.connection", null);
+    f.store.set("browserExtension.connection", {
+      ...connection,
+      version: "0.3.2",
+    });
+    assert.equal((await request()).statusCode, 400);
+    f.store.set("browserExtension.connection", connection);
+    assert.equal((await request(randomUUID())).statusCode, 400);
+    staged.run.updatedAt = new Date(Date.now() - 91000).toISOString();
+    f.store.set("automation.current", staged.run);
+    assert.equal((await request()).statusCode, 400);
+    staged.run.updatedAt = new Date().toISOString();
+    staged.run.inspectionJobId = randomUUID();
+    f.store.set("automation.current", staged.run);
+    assert.equal((await request()).statusCode, 400);
+    staged.run.inspectionJobId = f.job.id;
+    staged.run.fieldReadings[0]!.evidence.headerLines = [
+      "立即沟通",
+      "感兴趣 继续沟通",
+    ];
+    f.store.set("automation.current", staged.run);
+    assert.equal((await request()).statusCode, 400);
+    staged.run.fieldReadings[0]!.evidence.headerLines = ["感兴趣 继续沟通"];
+    f.store.set("automation.current", staged.run);
+    const corrupted = f.store.application(staged.identity.applicationId)!;
+    corrupted.actions[1]!.state = "unknown";
+    f.store.updateApplication(corrupted);
+    assert.equal((await request()).statusCode, 400);
+  } finally {
+    await f.close();
+  }
+});
+
+test("resume rejects changed employer, salary or description even with existing-contact evidence", async () => {
+  for (const change of [
+    { company: "无关企业有限公司" },
+    { companyAliases: ["新增关联企业"] },
+    { salaryMin: 24000 },
+    { description: "新的岗位职责" },
+  ]) {
+    const f = await fixture("eligible");
+    try {
+      const staged = await stageExistingContact(f);
+      f.store.upsertJob({ ...f.job, ...change });
+      const response = await f.workbench(
+        "/api/extension-application/resume-existing-contact",
+        {
+          applicationId: staged.identity.applicationId,
+          inspectionRunId: staged.inspectionRunId,
+        },
+      );
+      assert.equal(response.statusCode, 400);
+      assert.equal(
+        f.store.application(staged.identity.applicationId)?.actions[0]
+          ?.resolution,
+        undefined,
+      );
+    } finally {
+      await f.close();
+    }
+  }
+});
 
 test("single application preview and start accept only reviewed soft review with all hard gates", async () => {
   const f = await fixture();

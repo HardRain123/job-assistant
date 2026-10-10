@@ -8,8 +8,14 @@ import type {
   Assessment,
   Job,
   MatchPolicy,
+  Resume,
 } from "../../../packages/contracts/src/index.ts";
-import { Store } from "../../../packages/storage/src/index.ts";
+import {
+  Store,
+  actionCompleteForExistingContact,
+} from "../../../packages/storage/src/index.ts";
+import { canonicalJobUrl } from "./automation.ts";
+import { evaluateGates } from "../../../packages/matching/src/index.ts";
 
 interface Options {
   store: Store;
@@ -125,11 +131,11 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
     }
     return true;
   };
-  const requireConnection = () => {
+  const requireConnection = (minimum = [0, 3, 0]) => {
     const status = o.status();
     if (
       !status.paired ||
-      !versionAtLeast(status.version, [0, 3, 0]) ||
+      !versionAtLeast(status.version, minimum) ||
       !status.lastSeen ||
       Date.now() - Date.parse(status.lastSeen) > 90000
     )
@@ -218,6 +224,97 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
     )
       throw new Error("岗位内容已变化，请人工核对");
   };
+  const companyName = (value: string) =>
+    value
+      .replace(/\s+/g, " ")
+      .trim()
+      .replace(/(?:股份有限公司|有限责任公司|有限公司)$/, "");
+  const sameEmployer = (oldJob: Job, newJob: Job) => {
+    const oldName = companyName(oldJob.company);
+    const newName = companyName(newJob.company);
+    return (
+      Boolean(oldName && newName) &&
+      (oldName === newName ||
+        oldJob.companyAliases.some((alias) => companyName(alias) === newName) ||
+        newJob.companyAliases.some((alias) => companyName(alias) === oldName))
+    );
+  };
+  const sameBusinessFacts = (oldJob: Job, newJob: Job) => {
+    if (
+      oldJob.id !== newJob.id ||
+      oldJob.source !== newJob.source ||
+      oldJob.sourceId !== newJob.sourceId ||
+      !sameEmployer(oldJob, newJob)
+    )
+      return false;
+    const fields: (keyof Job)[] = [
+      "sourceJobId",
+      "companyAliases",
+      "title",
+      "description",
+      "location",
+      "remote",
+      "salaryMin",
+      "salaryMax",
+      "salaryMonths",
+      "experienceMin",
+      "education",
+      "industry",
+      "skills",
+    ];
+    if (
+      fields.some(
+        (field) =>
+          JSON.stringify(oldJob[field]) !== JSON.stringify(newJob[field]),
+      )
+    )
+      return false;
+    try {
+      return canonicalJobUrl(oldJob.url) === canonicalJobUrl(newJob.url);
+    } catch {
+      return false;
+    }
+  };
+  const inspectionShape = z
+    .object({
+      id: z.string().uuid(),
+      state: z.literal("completed"),
+      phase: z.literal("done"),
+      inspectionJobId: z.string().uuid(),
+      updatedAt: z.string(),
+      config: z
+        .object({
+          maxJobs: z.literal(1),
+          maxPages: z.literal(1),
+          autoAssess: z.literal(false),
+        })
+        .passthrough(),
+      visited: z.literal(1),
+      imported: z.literal(1),
+      discovered: z.literal(1),
+      seenUrls: z.array(z.string()).length(0),
+      jobIds: z.array(z.string().uuid()).length(1),
+      fieldReadings: z
+        .array(
+          z
+            .object({
+              url: z.string(),
+              evidence: z
+                .object({
+                  title: z.string(),
+                  company: z.string(),
+                  descriptionPresent: z.literal(true),
+                  headerLines: z.array(z.string()),
+                })
+                .passthrough(),
+            })
+            .passthrough(),
+        )
+        .length(1),
+    })
+    .passthrough();
+  const isContinueContact = (line: string) =>
+    /(?:^|[\s，,。;；:：|/])继续沟通(?:$|[\s，,。;；:：|/])/u.test(line);
   const requireBeginReady = (application: Application) => {
     if (
       store.get("paused", false) ||
@@ -299,6 +396,102 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
       return { applicationId: application.id };
     });
   });
+  app.post("/api/extension-application/resume-existing-contact", (req) => {
+    const body = z
+      .object({
+        applicationId: z.string().uuid(),
+        inspectionRunId: z.string().uuid(),
+      })
+      .strict()
+      .parse(req.body);
+    requireConnection([0, 3, 3]);
+    return store.transaction(() => {
+      requireReady();
+      const application = store.application(body.applicationId);
+      if (
+        !application ||
+        application.executor !== "extension" ||
+        application.status !== "needs-review" ||
+        application.actions.length < 2
+      )
+        throw new Error("当前投递不可按已有联系人接续");
+      const [native, ...remaining] = application.actions;
+      if (
+        native!.kind !== "native-greeting" ||
+        native!.index !== 0 ||
+        native!.state !== "unknown" ||
+        native!.evidence !== "send-unconfirmed" ||
+        native!.resolution ||
+        remaining.some((action) => action.state !== "pending")
+      )
+        throw new Error("仅原生招呼结果未知且后续未执行时可接续");
+      requireConfig(application);
+      const run = inspectionShape.safeParse(
+        store.get("automation.current", null),
+      );
+      const checkedAt = run.success ? Date.parse(run.data.updatedAt) : NaN;
+      if (
+        !run.success ||
+        run.data.id !== body.inspectionRunId ||
+        run.data.inspectionJobId !== application.jobId ||
+        run.data.jobIds[0] !== application.jobId ||
+        !Number.isFinite(checkedAt) ||
+        Date.now() - checkedAt > 90000 ||
+        checkedAt > Date.now() + 5000
+      )
+        throw new Error("指定岗位的只读检查缺失或已过期");
+      const prior = o.assessment(application.job);
+      if (
+        !prior ||
+        !["eligible", "review"].includes(prior.decision) ||
+        (prior.decision === "review" &&
+          (prior.score === null || prior.score < o.policy().autoThreshold)) ||
+        !prior.gates.length ||
+        prior.gates.some((gate) => gate.status !== "pass")
+      )
+        throw new Error("原岗位匹配条件已失效，请人工核对");
+      const current = store.job(application.jobId);
+      if (
+        !current ||
+        current.status !== "active" ||
+        !sameBusinessFacts(application.job, current)
+      )
+        throw new Error("岗位业务信息已变化，请重新人工核对");
+      const resume = store.get<Resume | null>("resume", null);
+      if (
+        !resume ||
+        evaluateGates(current, resume, o.policy()).some(
+          (gate) => gate.status !== "pass",
+        )
+      )
+        throw new Error("当前岗位硬条件未通过，请人工核对");
+      const evidence = run.data.fieldReadings[0]!;
+      if (
+        canonicalJobUrl(evidence.url) !== canonicalJobUrl(current.url) ||
+        evidence.evidence.title !== current.title ||
+        companyName(evidence.evidence.company) !==
+          companyName(current.company) ||
+        !evidence.evidence.headerLines.some(isContinueContact) ||
+        evidence.evidence.headerLines.some((line) => line.includes("立即沟通"))
+      )
+        throw new Error("只读页面未能确认该岗位已有联系");
+      const oldHash = application.job.contentHash;
+      native!.resolution = "contact-exists";
+      application.job = current;
+      application.status = "queued";
+      store.updateApplication(application);
+      store.enqueue("apply", application);
+      store.audit("extensionApplication.existingContactResumed", {
+        applicationId: application.id,
+        inspectionRunId: run.data.id,
+        nativeState: "unknown",
+        nativeEvidence: "send-unconfirmed",
+        oldHash,
+        currentHash: current.contentHash,
+      });
+      return { applicationId: application.id };
+    });
+  });
   app.post("/extension/v1/application/claim", () => {
     requireConnection();
     const candidate = store
@@ -372,8 +565,11 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
       (action.state !== "started" &&
         !(
           action.kind === "native-greeting" &&
-          action.state === "skipped" &&
-          action.evidence === "existing-contact"
+          ((action.state === "skipped" &&
+            action.evidence === "existing-contact") ||
+            (action.state === "unknown" &&
+              action.evidence === "send-unconfirmed" &&
+              action.resolution === "contact-exists"))
         ))
     )
       throw new Error("动作尚未获准");
@@ -429,8 +625,7 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
       action.kind !== "attachment" ||
       action.state !== "started" ||
       application.actions.some(
-        (a) =>
-          a.index < action.index && !["confirmed", "skipped"].includes(a.state),
+        (a) => a.index < action.index && !actionCompleteForExistingContact(a),
       )
     )
       throw new Error("附件动作尚未获准");
@@ -461,16 +656,28 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
     const body = identitySchema
       .extend({
         diagnostic: z
-          .object({
-            stage: z.literal("detail-entry"),
-            controlCount: z.number().int().min(0).max(20),
-            knownControlCount: z.number().int().min(0).max(20),
-            titleCount: z.number().int().min(0).max(20),
-            tags: z
-              .array(z.enum(["a", "button", "div", "span", "other"]))
-              .max(5),
-          })
-          .strict()
+          .discriminatedUnion("stage", [
+            z
+              .object({
+                stage: z.literal("detail-entry"),
+                controlCount: z.number().int().min(0).max(20),
+                knownControlCount: z.number().int().min(0).max(20),
+                titleCount: z.number().int().min(0).max(20),
+                tags: z
+                  .array(z.enum(["a", "button", "div", "span", "other"]))
+                  .max(5),
+              })
+              .strict(),
+            z
+              .object({
+                stage: z.literal("conversation"),
+                editorCount: z.number().int().min(0).max(20),
+                activeJobCardCount: z.number().int().min(0).max(20),
+                exactJobLinkCount: z.number().int().min(0).max(20),
+                employerFieldMatchCount: z.number().int().min(0).max(20),
+              })
+              .strict(),
+          ])
           .optional(),
         reason: z
           .enum([
@@ -508,9 +715,7 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
             }
           : a,
       );
-      status = application.actions.every((a) =>
-        ["confirmed", "skipped"].includes(a.state),
-      )
+      status = application.actions.every(actionCompleteForExistingContact)
         ? "completed"
         : "needs-review";
       application.status = status;

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "求职助手 · BOSS 职位导入",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "minimum_chrome_version": "120",
   "description": "在本地工作台采集和匹配 BOSS 职位，执行单独确认的单岗位投递并记录结果。",
   "action": { "default_title": "求职助手", "default_popup": "popup.html" },

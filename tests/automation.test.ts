@@ -12,6 +12,27 @@ const url = (id: string) => `https://www.zhipin.com/job_detail/${id}.html`;
 const job = (id: string) => ({ url: url(id), title: "工程师", company: "公司", description: "完整岗位要求", detail: true });
 const config = { keywords: ["前端", "后端"], city: "上海", maxJobs: 10, maxPages: 2, autoAssess: false, intervalSeconds: 3 };
 
+test("只读复核只打开已入库的一个 BOSS 岗位，不搜索、不评分或投递", async () => {
+  const f = await fixture();
+  try {
+    assert.equal((await f.request("/api/automation/start", { inspectJobId: "00000000-0000-4000-8000-000000000000" })).statusCode, 400);
+    const imported = await f.request("/extension/v1/jobs", { jobs: [job("inspection")] });
+    assert.equal(imported.statusCode, 200, imported.body);
+    const id = f.store.jobs()[0]!.id;
+    assert.equal((await f.request("/api/automation/start", { inspectJobId: id, url: "https://evil.example" })).statusCode, 400);
+    const started = await f.request("/api/automation/start", { inspectJobId: id });
+    assert.equal(started.statusCode, 200);
+    assert.equal(started.json().run.inspectionJobId, undefined);
+    assert.equal(f.store.get<any>("automation.current", null).inspectionJobId, id);
+    const detail = await f.claim();
+    assert.equal(detail.kind, "detail"); assert.equal(detail.url, url("inspection")); assert.equal(detail.searchUrl, undefined);
+    assert.equal((await f.result(detail, { jobs: [job("inspection")] })).statusCode, 200);
+    assert.equal(await f.claim(), null);
+    const run = await f.state(); assert.equal(run.state, "completed"); assert.equal(run.scored, 0);
+    assert.equal(f.store.applications().length, 0);
+  } finally { await f.close(); }
+});
+
 async function fixture(scoreJob: (id: string, signal: AbortSignal) => Promise<Assessment> = async () => ({ decision: "eligible" }) as Assessment) {
   const store = new Store(":memory:");
   let time = Date.UTC(2026, 0, 1), fingerprint = "private-resume-provider-key";

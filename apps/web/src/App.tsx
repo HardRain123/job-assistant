@@ -2,6 +2,7 @@ import { FormEvent, ReactNode, useEffect, useRef, useState } from "react";
 import { accountLabel, isChatGPTAccount, modelNames } from "./provider-view";
 import { ExtensionPanel } from "./ExtensionPanel";
 import { AutomationPanel } from "./AutomationPanel";
+import type { Application as StoredApplication } from "../../../packages/contracts/src/index";
 
 type Tab =
   | "工作台"
@@ -102,10 +103,16 @@ interface Policy {
 interface Application {
   id: string;
   stopReason?: string;
+  pageDiagnostic?: StoredApplication["pageDiagnostic"];
   job: Job;
   status: string;
   frozenMessages: string[];
-  actions: { kind: string; state: string; evidence: string | null }[];
+  actions: {
+    kind: string;
+    state: string;
+    evidence: string | null;
+    resolution?: "contact-exists";
+  }[];
   createdAt: string;
 }
 interface State {
@@ -1839,6 +1846,14 @@ function Records({
                 {a.stopReason && (
                   <p>{stopReasons[a.stopReason] ?? "投递需人工核对。"}</p>
                 )}
+                {a.pageDiagnostic?.stage === "conversation" && (
+                  <p>
+                    会话识别：输入框 {a.pageDiagnostic.editorCount}
+                    ，当前岗位区域 {a.pageDiagnostic.activeJobCardCount}
+                    ，目标岗位链接 {a.pageDiagnostic.exactJobLinkCount}
+                    ，雇主匹配 {a.pageDiagnostic.employerFieldMatchCount}。
+                  </p>
+                )}
                 {a.status === "needs-review" &&
                   ["page-unrecognized", "recipient-mismatch"].includes(
                     a.stopReason ?? "",
@@ -1872,6 +1887,9 @@ function Records({
                     </strong>
                     ：{x.state}
                     {x.evidence ? `（${x.evidence}）` : ""}
+                    {x.resolution === "contact-exists"
+                      ? "；已核对已有沟通，保留未知记录，不重发招呼"
+                      : ""}
                   </p>
                 ))}
               </div>

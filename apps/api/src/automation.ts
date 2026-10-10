@@ -53,6 +53,7 @@ interface Run {
   createdAt: string;
   updatedAt: string;
   // Private server state. Never expose leases, resume/config fingerprints or queues to UI.
+  inspectionJobId?: string | null;
   configurationKey: string;
   keywordIndex: number;
   page: number;
@@ -510,7 +511,14 @@ export function createAutomation(o: Options) {
       extension: o.extensionStatus(),
     }));
     app.post("/api/automation/start", (req) => {
-      const config = configSchema.parse(req.body);
+      const request = z.union([configSchema, z.object({ inspectJobId: z.string().uuid() }).strict()]).parse(req.body);
+      const inspectJob = "inspectJobId" in request ? o.store.job(request.inspectJobId) : null;
+      if ("inspectJobId" in request && (!inspectJob || inspectJob.source !== "boss")) throw new Error("只读核对岗位不存在或不是 BOSS 岗位");
+      const inspectionUrl = inspectJob ? canonicalJobUrl(inspectJob.url) : null;
+      const config: Config = "inspectJobId" in request ? {
+        keywords: [inspectJob!.title.slice(0, 80)], city: "上海", maxJobs: 1,
+        maxPages: 1, autoAssess: false, intervalSeconds: 3,
+      } : request;
       config.keywords = [...new Set(config.keywords)];
       const previous = reconcile();
       if (previous && !["completed", "cancelled"].includes(previous.state))
@@ -529,7 +537,7 @@ export function createAutomation(o: Options) {
         state: "running",
         phase: "collecting",
         config,
-        discovered: 0,
+        discovered: inspectionUrl ? 1 : 0,
         visited: 0,
         imported: 0,
         scored: 0,
@@ -541,13 +549,14 @@ export function createAutomation(o: Options) {
         message: "任务已创建，等待浏览器扩展接收（通常 30 秒内）。",
         createdAt: stamp,
         updatedAt: stamp,
+        inspectionJobId: inspectJob?.id ?? null,
         configurationKey: o.configurationKey(),
         keywordIndex: 0,
         page: 0,
         hasNext: false,
         searchUrl: null,
         signature: "",
-        pendingUrls: [],
+        pendingUrls: inspectionUrl ? [inspectionUrl] : [],
         seenUrls: [],
         jobIds: [],
         scoredIds: [],

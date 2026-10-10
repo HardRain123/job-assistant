@@ -121,13 +121,16 @@ export interface ApplicationAction {
   text: string | null;
   state: ActionState;
   evidence: string | null;
+  resolution?: "contact-exists";
   updatedAt: string;
 }
 export interface Application {
   id: string;
   executor?: "worker" | "extension";
   stopReason?: string;
-  pageDiagnostic?: { stage: "detail-entry"; controlCount: number; knownControlCount: number; titleCount: number; tags: string[] };
+  pageDiagnostic?:
+    | { stage: "detail-entry"; controlCount: number; knownControlCount: number; titleCount: number; tags: string[] }
+    | { stage: "conversation"; editorCount: number; activeJobCardCount: number; exactJobLinkCount: number; employerFieldMatchCount: number };
   batchId: string;
   jobId: string;
   job: Job;
