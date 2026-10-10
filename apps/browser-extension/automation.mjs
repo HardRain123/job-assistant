@@ -3,7 +3,7 @@ import { inspectSplitSearch, clickAndReadSplitDetail } from "./split-page.mjs";
 import { runExtensionApplication } from "./application.mjs";
 
 const API_BASE = "http://127.0.0.1:3000";
-const VERSION = "0.3.3";
+const VERSION = "0.3.4";
 const STATE_KEY = "jobAssistantAutomationTabs";
 const DIAGNOSTIC_KEY = "jobAssistantAutomationDiagnostic";
 const ALARM = "job-assistant-automation-poll";

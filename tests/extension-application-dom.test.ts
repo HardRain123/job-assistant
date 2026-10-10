@@ -26,6 +26,7 @@ const job = {
   description: "完整岗位职责",
   salaryMin: 20000,
   salaryMax: 30000,
+  location: "上海",
 };
 test("new Chrome tabs may have a pending URL before commit; wait without injecting or rejecting", () => {
   const run = (tab: any) =>
@@ -60,6 +61,7 @@ function element(
 ): any {
   return {
     innerText: value,
+    children: [],
     parentElement: null,
     disabled: false,
     getClientRects: () => (hidden ? [] : [{}]),
@@ -106,6 +108,66 @@ function chatFixture() {
   document.body = body;
   document.documentElement = element();
   return { rows, editor, link, header, button, input, root, document };
+}
+function semanticChatFixture() {
+  const f = chatFixture();
+  const selector = "a, button, span, div, p, strong, em, h1, h2, h3, b, label";
+  const title = element(job.title),
+    salary = element("20-30K"),
+    city = element(job.location);
+  const employer = element(job.company),
+    recruiter = element("王先生"),
+    view = element("查看职位");
+  const fields = [title, salary, city, view],
+    links: any[] = [],
+    headerLinks: any[] = [];
+  const card = element(`${job.title} 20-30K 上海 查看职位`, {
+    [selector]: fields,
+    "a[href*='/job_detail/']": links,
+  });
+  const rect = (left: number, top: number, right: number, bottom: number) => ({
+    left,
+    top,
+    right,
+    bottom,
+    width: right - left,
+    height: bottom - top,
+  });
+  f.editor.getBoundingClientRect = () => rect(400, 500, 1000, 650);
+  f.root.getBoundingClientRect = () => rect(380, 100, 1020, 680);
+  card.getBoundingClientRect = () => rect(400, 180, 1000, 230);
+  employer.getBoundingClientRect = () => rect(440, 140, 610, 170);
+  recruiter.getBoundingClientRect = () => rect(400, 140, 440, 170);
+  card.parentElement = f.root;
+  employer.parentElement = f.root;
+  recruiter.parentElement = f.root;
+  for (const field of fields) {
+    field.parentElement = card;
+    field.getBoundingClientRect = () => rect(410, 190, 580, 215);
+  }
+  const oldQuery = f.root.querySelectorAll;
+  const allFields = [employer, recruiter, ...fields];
+  f.root.querySelectorAll = (query: string) =>
+    query === selector
+      ? allFields
+      : query === "a[href*='/job_detail/']"
+        ? headerLinks
+        : query === ".title-box, .name-box, .chat-title"
+          ? []
+          : oldQuery(query);
+  return {
+    ...f,
+    title,
+    salary,
+    city,
+    employer,
+    recruiter,
+    view,
+    card,
+    allFields,
+    links,
+    headerLinks,
+  };
 }
 function row(value: string, sent = true) {
   return element(value, {
@@ -182,6 +244,141 @@ test("conversation requires this exact job and employer inside the current edito
       : oldQuery(selector);
   assert.equal((await runPage(f.document, { mode: "inspect" })).ok, false);
 });
+test("button job bar requires verified navigation and all visible identity fields", async () => {
+  const f = semanticChatFixture();
+  const request = { mode: "inspect", conversationOrigin: job.url };
+  assert.equal((await runPage(f.document, request)).page, "conversation");
+  assert.equal((await runPage(f.document, { mode: "inspect" })).ok, false);
+  assert.equal(
+    (
+      await runPage(f.document, {
+        ...request,
+        conversationOrigin: job.url + "wrong",
+      })
+    ).ok,
+    false,
+  );
+  for (const field of [f.title, f.salary, f.city, f.employer]) {
+    const original = field.innerText;
+    field.innerText = "其他值";
+    assert.equal((await runPage(f.document, request)).ok, false);
+    field.innerText = original;
+  }
+  const wrongLink = element();
+  wrongLink.href = "https://www.zhipin.com/job_detail/other.html";
+  f.links.push(wrongLink);
+  assert.equal((await runPage(f.document, request)).ok, false);
+});
+
+test("semantic header rejects sidebar geometry, history controls and duplicate job bars", async () => {
+  for (const modify of [
+    (f: any) => {
+      f.root.getBoundingClientRect = () => ({
+        left: 0,
+        top: 100,
+        right: 1020,
+        bottom: 680,
+        width: 1020,
+        height: 580,
+      });
+    },
+    (f: any) => {
+      f.view.closest = () => element("旧消息");
+    },
+    (f: any) => {
+      f.allFields.push(element("查看职位"));
+    },
+  ]) {
+    const f = semanticChatFixture();
+    modify(f);
+    assert.equal(
+      (
+        await runPage(f.document, {
+          mode: "inspect",
+          conversationOrigin: job.url,
+        })
+      ).ok,
+      false,
+    );
+  }
+});
+
+test("semantic recipient is rechecked after authorization before sending", async () => {
+  const f = semanticChatFixture();
+  let clicks = 0;
+  const binding = (
+    await runPage(f.document, { mode: "inspect", conversationOrigin: job.url })
+  ).conversationBinding;
+  f.button.click = () => clicks++;
+  const result = await runPage(
+    f.document,
+    {
+      mode: "message",
+      text: "您好",
+      conversationOrigin: job.url,
+      conversationBinding: binding,
+    },
+    "/web/geek/chat",
+    {
+      chrome: {
+        runtime: {
+          sendMessage: async () => {
+            f.recruiter.innerText = "李先生";
+            return { allowed: true, expiresAt: Date.now() + 1500 };
+          },
+        },
+      },
+    },
+  );
+  assert.equal(result.ok, false);
+  assert.equal(clicks, 0);
+});
+
+test("semantic header rejects conflicting links outside the job card and changed contacts between steps", async () => {
+  const f = semanticChatFixture();
+  const request = { mode: "inspect", conversationOrigin: job.url };
+  const binding = (await runPage(f.document, request)).conversationBinding;
+  assert.equal(typeof binding, "string");
+  assert.equal(
+    (
+      await runPage(f.document, {
+        mode: "message",
+        text: "您好",
+        conversationOrigin: job.url,
+      })
+    ).ok,
+    false,
+  );
+  const wrongLink = element("其他岗位");
+  wrongLink.href = "https://www.zhipin.com/job_detail/other.html";
+  wrongLink.getBoundingClientRect = () => ({ top: 140, bottom: 170 });
+  f.headerLinks.push(wrongLink);
+  assert.equal((await runPage(f.document, request)).ok, false);
+  f.headerLinks.length = 0;
+  f.recruiter.innerText = "李先生";
+  assert.equal(
+    (await runPage(f.document, { ...request, conversationBinding: binding }))
+      .ok,
+    false,
+  );
+});
+
+test("semantic header cannot bind a company and status label without a recruiter name", async () => {
+  const f = semanticChatFixture();
+  for (const label of ["在线", "活跃", "已沟通", "招聘者", ""]) {
+    f.recruiter.innerText = label;
+    assert.equal(
+      (
+        await runPage(f.document, {
+          mode: "inspect",
+          conversationOrigin: job.url,
+        })
+      ).ok,
+      false,
+    );
+  }
+});
+
 test("native contact must match the frozen URL and existing-contact state before click", async () => {
   let clicks = 0;
   const control = element("继续沟通");
@@ -468,6 +665,8 @@ function runnerFixture(
         calls.push({
           mode: args[0].mode,
           expectedExisting: args[0].expectedExisting,
+          conversationOrigin: args[0].conversationOrigin,
+          conversationBinding: args[0].conversationBinding,
         });
         if (args[0].mode === "inspect")
           return [
@@ -475,6 +674,8 @@ function runnerFixture(
               result: {
                 ok: true,
                 page: stage,
+                conversationBinding:
+                  stage === "conversation" ? "fixture-binding" : undefined,
                 existingContact: !options.missingContact,
               },
             },
@@ -546,6 +747,18 @@ test("verified existing contact preserves the unknown greeting and only navigate
       false,
     );
     assert.equal(f.calls.filter((call) => call.mode === "message").length, 1);
+    assert.equal(
+      f.calls.find((call) => call.mode === "contact")?.conversationOrigin,
+      null,
+    );
+    assert.equal(
+      f.calls.find((call) => call.mode === "message")?.conversationOrigin,
+      job.url,
+    );
+    assert.equal(
+      f.calls.find((call) => call.mode === "message")?.conversationBinding,
+      "fixture-binding",
+    );
     assert.equal(
       f.calls.some((call) => call.mode === "attachment"),
       false,

@@ -217,7 +217,7 @@ async function fixture(
   const extHeaders = {
     origin,
     authorization: `Bearer ${token}`,
-    "x-extension-version": "0.3.3",
+    "x-extension-version": "0.3.4",
   };
   await app.inject({
     method: "POST",
@@ -396,6 +396,155 @@ test("fresh exact read-only inspection resumes only pending messages while nativ
   }
 });
 
+test("resolved existing-contact page failure can resume after a new inspection without a new score", async () => {
+  for (const reason of ["recipient-mismatch", "page-unrecognized"] as const) {
+    const f = await fixture("eligible");
+    try {
+      const staged = await stageExistingContact(f);
+      const current = f.store.upsertJob({
+        ...f.job,
+        company: "示例公司有限公司",
+      });
+      staged.run.fieldReadings[0]!.evidence.company = current.company;
+      f.store.set("automation.current", staged.run);
+      const request = (inspectionRunId: string) =>
+        f.workbench("/api/extension-application/resume-existing-contact", {
+          applicationId: staged.identity.applicationId,
+          inspectionRunId,
+        });
+      assert.equal((await request(staged.inspectionRunId)).statusCode, 200);
+      const firstResume = (
+        await f.extension("/extension/v1/application/claim")
+      ).json().task;
+      assert.equal(
+        (
+          await f.extension("/extension/v1/application/result", {
+            taskId: firstResume.id,
+            leaseToken: firstResume.leaseToken,
+            applicationId: staged.identity.applicationId,
+            reason,
+            diagnostic: {
+              stage: "conversation",
+              editorCount: 1,
+              activeJobCardCount: 0,
+              exactJobLinkCount: 0,
+              employerFieldMatchCount: 0,
+            },
+          })
+        ).json().status,
+        "needs-review",
+      );
+      const before = f.store.application(staged.identity.applicationId)!;
+      assert.equal(before.actions[0]!.state, "unknown");
+      assert.equal(before.actions[0]!.resolution, "contact-exists");
+      assert.ok(
+        before.actions.slice(1).every((action) => action.state === "pending"),
+      );
+      assert.equal((await request(staged.inspectionRunId)).statusCode, 400);
+      const newRunId = randomUUID();
+      f.store.set("automation.current", {
+        ...staged.run,
+        id: newRunId,
+        updatedAt: new Date().toISOString(),
+      });
+      assert.equal((await request(newRunId)).statusCode, 200);
+      const restored = f.store.application(staged.identity.applicationId)!;
+      assert.deepEqual(restored.actions, before.actions);
+      assert.equal(f.store.tasks().length, 3);
+      assert.equal(
+        f.store.tasks().filter((task) => task.status === "needs-review").length,
+        2,
+      );
+      assert.equal(
+        f.store.db
+          .prepare(
+            "SELECT count(*) n FROM audit WHERE event='extensionApplication.existingContactResumed'",
+          )
+          .get()?.n,
+        2,
+      );
+      const secondResume = (
+        await f.extension("/extension/v1/application/claim")
+      ).json().task;
+      const identity = {
+        taskId: secondResume.id,
+        leaseToken: secondResume.leaseToken,
+        applicationId: staged.identity.applicationId,
+      };
+      assert.equal(
+        (
+          await f.extension("/extension/v1/application/authorize", {
+            ...identity,
+            actionId: staged.native.id,
+          })
+        ).json().allowed,
+        true,
+      );
+      assert.equal(
+        (
+          await f.extension("/extension/v1/application/action", {
+            ...identity,
+            actionId: secondResume.application.actions[1].id,
+            state: "started",
+            evidence: "before-action",
+          })
+        ).json().execute,
+        true,
+      );
+    } finally {
+      await f.close();
+    }
+  }
+});
+
+test("resolved contact retry rejects other stop reasons, changed hash, and touched later actions", async () => {
+  const f = await fixture("eligible");
+  try {
+    const staged = await stageExistingContact(f);
+    const current = f.store.upsertJob({
+      ...f.job,
+      company: "示例公司有限公司",
+    });
+    staged.run.fieldReadings[0]!.evidence.company = current.company;
+    f.store.set("automation.current", staged.run);
+    const request = (inspectionRunId: string) =>
+      f.workbench("/api/extension-application/resume-existing-contact", {
+        applicationId: staged.identity.applicationId,
+        inspectionRunId,
+      });
+    assert.equal((await request(staged.inspectionRunId)).statusCode, 200);
+    const first = (await f.extension("/extension/v1/application/claim")).json()
+      .task;
+    const identity = {
+      taskId: first.id,
+      leaseToken: first.leaseToken,
+      applicationId: staged.identity.applicationId,
+    };
+    await f.extension("/extension/v1/application/result", {
+      ...identity,
+      reason: "send-unconfirmed",
+    });
+    const newRunId = randomUUID();
+    f.store.set("automation.current", {
+      ...staged.run,
+      id: newRunId,
+      updatedAt: new Date().toISOString(),
+    });
+    assert.equal((await request(newRunId)).statusCode, 400);
+    const changed = f.store.application(staged.identity.applicationId)!;
+    changed.stopReason = "recipient-mismatch";
+    changed.actions[1]!.state = "unknown";
+    f.store.updateApplication(changed);
+    assert.equal((await request(newRunId)).statusCode, 400);
+    changed.actions[1]!.state = "pending";
+    f.store.updateApplication(changed);
+    f.store.upsertJob({ ...current, url: current.url + "?ref=changed" });
+    assert.equal((await request(newRunId)).statusCode, 400);
+  } finally {
+    await f.close();
+  }
+});
+
 test("resume rejects wrong or expired inspection and any previously started later action", async () => {
   const f = await fixture("eligible");
   try {
@@ -408,7 +557,7 @@ test("resume rejects wrong or expired inspection and any previously started late
     const connection = f.store.get<any>("browserExtension.connection", null);
     f.store.set("browserExtension.connection", {
       ...connection,
-      version: "0.3.2",
+      version: "0.3.3",
     });
     assert.equal((await request()).statusCode, 400);
     f.store.set("browserExtension.connection", connection);

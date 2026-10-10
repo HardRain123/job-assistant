@@ -404,7 +404,7 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
       })
       .strict()
       .parse(req.body);
-    requireConnection([0, 3, 3]);
+    requireConnection([0, 3, 4]);
     return store.transaction(() => {
       requireReady();
       const application = store.application(body.applicationId);
@@ -416,15 +416,23 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
       )
         throw new Error("当前投递不可按已有联系人接续");
       const [native, ...remaining] = application.actions;
+      const previouslyResolved = native?.resolution === "contact-exists";
       if (
         native!.kind !== "native-greeting" ||
         native!.index !== 0 ||
         native!.state !== "unknown" ||
         native!.evidence !== "send-unconfirmed" ||
-        native!.resolution ||
+        (native!.resolution && !previouslyResolved) ||
         remaining.some((action) => action.state !== "pending")
       )
         throw new Error("仅原生招呼结果未知且后续未执行时可接续");
+      if (
+        previouslyResolved &&
+        !["recipient-mismatch", "page-unrecognized"].includes(
+          application.stopReason ?? "",
+        )
+      )
+        throw new Error("已有联系人任务仅页面识别失败时可再次接续");
       requireConfig(application);
       const run = inspectionShape.safeParse(
         store.get("automation.current", null),
@@ -440,20 +448,41 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
         checkedAt > Date.now() + 5000
       )
         throw new Error("指定岗位的只读检查缺失或已过期");
-      const prior = o.assessment(application.job);
       if (
-        !prior ||
-        !["eligible", "review"].includes(prior.decision) ||
-        (prior.decision === "review" &&
-          (prior.score === null || prior.score < o.policy().autoThreshold)) ||
-        !prior.gates.length ||
-        prior.gates.some((gate) => gate.status !== "pass")
+        previouslyResolved &&
+        store.db
+          .prepare(
+            "SELECT id FROM audit WHERE event='extensionApplication.existingContactResumed' AND json_extract(body,'$.applicationId')=? AND json_extract(body,'$.inspectionRunId')=? LIMIT 1",
+          )
+          .get(application.id, body.inspectionRunId)
       )
-        throw new Error("原岗位匹配条件已失效，请人工核对");
+        throw new Error("请重新只读检查该岗位后再接续");
+      if (!previouslyResolved) {
+        const prior = o.assessment(application.job);
+        if (
+          !prior ||
+          !["eligible", "review"].includes(prior.decision) ||
+          (prior.decision === "review" &&
+            (prior.score === null || prior.score < o.policy().autoThreshold)) ||
+          !prior.gates.length ||
+          prior.gates.some((gate) => gate.status !== "pass")
+        )
+          throw new Error("原岗位匹配条件已失效，请人工核对");
+      } else if (
+        !store.db
+          .prepare(
+            "SELECT id FROM audit WHERE event='extensionApplication.existingContactResumed' AND json_extract(body,'$.applicationId')=? AND json_extract(body,'$.currentHash')=? LIMIT 1",
+          )
+          .get(application.id, application.job.contentHash)
+      ) {
+        throw new Error("已有联系人接续记录缺失，请人工核对");
+      }
       const current = store.job(application.jobId);
       if (
         !current ||
         current.status !== "active" ||
+        (previouslyResolved &&
+          current.contentHash !== application.job.contentHash) ||
         !sameBusinessFacts(application.job, current)
       )
         throw new Error("岗位业务信息已变化，请重新人工核对");
@@ -484,6 +513,8 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
       store.audit("extensionApplication.existingContactResumed", {
         applicationId: application.id,
         inspectionRunId: run.data.id,
+        retry: previouslyResolved,
+        previousStopReason: application.stopReason ?? null,
         nativeState: "unknown",
         nativeEvidence: "send-unconfirmed",
         oldHash,

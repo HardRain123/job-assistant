@@ -146,10 +146,138 @@ export async function applicationPageStep(request) {
     }
     return null;
   };
-  // The current editor's ancestors must contain this exact job link AND a
-  // matching employer in the conversation header. A sidebar match is not enough.
+  // Match the editor's own header; never use the contact list or old messages.
   const editorSelector =
     ".chat-editor .chat-input[contenteditable='true'], div.chat-input[contenteditable='true'], #chat-input[contenteditable='true']";
+  const headerFields =
+    "a, button, span, div, p, strong, em, h1, h2, h3, b, label";
+  const leafFields = (root) =>
+    nodes(root, headerFields).filter(
+      (node) =>
+        outsideChatHistory(node) &&
+        node.children.length === 0 &&
+        text(node).length <= 160,
+    );
+  const outsideChatHistory = (node) =>
+    !node.closest(
+      ".message-item, .chat-message, .chat-message-list, .message-list, .chat-record, .user-list, .chat-user-list, .friend-list",
+    );
+  const bindConversation = (root, editor, header) => {
+    // This bounded, visible header stays in the extension worker's memory only.
+    // A changed recruiter/header invalidates all subsequent actions.
+    const binding = JSON.stringify([canonical(job.url), header]);
+    if (request.conversationBinding && request.conversationBinding !== binding)
+      return null;
+    if (
+      request.conversationOrigin &&
+      request.mode !== "inspect" &&
+      !request.conversationBinding
+    )
+      return null;
+    return { root, editor, binding };
+  };
+  // Some current layouts render the job bar as a button-driven card, without a
+  // job-detail href. Accept it only after this dedicated tab navigated from the
+  // exact frozen job, with all four visible header fields agreeing. Geometry
+  // confines the lookup to the editor's own pane, above its message history.
+  const semanticHeader = (root, editor) => {
+    if (
+      canonical(request.conversationOrigin) !== canonical(job.url) ||
+      !clean(job.location) ||
+      !Number.isFinite(job.salaryMin) ||
+      !Number.isFinite(job.salaryMax)
+    )
+      return null;
+    if (
+      typeof editor.getBoundingClientRect !== "function" ||
+      typeof root.getBoundingClientRect !== "function"
+    )
+      return null;
+    const er = editor.getBoundingClientRect(),
+      rr = root.getBoundingClientRect();
+    if (er.width < 200 || rr.left < er.left - 80 || rr.right > er.right + 80)
+      return null;
+    const controls = leafFields(root).filter(
+      (node) => outsideChatHistory(node) && text(node) === "查看职位",
+    );
+    if (controls.length !== 1) return null;
+    for (
+      let card = controls[0].parentElement, depth = 0;
+      card && card !== root && depth < 5;
+      card = card.parentElement, depth++
+    ) {
+      if (!outsideChatHistory(card)) return null;
+      const cr = card.getBoundingClientRect();
+      if (
+        cr.height > 120 ||
+        text(card).length > 400 ||
+        cr.bottom > er.top ||
+        cr.top > rr.top + 200
+      )
+        continue;
+      const fields = leafFields(card);
+      if (
+        fields.filter((node) => text(node) === clean(job.title)).length !== 1 ||
+        fields.filter((node) => text(node) === clean(job.location)).length !== 1
+      )
+        continue;
+      const salaries = fields
+        .map((node) =>
+          text(node).match(
+            /^(\d+(?:\.\d+)?)\s*[-–—~至]\s*(\d+(?:\.\d+)?)\s*[kK]$/,
+          ),
+        )
+        .filter(Boolean);
+      if (
+        salaries.length !== 1 ||
+        Number(salaries[0][1]) * 1000 !== job.salaryMin ||
+        Number(salaries[0][2]) * 1000 !== job.salaryMax
+      )
+        continue;
+      const links = [
+        ...new Set([
+          ...nodes(card, "a[href*='/job_detail/']"),
+          ...nodes(root, "a[href*='/job_detail/']").filter((link) => {
+            if (!outsideChatHistory(link)) return false;
+            const box = link.getBoundingClientRect();
+            return box.top >= rr.top && box.bottom <= cr.bottom;
+          }),
+        ]),
+      ];
+      if (links.some((link) => canonical(link.href) !== canonical(job.url)))
+        return null;
+      const header = leafFields(root).filter((node) => {
+        const box = node.getBoundingClientRect();
+        return (
+          box.top >= cr.top - 100 &&
+          box.bottom <= cr.top + 4 &&
+          box.left >= rr.left &&
+          box.right <= rr.right
+        );
+      });
+      const employer = header.filter((node) =>
+        companies.includes(normCompany(text(node))),
+      );
+      // The screenshot-backed fallback requires an explicit recruiter name,
+      // not an online/activity/role label. Other naming layouts stay unsupported.
+      const recruiters = header.filter((node) =>
+        /^[\p{Script=Han}·]{1,8}(先生|女士)$/u.test(text(node)),
+      );
+      if (
+        employer.length === 1 &&
+        recruiters.length === 1 &&
+        header.length <= 12
+      ) {
+        const labels = header
+          .map((node) => text(node))
+          .filter(Boolean)
+          .sort();
+        if (labels.join(" ").length <= 400)
+          return bindConversation(root, editor, labels);
+      }
+    }
+    return null;
+  };
   const conversation = () => {
     if (!/^\/web\/geek\/chat\/?$/.test(location.pathname)) return null;
     const editors = nodes(document, editorSelector);
@@ -157,12 +285,14 @@ export async function applicationPageStep(request) {
     const editor = editors[0];
     for (
       let root = editor.parentElement, depth = 0;
-      root && depth < 7;
+      root && depth < 12;
       root = root.parentElement, depth++
     ) {
       if (root === document.body || root === document.documentElement) break;
       if (nodes(root, ".user-list, .chat-user-list, .friend-list").length)
         break;
+      const semantic = semanticHeader(root, editor);
+      if (semantic) return semantic;
       const outsideHistory = (node) =>
         !node.closest(
           ".message-item, .user-list, .chat-user-list, .friend-list",
@@ -190,7 +320,11 @@ export async function applicationPageStep(request) {
         );
       });
       if (!employerMatches) continue;
-      return { root, editor };
+      return bindConversation(
+        root,
+        editor,
+        headers.map((header) => text(header).slice(0, 400)).sort(),
+      );
     }
     return null;
   };
@@ -322,6 +456,7 @@ export async function applicationPageStep(request) {
       ? {
           ok: true,
           page: "conversation",
+          conversationBinding: current.binding,
           outgoingCount: outgoing(current.root).length,
         }
       : unknownConversation();

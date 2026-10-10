@@ -105,6 +105,8 @@ export async function runExtensionApplication(api, token) {
   let pageDiagnostic;
   let activeAction = null;
   let authorization = null;
+  let conversationOrigin = null;
+  let conversationBinding = null;
   const heartbeat = async () => {
     const status = await call("heartbeat", {
       taskId: task.id,
@@ -195,7 +197,16 @@ export async function runExtensionApplication(api, token) {
         target: { tabId },
         world: "ISOLATED",
         func: applicationPageStep,
-        args: [{ ...request, job: application.job, authorization, readerKey }],
+        args: [
+          {
+            ...request,
+            job: application.job,
+            authorization,
+            readerKey,
+            conversationOrigin,
+            conversationBinding,
+          },
+        ],
       });
       if (result?.result?.diagnostic) pageDiagnostic = result.result.diagnostic;
       return result?.result || { ok: false, reason: "page-unrecognized" };
@@ -223,7 +234,14 @@ export async function runExtensionApplication(api, token) {
         await sleep(500);
         continue;
       }
-      if (view.ok && view.page === "conversation") return true;
+      if (
+        view.ok &&
+        view.page === "conversation" &&
+        typeof view.conversationBinding === "string"
+      ) {
+        conversationBinding = view.conversationBinding;
+        return true;
+      }
       if (
         ["login-required", "verification-required", "cancelled"].includes(
           view.reason,
@@ -309,6 +327,8 @@ export async function runExtensionApplication(api, token) {
             // Continue is navigation only. Its context can disappear while the
             // new chat loads; confirm the recipient read-only without replay.
           }
+          if (!contact || contact.ok)
+            conversationOrigin = canonicalApplicationUrl(application.job.url);
           if (
             (contact && !contact.ok) ||
             !(await waitConversation(originalTab))
@@ -332,6 +352,8 @@ export async function runExtensionApplication(api, token) {
           mode: "contact",
           expectedExisting: false,
         });
+        if (contact.ok && contact.contactConfirmed)
+          conversationOrigin = canonicalApplicationUrl(application.job.url);
         result =
           contact.ok &&
           contact.contactConfirmed &&
