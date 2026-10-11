@@ -162,25 +162,65 @@ export async function applicationPageStep(request) {
     !node.closest(
       ".message-item, .chat-message, .chat-message-list, .message-list, .chat-record, .user-list, .chat-user-list, .friend-list",
     );
-  const bindConversation = (root, editor, header) => {
+  const semanticProbes = [];
+  const bindConversation = (root, editor, header, probe) => {
     // This bounded, visible header stays in the extension worker's memory only.
     // A changed recruiter/header invalidates all subsequent actions.
     const binding = JSON.stringify([canonical(job.url), header]);
-    if (request.conversationBinding && request.conversationBinding !== binding)
+    if (
+      request.conversationBinding &&
+      request.conversationBinding !== binding
+    ) {
+      if (probe) probe.result = "binding-changed";
       return null;
+    }
     if (
       request.conversationOrigin &&
       request.mode !== "inspect" &&
       !request.conversationBinding
-    )
+    ) {
+      if (probe) probe.result = "binding-missing";
       return null;
+    }
+    if (probe) probe.result = "matched";
     return { root, editor, binding };
   };
   // Some current layouts render the job bar as a button-driven card, without a
   // job-detail href. Accept it only after this dedicated tab navigated from the
   // exact frozen job, with all four visible header fields agreeing. Geometry
   // confines the lookup to the editor's own pane, above its message history.
-  const semanticHeader = (root, editor) => {
+  const semanticHeader = (root, editor, depth) => {
+    // Fixed codes and bounded counts only: no DOM, text, URLs or chat history
+    // leave the page through these diagnostics, and they never grant permission.
+    const probe = {
+      depth,
+      result: "source-unverified",
+      viewControlCount: 0,
+      viewTextCount: 0,
+      titleMatchCount: 0,
+      cityMatchCount: 0,
+      salaryMatchCount: 0,
+      employerMatchCount: 0,
+      recruiterCount: 0,
+    };
+    semanticProbes.push(probe);
+    const stages = [
+      "no-card",
+      "card-bounds",
+      "job-fields",
+      "salary",
+      "conflicting-link",
+      "employer",
+      "recruiter",
+      "header-limit",
+    ];
+    const progress = (result) => {
+      if (stages.indexOf(result) >= stages.indexOf(probe.result))
+        probe.result = result;
+    };
+    const count = (key, value) => {
+      probe[key] = Math.min(20, Math.max(probe[key], value));
+    };
     if (
       canonical(request.conversationOrigin) !== canonical(job.url) ||
       !clean(job.location) ||
@@ -188,6 +228,7 @@ export async function applicationPageStep(request) {
       !Number.isFinite(job.salaryMax)
     )
       return null;
+    probe.result = "geometry-unavailable";
     if (
       typeof editor.getBoundingClientRect !== "function" ||
       typeof root.getBoundingClientRect !== "function"
@@ -195,19 +236,42 @@ export async function applicationPageStep(request) {
       return null;
     const er = editor.getBoundingClientRect(),
       rr = root.getBoundingClientRect();
-    if (er.width < 200 || rr.left < er.left - 80 || rr.right > er.right + 80)
+    if (er.width < 200) {
+      probe.result = "editor-width";
       return null;
+    }
+    if (rr.left < er.left - 80) {
+      probe.result = "pane-left";
+      return null;
+    }
+    if (rr.right > er.right + 80) {
+      probe.result = "pane-right";
+      return null;
+    }
+    probe.result = "view-control";
+    count(
+      "viewTextCount",
+      nodes(root, headerFields).filter(
+        (node) => outsideChatHistory(node) && text(node) === "查看职位",
+      ).length,
+    );
     const controls = leafFields(root).filter(
       (node) => outsideChatHistory(node) && text(node) === "查看职位",
     );
+    count("viewControlCount", controls.length);
     if (controls.length !== 1) return null;
+    progress("no-card");
     for (
       let card = controls[0].parentElement, depth = 0;
       card && card !== root && depth < 5;
       card = card.parentElement, depth++
     ) {
-      if (!outsideChatHistory(card)) return null;
+      if (!outsideChatHistory(card)) {
+        probe.result = "outside-history";
+        return null;
+      }
       const cr = card.getBoundingClientRect();
+      progress("card-bounds");
       if (
         cr.height > 120 ||
         text(card).length > 400 ||
@@ -216,11 +280,21 @@ export async function applicationPageStep(request) {
       )
         continue;
       const fields = leafFields(card);
+      progress("job-fields");
+      count(
+        "titleMatchCount",
+        fields.filter((node) => text(node) === clean(job.title)).length,
+      );
+      count(
+        "cityMatchCount",
+        fields.filter((node) => text(node) === clean(job.location)).length,
+      );
       if (
         fields.filter((node) => text(node) === clean(job.title)).length !== 1 ||
         fields.filter((node) => text(node) === clean(job.location)).length !== 1
       )
         continue;
+      progress("salary");
       const salaries = fields
         .map((node) =>
           text(node).match(
@@ -228,6 +302,14 @@ export async function applicationPageStep(request) {
           ),
         )
         .filter(Boolean);
+      count(
+        "salaryMatchCount",
+        salaries.filter(
+          (salary) =>
+            Number(salary[1]) * 1000 === job.salaryMin &&
+            Number(salary[2]) * 1000 === job.salaryMax,
+        ).length,
+      );
       if (
         salaries.length !== 1 ||
         Number(salaries[0][1]) * 1000 !== job.salaryMin ||
@@ -244,8 +326,10 @@ export async function applicationPageStep(request) {
           }),
         ]),
       ];
-      if (links.some((link) => canonical(link.href) !== canonical(job.url)))
+      if (links.some((link) => canonical(link.href) !== canonical(job.url))) {
+        probe.result = "conflicting-link";
         return null;
+      }
       const header = leafFields(root).filter((node) => {
         const box = node.getBoundingClientRect();
         return (
@@ -263,6 +347,13 @@ export async function applicationPageStep(request) {
       const recruiters = header.filter((node) =>
         /^[\p{Script=Han}·]{1,8}(先生|女士)$/u.test(text(node)),
       );
+      count("employerMatchCount", employer.length);
+      count("recruiterCount", recruiters.length);
+      progress("employer");
+      if (employer.length !== 1) continue;
+      progress("recruiter");
+      if (recruiters.length !== 1) continue;
+      progress("header-limit");
       if (
         employer.length === 1 &&
         recruiters.length === 1 &&
@@ -273,12 +364,13 @@ export async function applicationPageStep(request) {
           .filter(Boolean)
           .sort();
         if (labels.join(" ").length <= 400)
-          return bindConversation(root, editor, labels);
+          return bindConversation(root, editor, labels, probe);
       }
     }
     return null;
   };
   const conversation = () => {
+    semanticProbes.length = 0;
     if (!/^\/web\/geek\/chat\/?$/.test(location.pathname)) return null;
     const editors = nodes(document, editorSelector);
     if (editors.length !== 1) return null;
@@ -291,7 +383,7 @@ export async function applicationPageStep(request) {
       if (root === document.body || root === document.documentElement) break;
       if (nodes(root, ".user-list, .chat-user-list, .friend-list").length)
         break;
-      const semantic = semanticHeader(root, editor);
+      const semantic = semanticHeader(root, editor, depth);
       if (semantic) return semantic;
       const outsideHistory = (node) =>
         !node.closest(
@@ -392,6 +484,7 @@ export async function applicationPageStep(request) {
       activeJobCardCount: Math.min(activeJobCardCount, 20),
       exactJobLinkCount: Math.min(exactJobLinkCount, 20),
       employerFieldMatchCount: Math.min(employerFieldMatchCount, 20),
+      probes: semanticProbes.slice(0, 12),
     };
   };
   const unknownConversation = () => ({

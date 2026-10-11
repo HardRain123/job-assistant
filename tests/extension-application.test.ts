@@ -109,6 +109,133 @@ test("only an entirely unsent layout failure can retry, retaining the original t
     await f.close();
   }
 });
+test("bounded conversation probes persist with idempotent receipts and never authorize pending actions", async () => {
+  const f = await fixture("eligible");
+  try {
+    const selection = { ...f.selection, acceptReview: false };
+    const preview = (
+      await f.workbench("/api/extension-application/preview", selection)
+    ).json();
+    await f.workbench("/api/extension-application/start", {
+      ...selection,
+      expectedConfigurationKey: preview.configurationKey,
+    });
+    const task = (await f.extension("/extension/v1/application/claim")).json()
+      .task;
+    const identity = {
+      taskId: task.id,
+      leaseToken: task.leaseToken,
+      applicationId: task.application.id,
+    };
+    const probe = {
+      depth: 0,
+      result: "view-control",
+      viewControlCount: 0,
+      viewTextCount: 1,
+      titleMatchCount: 0,
+      cityMatchCount: 0,
+      salaryMatchCount: 0,
+      employerMatchCount: 0,
+      recruiterCount: 0,
+    };
+    const diagnostic = {
+      stage: "conversation",
+      editorCount: 1,
+      activeJobCardCount: 0,
+      exactJobLinkCount: 0,
+      employerFieldMatchCount: 0,
+      probes: [probe],
+    };
+    const countFields = [
+      "viewControlCount",
+      "viewTextCount",
+      "titleMatchCount",
+      "cityMatchCount",
+      "salaryMatchCount",
+      "employerMatchCount",
+      "recruiterCount",
+    ];
+    const invalid = [
+      [{ ...probe, html: "private content" }],
+      [{ ...probe, result: "private content" }],
+      [{ ...probe, depth: 12 }],
+      [{ ...probe, depth: -1 }],
+      [{ ...probe, depth: 0.5 }],
+      Array.from({ length: 13 }, () => probe),
+      ...countFields.flatMap((key) => [
+        [{ ...probe, [key]: 21 }],
+        [{ ...probe, [key]: -1 }],
+        [{ ...probe, [key]: 0.5 }],
+      ]),
+    ];
+    for (const probes of invalid) {
+      assert.equal(
+        (
+          await f.extension("/extension/v1/application/result", {
+            ...identity,
+            reason: "recipient-mismatch",
+            diagnostic: { ...diagnostic, probes },
+          })
+        ).statusCode,
+        400,
+      );
+    }
+    assert.equal(
+      f.store.application(identity.applicationId)?.pageDiagnostic,
+      undefined,
+    );
+    const actionsBefore = f.store.application(identity.applicationId)!.actions;
+    const payload = {
+      ...identity,
+      reason: "recipient-mismatch",
+      diagnostic: {
+        ...diagnostic,
+        probes: Array.from({ length: 12 }, (_, depth) => ({
+          ...probe,
+          depth,
+          result: "matched",
+          viewTextCount: 20,
+        })),
+      },
+    };
+    const response = await f.extension(
+      "/extension/v1/application/result",
+      payload,
+    );
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.json().status, "needs-review");
+    assert.deepEqual(
+      f.store.application(identity.applicationId)!.actions,
+      actionsBefore,
+    );
+    assert.ok(actionsBefore.every((action) => action.state === "pending"));
+    const reopened = new Store(join(f.attachmentsDir, "..", "db.sqlite"));
+    try {
+      assert.deepEqual(
+        reopened.application(identity.applicationId)?.pageDiagnostic,
+        payload.diagnostic,
+      );
+    } finally {
+      reopened.close();
+    }
+    assert.equal(
+      (await f.extension("/extension/v1/application/result", payload))
+        .statusCode,
+      200,
+    );
+    assert.equal(
+      (
+        await f.extension("/extension/v1/application/result", {
+          ...payload,
+          diagnostic,
+        })
+      ).statusCode,
+      400,
+    );
+  } finally {
+    await f.close();
+  }
+});
 async function fixture(
   decision: Assessment["decision"] = "review",
   gates: Assessment["gates"] = [

@@ -124,13 +124,57 @@ export interface ApplicationAction {
   resolution?: "contact-exists";
   updatedAt: string;
 }
+export const CONVERSATION_PROBE_RESULTS = [
+  "source-unverified",
+  "geometry-unavailable",
+  "editor-width",
+  "pane-left",
+  "pane-right",
+  "view-control",
+  "outside-history",
+  "no-card",
+  "card-bounds",
+  "job-fields",
+  "salary",
+  "conflicting-link",
+  "employer",
+  "recruiter",
+  "header-limit",
+  "binding-changed",
+  "binding-missing",
+  "matched",
+] as const;
+export interface ConversationProbe {
+  depth: number;
+  result: (typeof CONVERSATION_PROBE_RESULTS)[number];
+  viewControlCount: number;
+  viewTextCount: number;
+  titleMatchCount: number;
+  cityMatchCount: number;
+  salaryMatchCount: number;
+  employerMatchCount: number;
+  recruiterCount: number;
+}
 export interface Application {
   id: string;
   executor?: "worker" | "extension";
   stopReason?: string;
   pageDiagnostic?:
-    | { stage: "detail-entry"; controlCount: number; knownControlCount: number; titleCount: number; tags: string[] }
-    | { stage: "conversation"; editorCount: number; activeJobCardCount: number; exactJobLinkCount: number; employerFieldMatchCount: number };
+    | {
+        stage: "detail-entry";
+        controlCount: number;
+        knownControlCount: number;
+        titleCount: number;
+        tags: string[];
+      }
+    | {
+        stage: "conversation";
+        editorCount: number;
+        activeJobCardCount: number;
+        exactJobLinkCount: number;
+        employerFieldMatchCount: number;
+        probes?: ConversationProbe[];
+      };
   batchId: string;
   jobId: string;
   job: Job;

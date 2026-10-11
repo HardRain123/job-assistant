@@ -2,7 +2,10 @@ import { FormEvent, ReactNode, useEffect, useRef, useState } from "react";
 import { accountLabel, isChatGPTAccount, modelNames } from "./provider-view";
 import { ExtensionPanel } from "./ExtensionPanel";
 import { AutomationPanel } from "./AutomationPanel";
-import type { Application as StoredApplication } from "../../../packages/contracts/src/index";
+import type {
+  Application as StoredApplication,
+  ConversationProbe,
+} from "../../../packages/contracts/src/index";
 
 type Tab =
   | "工作台"
@@ -16,6 +19,26 @@ type Tab =
   | "投递记录"
   | "浏览器";
 type Json = Record<string, unknown>;
+const conversationProbeLabels: Record<ConversationProbe["result"], string> = {
+  "source-unverified": "尚未核实会话来源岗位",
+  "geometry-unavailable": "无法读取页面区域位置",
+  "editor-width": "输入框宽度不足",
+  "pane-left": "区域左侧超出会话范围",
+  "pane-right": "区域右侧超出会话范围",
+  "view-control": "查看职位入口数量不符",
+  "outside-history": "入口处于历史消息或联系人区域",
+  "no-card": "未找到当前岗位卡片",
+  "card-bounds": "岗位卡片位置或范围不符",
+  "job-fields": "岗位名称或城市匹配不符",
+  salary: "薪资匹配不符",
+  "conflicting-link": "岗位链接与目标不符",
+  employer: "雇主匹配不符",
+  recruiter: "招聘者标识数量不符",
+  "header-limit": "头部字段数量或长度超限",
+  "binding-changed": "会话绑定发生变化",
+  "binding-missing": "缺少已验证的会话绑定",
+  matched: "页面识别条件匹配（仅诊断结果）",
+};
 interface Resume {
   id: string;
   name: string;
@@ -1847,12 +1870,33 @@ function Records({
                   <p>{stopReasons[a.stopReason] ?? "投递需人工核对。"}</p>
                 )}
                 {a.pageDiagnostic?.stage === "conversation" && (
-                  <p>
-                    会话识别：输入框 {a.pageDiagnostic.editorCount}
-                    ，当前岗位区域 {a.pageDiagnostic.activeJobCardCount}
-                    ，目标岗位链接 {a.pageDiagnostic.exactJobLinkCount}
-                    ，雇主匹配 {a.pageDiagnostic.employerFieldMatchCount}。
-                  </p>
+                  <div>
+                    <p>
+                      会话识别：输入框 {a.pageDiagnostic.editorCount}
+                      ，当前岗位区域 {a.pageDiagnostic.activeJobCardCount}
+                      ，目标岗位链接 {a.pageDiagnostic.exactJobLinkCount}
+                      ，雇主匹配 {a.pageDiagnostic.employerFieldMatchCount}。
+                    </p>
+                    {!!a.pageDiagnostic.probes?.length && (
+                      <details>
+                        <summary>查看逐层识别诊断</summary>
+                        {a.pageDiagnostic.probes.map((probe, index) => (
+                          <p key={index}>
+                            第 {probe.depth + 1} 层：
+                            {conversationProbeLabels[probe.result] ??
+                              "未知诊断类型"}
+                            。查看职位入口 {probe.viewControlCount}，入口文字{" "}
+                            {probe.viewTextCount}，岗位名称{" "}
+                            {probe.titleMatchCount}
+                            ，城市 {probe.cityMatchCount}，薪资{" "}
+                            {probe.salaryMatchCount}，雇主{" "}
+                            {probe.employerMatchCount}，招聘者{" "}
+                            {probe.recruiterCount}。
+                          </p>
+                        ))}
+                      </details>
+                    )}
+                  </div>
                 )}
                 {a.status === "needs-review" &&
                   ["page-unrecognized", "recipient-mismatch"].includes(

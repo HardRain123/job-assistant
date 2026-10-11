@@ -788,7 +788,11 @@ test("failed conversation inspection reports only bounded counts, excluding hist
   f.header.innerText = "其他公司";
   const result = await runPage(f.document, { mode: "inspect" });
   assert.equal(result.ok, false);
-  assert.deepEqual(JSON.parse(JSON.stringify(result.diagnostic)), {
+  const { probes, ...legacyDiagnostic } = JSON.parse(
+    JSON.stringify(result.diagnostic),
+  );
+  assert.equal(probes[0].result, "source-unverified");
+  assert.deepEqual(legacyDiagnostic, {
     stage: "conversation",
     editorCount: 1,
     activeJobCardCount: 1,
@@ -801,6 +805,85 @@ test("failed conversation inspection reports only bounded counts, excluding hist
       .exactJobLinkCount,
     0,
   );
+});
+test("semantic diagnostics pinpoint the failed gate without returning visible text or granting sends", async () => {
+  const cases: Array<[string, (f: any) => void]> = [
+    [
+      "view-control",
+      (f) => {
+        f.view.children = [element()];
+      },
+    ],
+    [
+      "job-fields",
+      (f) => {
+        f.city.innerText = "其他城市";
+      },
+    ],
+    [
+      "salary",
+      (f) => {
+        f.salary.innerText = "10-15K";
+      },
+    ],
+    [
+      "employer",
+      (f) => {
+        f.employer.innerText = "其他公司";
+      },
+    ],
+    [
+      "recruiter",
+      (f) => {
+        f.recruiter.innerText = "在线";
+      },
+    ],
+    [
+      "pane-left",
+      (f) => {
+        f.root.getBoundingClientRect = () => ({
+          left: 0,
+          right: 1020,
+          top: 100,
+        });
+      },
+    ],
+  ];
+  for (const [expected, modify] of cases) {
+    const f = semanticChatFixture();
+    modify(f);
+    let clicks = 0;
+    f.button.click = () => clicks++;
+    const result = await runPage(f.document, {
+      mode: "inspect",
+      conversationOrigin: job.url,
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.diagnostic.probes[0].result, expected);
+    assert.equal(clicks, 0);
+    const serialized = JSON.stringify(result.diagnostic);
+    for (const sensitive of [
+      job.title,
+      job.company,
+      job.location,
+      job.url,
+      "王先生",
+      "其他公司",
+    ])
+      assert.equal(serialized.includes(sensitive), false);
+    if (expected === "view-control") {
+      assert.equal(result.diagnostic.probes[0].viewTextCount, 1);
+      assert.equal(result.diagnostic.probes[0].viewControlCount, 0);
+    }
+  }
+  const f = semanticChatFixture();
+  f.allFields.push(...Array.from({ length: 40 }, () => element("查看职位")));
+  const result = await runPage(f.document, {
+    mode: "inspect",
+    conversationOrigin: job.url,
+  });
+  assert.equal(result.diagnostic.probes[0].viewTextCount, 20);
+  assert.equal(result.diagnostic.probes[0].viewControlCount, 20);
 });
 test("runner refuses duplicate begin permission and stops after an uncertain message before attachment", async () => {
   const denied = runnerFixture({ execute: false });

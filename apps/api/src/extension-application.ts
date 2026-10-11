@@ -3,6 +3,7 @@ import { lstatSync, readFileSync } from "node:fs";
 import { basename, extname, join } from "node:path";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
+import { CONVERSATION_PROBE_RESULTS } from "../../../packages/contracts/src/index.ts";
 import type {
   Application,
   Assessment,
@@ -706,6 +707,24 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
                 activeJobCardCount: z.number().int().min(0).max(20),
                 exactJobLinkCount: z.number().int().min(0).max(20),
                 employerFieldMatchCount: z.number().int().min(0).max(20),
+                probes: z
+                  .array(
+                    z
+                      .object({
+                        depth: z.number().int().min(0).max(11),
+                        result: z.enum(CONVERSATION_PROBE_RESULTS),
+                        viewControlCount: z.number().int().min(0).max(20),
+                        viewTextCount: z.number().int().min(0).max(20),
+                        titleMatchCount: z.number().int().min(0).max(20),
+                        cityMatchCount: z.number().int().min(0).max(20),
+                        salaryMatchCount: z.number().int().min(0).max(20),
+                        employerMatchCount: z.number().int().min(0).max(20),
+                        recruiterCount: z.number().int().min(0).max(20),
+                      })
+                      .strict(),
+                  )
+                  .max(12)
+                  .optional(),
               })
               .strict(),
           ])
