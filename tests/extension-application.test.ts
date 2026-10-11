@@ -5,7 +5,10 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApp } from "../apps/api/src/app.ts";
-import { Store } from "../packages/storage/src/index.ts";
+import {
+  Store,
+  actionCompleteForExistingContact,
+} from "../packages/storage/src/index.ts";
 import {
   DEFAULT_POLICY,
   type Assessment,
@@ -454,6 +457,375 @@ async function stageExistingContact(f: Awaited<ReturnType<typeof fixture>>) {
   f.store.set("automation.current", run);
   return { identity, native, run, inspectionRunId };
 }
+
+async function stageUncertainMessage(f: Awaited<ReturnType<typeof fixture>>) {
+  const template = f.store.get<any>("template", null);
+  f.store.set("template", {
+    ...template,
+    segments: [...template.segments, "到岗时间：一周"],
+  });
+  const staged = await stageExistingContact(f);
+  const resumed = await f.workbench(
+    "/api/extension-application/resume-existing-contact",
+    {
+      applicationId: staged.identity.applicationId,
+      inspectionRunId: staged.inspectionRunId,
+    },
+  );
+  assert.equal(resumed.statusCode, 200, resumed.body);
+  const task = (await f.extension("/extension/v1/application/claim")).json()
+    .task;
+  const identity = {
+    taskId: task.id,
+    leaseToken: task.leaseToken,
+    applicationId: task.application.id,
+  };
+  const action = task.application.actions[1];
+  for (const [state, evidence] of [
+    ["started", "before-action"],
+    ["unknown", "send-unconfirmed"],
+  ]) {
+    const response = await f.extension("/extension/v1/application/action", {
+      ...identity,
+      actionId: action.id,
+      state,
+      evidence,
+    });
+    assert.equal(response.statusCode, 200, response.body);
+  }
+  const diagnostic = {
+    stage: "conversation",
+    editorCount: 1,
+    activeJobCardCount: 1,
+    exactJobLinkCount: 1,
+    employerFieldMatchCount: 1,
+  };
+  assert.equal(
+    (
+      await f.extension("/extension/v1/application/result", {
+        ...identity,
+        reason: "send-unconfirmed",
+        diagnostic,
+      })
+    ).json().status,
+    "needs-review",
+  );
+  const run = {
+    ...staged.run,
+    id: randomUUID(),
+    updatedAt: new Date().toISOString(),
+  };
+  f.store.set("automation.current", run);
+  const request = {
+    applicationId: identity.applicationId,
+    actionId: action.id,
+    expectedTextHash: createHash("sha256").update(action.text).digest("hex"),
+    inspectionRunId: run.id,
+  };
+  return { identity, action, run, request, diagnostic };
+}
+
+test("authenticated manual message confirmation preserves uncertainty, audits it and resumes only pending work", async () => {
+  const f = await fixture("eligible");
+  try {
+    const staged = await stageUncertainMessage(f);
+    const url = "/api/extension-application/confirm-message-and-resume";
+    assert.equal(
+      (await f.app.inject({ method: "POST", url, payload: staged.request }))
+        .statusCode,
+      401,
+    );
+    assert.equal((await f.extension(url, staged.request)).statusCode, 403);
+    const before = f.store.application(staged.identity.applicationId)!;
+    const response = await f.workbench(url, staged.request);
+    assert.equal(response.statusCode, 200, response.body);
+    assert.equal((await f.workbench(url, staged.request)).statusCode, 400);
+    assert.equal(f.store.tasks().length, 3);
+    const saved = f.store.application(before.id)!;
+    assert.equal(saved.status, "queued");
+    assert.equal(saved.stopReason, undefined);
+    assert.equal(saved.pageDiagnostic, undefined);
+    assert.deepEqual(saved.actions[0], before.actions[0]);
+    assert.equal(saved.actions[1]!.state, "unknown");
+    assert.equal(saved.actions[1]!.evidence, "send-unconfirmed");
+    assert.equal(saved.actions[1]!.resolution, "user-confirmed-sent");
+    assert.deepEqual(saved.frozenMessages, before.frozenMessages);
+    const audit = JSON.parse(
+      String(
+        f.store.db
+          .prepare(
+            "SELECT body FROM audit WHERE event='extensionApplication.messageConfirmedAndResumed'",
+          )
+          .get()?.body,
+      ),
+    );
+    assert.equal(audit.actionId, staged.action.id);
+    assert.equal(audit.textHash, staged.request.expectedTextHash);
+    assert.equal(audit.previousState, "unknown");
+    assert.equal(audit.previousEvidence, "send-unconfirmed");
+    assert.deepEqual(audit.previousDiagnostic, staged.diagnostic);
+    const payload = f.store.tasks().find((task) => task.status === "queued")!
+      .payload as typeof saved;
+    assert.deepEqual(payload.actions, saved.actions);
+    const task = (await f.extension("/extension/v1/application/claim")).json()
+      .task;
+    assert.deepEqual(
+      task.application.actions.map((action: any) => action.id),
+      [saved.actions[0]!.id, saved.actions[2]!.id, saved.actions[3]!.id],
+    );
+    const identity = {
+      taskId: task.id,
+      leaseToken: task.leaseToken,
+      applicationId: saved.id,
+    };
+    for (const path of ["authorize", "action"]) {
+      const extra =
+        path === "action"
+          ? { state: "started", evidence: "before-action" }
+          : {};
+      assert.equal(
+        (
+          await f.extension(`/extension/v1/application/${path}`, {
+            ...identity,
+            actionId: staged.action.id,
+            ...extra,
+          })
+        ).statusCode,
+        400,
+      );
+    }
+    assert.equal(
+      (
+        await f.extension("/extension/v1/application/action", {
+          ...identity,
+          actionId: saved.actions[2]!.id,
+          state: "started",
+          evidence: "before-action",
+          resolution: "user-confirmed-sent",
+        })
+      ).statusCode,
+      400,
+    );
+    for (const action of saved.actions.slice(2)) {
+      assert.equal(
+        (
+          await f.extension("/extension/v1/application/action", {
+            ...identity,
+            actionId: action.id,
+            state: "started",
+            evidence: "before-action",
+          })
+        ).json().execute,
+        true,
+      );
+      if (action.kind === "attachment")
+        assert.equal(
+          (
+            await f.extension("/extension/v1/application/attachment", {
+              ...identity,
+              actionId: action.id,
+            })
+          ).statusCode,
+          200,
+        );
+      assert.equal(
+        (
+          await f.extension("/extension/v1/application/action", {
+            ...identity,
+            actionId: action.id,
+            state: "confirmed",
+            evidence:
+              action.kind === "attachment" ? "new-attachment" : "new-message",
+          })
+        ).statusCode,
+        200,
+      );
+    }
+    // Successful completion must remove even old diagnostics restored by a stale client.
+    const running = f.store.application(saved.id)!;
+    running.stopReason = "send-unconfirmed";
+    running.pageDiagnostic = staged.diagnostic as typeof running.pageDiagnostic;
+    f.store.updateApplication(running);
+    assert.equal(
+      (await f.extension("/extension/v1/application/result", identity)).json()
+        .status,
+      "completed",
+    );
+    const completed = f.store.application(saved.id)!;
+    assert.ok(completed.actions.every(actionCompleteForExistingContact));
+    assert.equal(completed.actions[1]!.state, "unknown");
+    assert.equal(completed.stopReason, undefined);
+    assert.equal(completed.pageDiagnostic, undefined);
+  } finally {
+    await f.close();
+  }
+});
+
+test("manual reconciliation rejects mismatched text, non-message actions, stale or reused inspection and altered frozen inputs", async () => {
+  const cases = [
+    "wrong-hash",
+    "native",
+    "attachment",
+    "expired",
+    "wrong-job",
+    "no-contact",
+    "used-inspection",
+    "configuration",
+    "attachment-bytes",
+    "job-changed",
+    "later-unknown",
+    "prior-unresolved",
+    "prior-confirmed",
+    "no-contact-audit",
+    "no-pending",
+    "wrong-stop",
+  ] as const;
+  for (const scenario of cases) {
+    const f = await fixture("eligible");
+    try {
+      const staged = await stageUncertainMessage(f);
+      const application = f.store.application(staged.identity.applicationId)!;
+      const request = { ...staged.request };
+      if (scenario === "wrong-hash") request.expectedTextHash = "0".repeat(64);
+      if (scenario === "native") request.actionId = application.actions[0]!.id;
+      if (scenario === "attachment")
+        request.actionId = application.actions.at(-1)!.id;
+      if (scenario === "expired")
+        staged.run.updatedAt = new Date(Date.now() - 91000).toISOString();
+      if (scenario === "wrong-job") staged.run.inspectionJobId = randomUUID();
+      if (scenario === "no-contact")
+        staged.run.fieldReadings[0]!.evidence.headerLines = ["立即沟通"];
+      if (scenario === "used-inspection")
+        f.store.audit("extensionApplication.existingContactResumed", {
+          applicationId: application.id,
+          inspectionRunId: staged.run.id,
+        });
+      if (scenario === "configuration")
+        f.store.set("template", {
+          ...f.store.get<any>("template", null),
+          version: 999,
+        });
+      if (scenario === "attachment-bytes")
+        writeFileSync(
+          join(f.attachmentsDir, f.attachmentName),
+          "%PDF-1.4 changed",
+        );
+      if (scenario === "job-changed")
+        f.store.upsertJob({ ...f.job, description: "不同工作内容" });
+      if (scenario === "later-unknown")
+        application.actions[2]!.state = "unknown";
+      if (scenario === "prior-unresolved")
+        delete application.actions[0]!.resolution;
+      if (scenario === "prior-confirmed")
+        application.actions[0]!.state = "confirmed";
+      if (scenario === "no-contact-audit")
+        f.store.db
+          .prepare(
+            "DELETE FROM audit WHERE event='extensionApplication.existingContactResumed'",
+          )
+          .run();
+      if (scenario === "no-pending")
+        application.actions = application.actions.slice(0, 2);
+      if (scenario === "wrong-stop")
+        application.stopReason = "recipient-mismatch";
+      f.store.updateApplication(application);
+      f.store.set("automation.current", staged.run);
+      const response = await f.workbench(
+        "/api/extension-application/confirm-message-and-resume",
+        request,
+      );
+      assert.equal(response.statusCode, 400, scenario + ": " + response.body);
+      assert.equal(f.store.tasks().length, 2, scenario);
+      assert.equal(
+        f.store.application(application.id)!.actions[1]!.resolution,
+        undefined,
+        scenario,
+      );
+      assert.equal(
+        f.store.db
+          .prepare(
+            "SELECT count(*) n FROM audit WHERE event='extensionApplication.messageConfirmedAndResumed'",
+          )
+          .get()?.n,
+        0,
+        scenario,
+      );
+    } finally {
+      await f.close();
+    }
+  }
+});
+
+test("another unknown segment can be reconciled once after a new inspection, without replaying prior messages", async () => {
+  const f = await fixture("eligible");
+  try {
+    const staged = await stageUncertainMessage(f);
+    const url = "/api/extension-application/confirm-message-and-resume";
+    assert.equal((await f.workbench(url, staged.request)).statusCode, 200);
+    const task = (await f.extension("/extension/v1/application/claim")).json()
+      .task;
+    const identity = {
+      taskId: task.id,
+      leaseToken: task.leaseToken,
+      applicationId: staged.identity.applicationId,
+    };
+    const action = task.application.actions.find(
+      (item: any) => item.kind === "message",
+    );
+    for (const [state, evidence] of [
+      ["started", "before-action"],
+      ["unknown", "send-unconfirmed"],
+    ])
+      assert.equal(
+        (
+          await f.extension("/extension/v1/application/action", {
+            ...identity,
+            actionId: action.id,
+            state,
+            evidence,
+          })
+        ).statusCode,
+        200,
+      );
+    await f.extension("/extension/v1/application/result", {
+      ...identity,
+      reason: "send-unconfirmed",
+    });
+    assert.equal(
+      f.store.application(identity.applicationId)?.pageDiagnostic,
+      undefined,
+    );
+    const request = {
+      ...staged.request,
+      actionId: action.id,
+      expectedTextHash: createHash("sha256").update(action.text).digest("hex"),
+    };
+    assert.equal((await f.workbench(url, request)).statusCode, 400);
+    request.inspectionRunId = randomUUID();
+    f.store.set("automation.current", {
+      ...staged.run,
+      id: request.inspectionRunId,
+      updatedAt: new Date().toISOString(),
+    });
+    assert.equal((await f.workbench(url, request)).statusCode, 200);
+    const lastTask = (
+      await f.extension("/extension/v1/application/claim")
+    ).json().task;
+    assert.deepEqual(
+      lastTask.application.actions.map((item: any) => item.kind),
+      ["native-greeting", "attachment"],
+    );
+    assert.equal(
+      f.store
+        .application(identity.applicationId)
+        ?.actions.filter((item) => item.resolution === "user-confirmed-sent")
+        .length,
+      2,
+    );
+  } finally {
+    await f.close();
+  }
+});
 
 test("fresh exact read-only inspection resumes only pending messages while native remains unknown", async () => {
   const f = await fixture("eligible");

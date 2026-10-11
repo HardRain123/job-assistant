@@ -10,9 +10,14 @@ import type {
 } from "../../contracts/src/index.ts";
 
 export const actionCompleteForExistingContact = (action: ApplicationAction) =>
-  action.state === "confirmed" || action.state === "skipped" ||
-  (action.kind === "native-greeting" && action.state === "unknown" &&
-    action.evidence === "send-unconfirmed" && action.resolution === "contact-exists");
+  action.state === "confirmed" ||
+  action.state === "skipped" ||
+  (action.state === "unknown" &&
+    action.evidence === "send-unconfirmed" &&
+    ((action.kind === "native-greeting" &&
+      action.resolution === "contact-exists") ||
+      (action.kind === "message" &&
+        action.resolution === "user-confirmed-sent")));
 
 export class Store {
   db: DatabaseSync;
@@ -259,7 +264,8 @@ export class Store {
         !old ||
         old.kind !== action.kind ||
         old.index !== action.index ||
-        old.text !== action.text
+        old.text !== action.text ||
+        old.resolution !== action.resolution
       )
         throw new Error("动作与冻结批次不一致");
       if (old.state === action.state) {
@@ -281,9 +287,7 @@ export class Store {
         action.state === "started" &&
         action.kind !== "native-greeting" &&
         app.actions.some(
-          (a) =>
-            a.index < action.index &&
-            !actionCompleteForExistingContact(a),
+          (a) => a.index < action.index && !actionCompleteForExistingContact(a),
         )
       )
         throw new Error("前序话术尚未确认发送");

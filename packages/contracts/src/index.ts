@@ -121,7 +121,7 @@ export interface ApplicationAction {
   text: string | null;
   state: ActionState;
   evidence: string | null;
-  resolution?: "contact-exists";
+  resolution?: "contact-exists" | "user-confirmed-sent";
   updatedAt: string;
 }
 export const CONVERSATION_PROBE_RESULTS = [

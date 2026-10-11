@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { Store } from "../packages/storage/src/index.ts";
+import {
+  Store,
+  actionCompleteForExistingContact,
+} from "../packages/storage/src/index.ts";
 import {
   DEFAULT_TEMPLATE,
   type Application,
@@ -172,6 +175,83 @@ test("不可伪造冻结话术且单个岗位不能重复进入批次", () => {
           state: "started",
         }),
       /冻结/,
+    );
+  } finally {
+    s.close();
+  }
+});
+test("人工确认仅放行已核对的未知话术，动作回调不能伪造或移除人工结论", () => {
+  const s = new Store(":memory:");
+  try {
+    const a = application();
+    const message = {
+      ...a.actions[1]!,
+      state: "unknown" as const,
+      evidence: "send-unconfirmed",
+      resolution: "user-confirmed-sent" as const,
+    };
+    assert.equal(actionCompleteForExistingContact(message), true);
+    assert.equal(
+      actionCompleteForExistingContact({ ...message, kind: "attachment" }),
+      false,
+    );
+    assert.equal(
+      actionCompleteForExistingContact({ ...message, kind: "native-greeting" }),
+      false,
+    );
+    assert.equal(
+      actionCompleteForExistingContact({
+        ...message,
+        evidence: "before-action",
+      }),
+      false,
+    );
+    assert.equal(
+      actionCompleteForExistingContact({ ...message, resolution: undefined }),
+      false,
+    );
+    s.insertApplication(a);
+    const id = s.enqueue("apply", a);
+    const t = s.claim()!;
+    assert.throws(
+      () =>
+        s.recordAction(id, t.leaseToken!, a.id, {
+          ...a.actions[1]!,
+          state: "pending",
+          resolution: "user-confirmed-sent",
+        }),
+      /冻结/,
+    );
+    assert.throws(
+      () =>
+        s.recordAction(id, t.leaseToken!, a.id, {
+          ...a.actions[1]!,
+          state: "started",
+          resolution: "user-confirmed-sent",
+        }),
+      /冻结/,
+    );
+    a.actions[1] = message;
+    s.updateApplication(a);
+    assert.throws(
+      () =>
+        s.recordAction(id, t.leaseToken!, a.id, {
+          ...message,
+          resolution: undefined,
+        }),
+      /冻结/,
+    );
+    assert.throws(
+      () =>
+        s.recordAction(id, t.leaseToken!, a.id, {
+          ...message,
+          state: "started",
+        }),
+      /倒退/,
+    );
+    assert.equal(
+      s.application(a.id)?.actions[1]!.resolution,
+      "user-confirmed-sent",
     );
   } finally {
     s.close();

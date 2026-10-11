@@ -316,6 +316,75 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
     .passthrough();
   const isContinueContact = (line: string) =>
     /(?:^|[\s，,。;；:：|/])继续沟通(?:$|[\s，,。;；:：|/])/u.test(line);
+  const requireContactInspection = (
+    application: Application,
+    current: Job,
+    inspectionRunId: string,
+  ) => {
+    const run = inspectionShape.safeParse(
+      store.get("automation.current", null),
+    );
+    const checkedAt = run.success ? Date.parse(run.data.updatedAt) : NaN;
+    if (
+      !run.success ||
+      run.data.id !== inspectionRunId ||
+      run.data.inspectionJobId !== application.jobId ||
+      run.data.jobIds[0] !== application.jobId ||
+      !Number.isFinite(checkedAt) ||
+      Date.now() - checkedAt > 90000 ||
+      checkedAt > Date.now() + 5000
+    )
+      throw new Error("指定岗位的只读检查缺失或已过期");
+    if (
+      store.db
+        .prepare(
+          "SELECT id FROM audit WHERE event IN ('extensionApplication.existingContactResumed','extensionApplication.messageConfirmedAndResumed') AND json_extract(body,'$.applicationId')=? AND json_extract(body,'$.inspectionRunId')=? LIMIT 1",
+        )
+        .get(application.id, inspectionRunId)
+    )
+      throw new Error("请重新只读检查该岗位后再接续");
+    const evidence = run.data.fieldReadings[0]!;
+    if (
+      canonicalJobUrl(evidence.url) !== canonicalJobUrl(current.url) ||
+      evidence.evidence.title !== current.title ||
+      companyName(evidence.evidence.company) !== companyName(current.company) ||
+      !evidence.evidence.headerLines.some(isContinueContact) ||
+      evidence.evidence.headerLines.some((line) => line.includes("立即沟通"))
+    )
+      throw new Error("只读页面未能确认该岗位已有联系");
+    return run.data;
+  };
+  const requireExistingContactAudit = (application: Application) => {
+    if (
+      !store.db
+        .prepare(
+          "SELECT id FROM audit WHERE event='extensionApplication.existingContactResumed' AND json_extract(body,'$.applicationId')=? AND json_extract(body,'$.currentHash')=? LIMIT 1",
+        )
+        .get(application.id, application.job.contentHash)
+    )
+      throw new Error("已有联系人接续记录缺失，请人工核对");
+  };
+  const manuallyConfirmedMessage = (action: Application["actions"][number]) =>
+    action.kind === "message" &&
+    action.state === "unknown" &&
+    action.evidence === "send-unconfirmed" &&
+    action.resolution === "user-confirmed-sent";
+  const requireMessageConfirmationAudit = (
+    application: Application,
+    action: Application["actions"][number],
+  ) => {
+    const textHash = createHash("sha256")
+      .update(action.text ?? "")
+      .digest("hex");
+    if (
+      !store.db
+        .prepare(
+          "SELECT id FROM audit WHERE event='extensionApplication.messageConfirmedAndResumed' AND json_extract(body,'$.applicationId')=? AND json_extract(body,'$.actionId')=? AND json_extract(body,'$.textHash')=? LIMIT 1",
+        )
+        .get(application.id, action.id, textHash)
+    )
+      throw new Error("话术人工确认记录缺失，请人工核对");
+  };
   const requireBeginReady = (application: Application) => {
     if (
       store.get("paused", false) ||
@@ -435,29 +504,6 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
       )
         throw new Error("已有联系人任务仅页面识别失败时可再次接续");
       requireConfig(application);
-      const run = inspectionShape.safeParse(
-        store.get("automation.current", null),
-      );
-      const checkedAt = run.success ? Date.parse(run.data.updatedAt) : NaN;
-      if (
-        !run.success ||
-        run.data.id !== body.inspectionRunId ||
-        run.data.inspectionJobId !== application.jobId ||
-        run.data.jobIds[0] !== application.jobId ||
-        !Number.isFinite(checkedAt) ||
-        Date.now() - checkedAt > 90000 ||
-        checkedAt > Date.now() + 5000
-      )
-        throw new Error("指定岗位的只读检查缺失或已过期");
-      if (
-        previouslyResolved &&
-        store.db
-          .prepare(
-            "SELECT id FROM audit WHERE event='extensionApplication.existingContactResumed' AND json_extract(body,'$.applicationId')=? AND json_extract(body,'$.inspectionRunId')=? LIMIT 1",
-          )
-          .get(application.id, body.inspectionRunId)
-      )
-        throw new Error("请重新只读检查该岗位后再接续");
       if (!previouslyResolved) {
         const prior = o.assessment(application.job);
         if (
@@ -469,15 +515,7 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
           prior.gates.some((gate) => gate.status !== "pass")
         )
           throw new Error("原岗位匹配条件已失效，请人工核对");
-      } else if (
-        !store.db
-          .prepare(
-            "SELECT id FROM audit WHERE event='extensionApplication.existingContactResumed' AND json_extract(body,'$.applicationId')=? AND json_extract(body,'$.currentHash')=? LIMIT 1",
-          )
-          .get(application.id, application.job.contentHash)
-      ) {
-        throw new Error("已有联系人接续记录缺失，请人工核对");
-      }
+      } else requireExistingContactAudit(application);
       const current = store.job(application.jobId);
       if (
         !current ||
@@ -495,32 +533,135 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
         )
       )
         throw new Error("当前岗位硬条件未通过，请人工核对");
-      const evidence = run.data.fieldReadings[0]!;
-      if (
-        canonicalJobUrl(evidence.url) !== canonicalJobUrl(current.url) ||
-        evidence.evidence.title !== current.title ||
-        companyName(evidence.evidence.company) !==
-          companyName(current.company) ||
-        !evidence.evidence.headerLines.some(isContinueContact) ||
-        evidence.evidence.headerLines.some((line) => line.includes("立即沟通"))
-      )
-        throw new Error("只读页面未能确认该岗位已有联系");
+      const run = requireContactInspection(
+        application,
+        current,
+        body.inspectionRunId,
+      );
       const oldHash = application.job.contentHash;
+      const previousStopReason = application.stopReason ?? null;
       native!.resolution = "contact-exists";
       application.job = current;
       application.status = "queued";
+      delete application.stopReason;
+      delete application.pageDiagnostic;
       store.updateApplication(application);
       store.enqueue("apply", application);
       store.audit("extensionApplication.existingContactResumed", {
         applicationId: application.id,
-        inspectionRunId: run.data.id,
+        inspectionRunId: run.id,
         retry: previouslyResolved,
-        previousStopReason: application.stopReason ?? null,
+        previousStopReason,
         nativeState: "unknown",
         nativeEvidence: "send-unconfirmed",
         oldHash,
         currentHash: current.contentHash,
       });
+      return { applicationId: application.id };
+    });
+  });
+  app.post("/api/extension-application/confirm-message-and-resume", (req) => {
+    const body = z
+      .object({
+        applicationId: z.string().uuid(),
+        actionId: z.string().uuid(),
+        expectedTextHash: z.string().regex(/^[a-f0-9]{64}$/),
+        inspectionRunId: z.string().uuid(),
+      })
+      .strict()
+      .parse(req.body);
+    requireConnection([0, 3, 4]);
+    return store.transaction(() => {
+      requireReady();
+      const application = store.application(body.applicationId);
+      if (
+        !application ||
+        application.executor !== "extension" ||
+        application.status !== "needs-review" ||
+        application.stopReason !== "send-unconfirmed"
+      )
+        throw new Error("当前投递不支持人工确认话术后接续");
+      const action = application.actions.find(
+        (item) => item.id === body.actionId,
+      );
+      if (
+        !action ||
+        action.kind !== "message" ||
+        action.state !== "unknown" ||
+        action.evidence !== "send-unconfirmed" ||
+        action.resolution ||
+        !action.text ||
+        createHash("sha256").update(action.text).digest("hex") !==
+          body.expectedTextHash
+      )
+        throw new Error("只能确认内容一致且发送结果未知的话术");
+      const native = application.actions[0];
+      if (
+        !native ||
+        native.kind !== "native-greeting" ||
+        native.index !== 0 ||
+        native.state !== "unknown" ||
+        native.evidence !== "send-unconfirmed" ||
+        native.resolution !== "contact-exists"
+      )
+        throw new Error("当前扩展仅支持已核对的既有联系人接续");
+      const earlier = application.actions.filter(
+        (item) => item.index < action.index,
+      );
+      const later = application.actions.filter(
+        (item) => item.index > action.index,
+      );
+      if (
+        !earlier.length ||
+        earlier.some((item) => !actionCompleteForExistingContact(item)) ||
+        earlier.some(
+          (item) => item.id !== native.id && !manuallyConfirmedMessage(item),
+        ) ||
+        !later.length ||
+        later.some((item) => item.state !== "pending" || item.resolution)
+      )
+        throw new Error("前序动作未核对，或后续动作已执行，无法安全接续");
+      requireBeginReady(application);
+      requireExistingContactAudit(application);
+      for (const item of earlier.filter(manuallyConfirmedMessage))
+        requireMessageConfirmationAudit(application, item);
+      const current = store.job(application.jobId)!;
+      const resume = store.get<Resume | null>("resume", null);
+      if (
+        !resume ||
+        evaluateGates(current, resume, o.policy()).some(
+          (gate) => gate.status !== "pass",
+        )
+      )
+        throw new Error("当前岗位硬条件未通过，请人工核对");
+      const run = requireContactInspection(
+        application,
+        current,
+        body.inspectionRunId,
+      );
+      const previousDiagnostic = application.pageDiagnostic ?? null;
+      const previousStopReason = application.stopReason;
+      // A user's observation resolves whether to proceed, without rewriting the
+      // missing browser receipt as an automatically confirmed send.
+      action.resolution = "user-confirmed-sent";
+      action.updatedAt = new Date().toISOString();
+      application.status = "queued";
+      delete application.stopReason;
+      delete application.pageDiagnostic;
+      store.audit("extensionApplication.messageConfirmedAndResumed", {
+        applicationId: application.id,
+        actionId: action.id,
+        inspectionRunId: run.id,
+        textHash: body.expectedTextHash,
+        previousState: action.state,
+        previousEvidence: action.evidence,
+        previousStopReason,
+        previousDiagnostic,
+        resolution: action.resolution,
+        currentHash: current.contentHash,
+      });
+      store.updateApplication(application);
+      store.enqueue("apply", application);
       return { applicationId: application.id };
     });
   });
@@ -543,6 +684,10 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
         if (application) {
           requireConfig(application);
           requireFrozenJob(application);
+          for (const action of application.actions.filter(
+            manuallyConfirmedMessage,
+          ))
+            requireMessageConfirmationAudit(application, action);
           current = true;
         }
       } catch {
@@ -566,7 +711,20 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
     const task = store.claim("extension");
     if (!task) return { task: null };
     const application = store.application((task.payload as Application).id)!;
-    return { task: { id: task.id, leaseToken: task.leaseToken, application } };
+    // The installed extension only accepts pending work and its existing-contact
+    // navigation action. Keep reconciled messages in storage and the task payload.
+    return {
+      task: {
+        id: task.id,
+        leaseToken: task.leaseToken,
+        application: {
+          ...application,
+          actions: application.actions.filter(
+            (action) => !manuallyConfirmedMessage(action),
+          ),
+        },
+      },
+    };
   });
   app.post("/extension/v1/application/heartbeat", (req) => {
     const body = leaseSchema.parse(req.body);
@@ -771,8 +929,10 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
       application.status = status;
       if (body.reason && status !== "completed")
         application.stopReason = body.reason;
+      else delete application.stopReason;
       if (body.diagnostic && status !== "completed")
         application.pageDiagnostic = body.diagnostic;
+      else delete application.pageDiagnostic;
       store.updateApplication(application);
       store.finishTask(
         body.taskId,

@@ -131,10 +131,13 @@ interface Application {
   status: string;
   frozenMessages: string[];
   actions: {
+    id: string;
+    index: number;
     kind: string;
+    text: string | null;
     state: string;
     evidence: string | null;
-    resolution?: "contact-exists";
+    resolution?: StoredApplication["actions"][number]["resolution"];
   }[];
   createdAt: string;
 }
@@ -1782,6 +1785,152 @@ function ChatGPT({
     </div>
   );
 }
+function ConfirmSentMessage({
+  application,
+  paused,
+  mutate,
+}: {
+  application: Application;
+  paused: boolean;
+  mutate: <T>(p: string, m: string, b?: unknown) => Promise<T | undefined>;
+}) {
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+  const unresolved = application.actions.filter(
+    (action) => action.state === "unknown" && !action.resolution,
+  );
+  const action = unresolved[0];
+  const native = application.actions.find((item) => item.index === 0);
+  if (
+    application.status !== "needs-review" ||
+    application.stopReason !== "send-unconfirmed" ||
+    unresolved.length !== 1 ||
+    action?.kind !== "message" ||
+    action.evidence !== "send-unconfirmed" ||
+    !action.text ||
+    native?.kind !== "native-greeting" ||
+    native.state !== "unknown" ||
+    native.resolution !== "contact-exists" ||
+    application.actions.some(
+      (previous) =>
+        previous.index > 0 &&
+        previous.index < action.index &&
+        (previous.kind !== "message" ||
+          previous.state !== "unknown" ||
+          previous.resolution !== "user-confirmed-sent"),
+    ) ||
+    !application.actions.some((later) => later.index > action.index) ||
+    application.actions.some(
+      (later) => later.index > action.index && later.state !== "pending",
+    )
+  )
+    return null;
+
+  const resume = async () => {
+    if (busy) return;
+    setBusy(true);
+    setError("");
+    try {
+      type Inspection = { id: string; state: string; imported: number };
+      const started = await api<{ run: Inspection }>(
+        "/api/automation/start",
+        "POST",
+        {
+          inspectJobId: application.job.id,
+        },
+      );
+      let run = started.run;
+      for (
+        let attempt = 0;
+        run.state === "running" && attempt < 30;
+        attempt++
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        if (!mounted.current) return;
+        const current = await api<{ run: Inspection | null }>(
+          "/api/automation",
+        );
+        if (current.run?.id !== started.run.id)
+          throw new Error("核对任务已变化，请重新核对。");
+        run = current.run;
+      }
+      if (!mounted.current) return;
+      if (run.state !== "completed" || run.imported !== 1)
+        throw new Error(
+          "岗位核对尚未成功，本次未接续发送。请检查浏览器和采集状态。",
+        );
+      const hash = new Uint8Array(
+        await crypto.subtle.digest(
+          "SHA-256",
+          new TextEncoder().encode(action.text!),
+        ),
+      );
+      if (!mounted.current) return;
+      const result = await mutate<{ applicationId: string }>(
+        "/api/extension-application/confirm-message-and-resume",
+        "POST",
+        {
+          applicationId: application.id,
+          actionId: action.id,
+          expectedTextHash: [...hash]
+            .map((byte) => byte.toString(16).padStart(2, "0"))
+            .join(""),
+          inspectionRunId: run.id,
+        },
+      );
+      if (result && mounted.current) setOpen(false);
+    } catch (e) {
+      if (mounted.current)
+        setError(e instanceof Error ? e.message : "接续失败");
+    } finally {
+      if (mounted.current) setBusy(false);
+    }
+  };
+  return (
+    <>
+      <button
+        className="quiet"
+        disabled={paused || busy}
+        onClick={() => setOpen(true)}
+      >
+        核对已发送的消息
+      </button>
+      {open && (
+        <Dialog
+          title="确认这段消息已发送"
+          onClose={() => {
+            if (!busy) setOpen(false);
+          }}
+        >
+          <p>
+            {application.job.company} · {application.job.title}
+          </p>
+          <p>
+            请先在 BOSS 对应聊天中确认以下完整内容已出现在发出的消息气泡中。
+          </p>
+          <blockquote style={{ whiteSpace: "pre-wrap" }}>
+            {action.text}
+          </blockquote>
+          <p>
+            确认后记录为“人工核对已发送”，保留原始未知回执，并从下一步继续。该消息不会重发。
+          </p>
+          {error && <p role="alert">{error}</p>}
+          <button disabled={busy || paused} onClick={() => void resume()}>
+            {busy ? "正在核对岗位并接续…" : "已在 BOSS 核对，继续后续步骤"}
+          </button>
+        </Dialog>
+      )}
+    </>
+  );
+}
 function Records({
   s,
   mutate,
@@ -1918,6 +2067,11 @@ function Records({
                       重试尚未发送的任务
                     </button>
                   )}
+                <ConfirmSentMessage
+                  application={a}
+                  paused={s.paused}
+                  mutate={mutate}
+                />
               </div>
               <div>
                 {a.actions.map((x, i) => (
@@ -1933,7 +2087,9 @@ function Records({
                     {x.evidence ? `（${x.evidence}）` : ""}
                     {x.resolution === "contact-exists"
                       ? "；已核对已有沟通，保留未知记录，不重发招呼"
-                      : ""}
+                      : x.resolution === "user-confirmed-sent"
+                        ? "；人工核对已发送，保留原始回执，不重发"
+                        : ""}
                   </p>
                 ))}
               </div>
