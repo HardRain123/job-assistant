@@ -249,14 +249,15 @@ export async function applicationPageStep(request) {
       return null;
     }
     probe.result = "view-control";
-    count(
-      "viewTextCount",
-      nodes(root, headerFields).filter(
-        (node) => outsideChatHistory(node) && text(node) === "查看职位",
-      ).length,
-    );
-    const controls = leafFields(root).filter(
+    const candidates = nodes(root, headerFields).filter(
       (node) => outsideChatHistory(node) && text(node) === "查看职位",
+    );
+    count("viewTextCount", candidates.length);
+    // A label may repeat in nested wrappers and contain a decorative child.
+    // Keep its innermost matching element; separate controls remain ambiguous.
+    const controls = candidates.filter(
+      (node) =>
+        !candidates.some((other) => other !== node && node.contains(other)),
     );
     count("viewControlCount", controls.length);
     if (controls.length !== 1) return null;

@@ -884,12 +884,36 @@ test("failed conversation inspection reports only bounded counts, excluding hist
     0,
   );
 });
+test("nested View Job wrappers with decorative children remain one current-header control", async () => {
+  const f = semanticChatFixture();
+  const selector = "a, button, span, div, p, strong, em, h1, h2, h3, b, label";
+  f.view.children = [element()];
+  const wrapper = element("查看职位", { [selector]: [f.view] });
+  wrapper.children = [f.view];
+  wrapper.getBoundingClientRect = f.view.getBoundingClientRect;
+  wrapper.parentElement = f.card;
+  f.view.parentElement = wrapper;
+  f.allFields.push(wrapper);
+  const result = await runPage(f.document, {
+    mode: "inspect",
+    conversationOrigin: job.url,
+  });
+  assert.equal(result.page, "conversation");
+  assert.equal(typeof result.conversationBinding, "string");
+  f.allFields.push(element("查看职位"));
+  const ambiguous = await runPage(f.document, {
+    mode: "inspect",
+    conversationOrigin: job.url,
+  });
+  assert.equal(ambiguous.ok, false);
+  assert.equal(ambiguous.diagnostic.probes[0].viewControlCount, 2);
+});
 test("semantic diagnostics pinpoint the failed gate without returning visible text or granting sends", async () => {
   const cases: Array<[string, (f: any) => void]> = [
     [
       "view-control",
       (f) => {
-        f.view.children = [element()];
+        f.allFields.push(element("查看职位"));
       },
     ],
     [
@@ -950,8 +974,8 @@ test("semantic diagnostics pinpoint the failed gate without returning visible te
     ])
       assert.equal(serialized.includes(sensitive), false);
     if (expected === "view-control") {
-      assert.equal(result.diagnostic.probes[0].viewTextCount, 1);
-      assert.equal(result.diagnostic.probes[0].viewControlCount, 0);
+      assert.equal(result.diagnostic.probes[0].viewTextCount, 2);
+      assert.equal(result.diagnostic.probes[0].viewControlCount, 2);
     }
   }
   const f = semanticChatFixture();
