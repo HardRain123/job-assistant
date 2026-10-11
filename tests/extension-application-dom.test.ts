@@ -28,6 +28,32 @@ const job = {
   salaryMax: 30000,
   location: "上海",
 };
+test("unresolved browser injections time out once and late completion cannot restart them", async () => {
+  let expire: (() => void) | undefined;
+  let release: (value: any) => void = () => {};
+  let cleared = 0;
+  const pending = new Promise((resolve) => {
+    release = resolve;
+  });
+  const result = runInNewContext(
+    runnerScript + "\nboundedApplicationScript(pending)",
+    {
+      pending,
+      setTimeout: (callback: () => void) => {
+        expire = callback;
+        return 1;
+      },
+      clearTimeout: () => {
+        cleared++;
+      },
+    },
+  );
+  expire!();
+  await assert.rejects(result, /page-unrecognized/);
+  release([{ result: { ok: true } }]);
+  await Promise.resolve();
+  assert.equal(cleared, 1);
+});
 test("new Chrome tabs may have a pending URL before commit; wait without injecting or rejecting", () => {
   const run = (tab: any) =>
     runInNewContext(
@@ -580,10 +606,16 @@ function runnerFixture(
     resolvedContact?: boolean;
     unresolvedContact?: boolean;
     navigationError?: boolean;
+    navigationHang?: boolean;
     missingContact?: boolean;
   } = {},
 ) {
   const calls: any[] = [];
+  const scriptTimers: Array<() => void> = [];
+  let markContactStarted: () => void = () => {};
+  const contactStarted = new Promise<void>((resolve) => {
+    markContactStarted = resolve;
+  });
   let stage = "detail";
   const actions = [
     {
@@ -682,6 +714,8 @@ function runnerFixture(
           ];
         if (args[0].mode === "contact") {
           stage = "conversation";
+          markContactStarted();
+          if (options.navigationHang) return new Promise(() => {});
           if (options.navigationError)
             throw new Error("Frame context destroyed during navigation");
           return [{ result: { ok: true, existingContact: true } }];
@@ -697,15 +731,22 @@ function runnerFixture(
     applicationPageStep,
     URL,
     crypto: webcrypto,
-    setTimeout: (callback: () => void) => {
+    setTimeout: (callback: () => void, ms: number) => {
+      if (ms === 15000) {
+        scriptTimers.push(callback);
+        return scriptTimers.length;
+      }
       callback();
       return 1;
     },
+    clearTimeout: () => {},
     setInterval: () => 1,
     clearInterval: () => {},
   };
   return {
     calls,
+    contactStarted,
+    expireScript: () => scriptTimers.at(-1)?.(),
     run: () =>
       runInNewContext(
         runnerScript + "\nrunExtensionApplication(api, 'fixture-token')",
@@ -764,6 +805,43 @@ test("verified existing contact preserves the unknown greeting and only navigate
       false,
     );
   }
+});
+
+test("a lost Continue navigation result is inspected without replaying the click", async () => {
+  const f = runnerFixture({ resolvedContact: true, navigationHang: true });
+  const pending = f.run();
+  await f.contactStarted;
+  assert.equal(f.calls.filter((call) => call.mode === "contact").length, 1);
+  f.expireScript();
+  await pending;
+  assert.equal(f.calls.filter((call) => call.mode === "contact").length, 1);
+  assert.equal(f.calls.filter((call) => call.mode === "message").length, 1);
+  assert.equal(
+    f.calls.some((call) => call.body?.actionId === "greeting"),
+    false,
+  );
+});
+
+test("a timed out new contact action stays unknown and never proceeds to messages", async () => {
+  const f = runnerFixture({ missingContact: true, navigationHang: true });
+  const pending = f.run();
+  await f.contactStarted;
+  f.expireScript();
+  await pending;
+  assert.equal(f.calls.filter((call) => call.mode === "contact").length, 1);
+  assert.equal(
+    f.calls.some(
+      (call) => call.mode === "message" || call.mode === "attachment",
+    ),
+    false,
+  );
+  assert.equal(
+    f.calls.filter(
+      (call) =>
+        call.body?.actionId === "greeting" && call.body?.state === "unknown",
+    ).length,
+    1,
+  );
 });
 test("unknown greeting without a resolution or without a live Continue control cannot be replayed", async () => {
   for (const options of [

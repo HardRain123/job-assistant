@@ -80,6 +80,25 @@ export function applicationNavigationState(tab, expectedUrl) {
   return tab.status === "complete" ? "reject" : "wait";
 }
 
+// Chrome may leave an async injection unresolved when its document navigates.
+// Racing the call bounds our wait; it does not retry or cancel a browser action.
+export async function boundedApplicationScript(pending, timeoutMs = 15_000) {
+  let timer;
+  try {
+    return await Promise.race([
+      pending,
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error("page-unrecognized")),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /** One leased application at a time; no browser side effect is retried. */
 export async function runExtensionApplication(api, token) {
   const call = (path, body = {}) =>
@@ -107,7 +126,9 @@ export async function runExtensionApplication(api, token) {
   let authorization = null;
   let conversationOrigin = null;
   let conversationBinding = null;
+  const deadline = Date.now() + 120_000;
   const heartbeat = async () => {
+    if (Date.now() > deadline) interrupted = true;
     const status = await call("heartbeat", {
       taskId: task.id,
       leaseToken: task.leaseToken,
@@ -185,29 +206,33 @@ export async function runExtensionApplication(api, token) {
       request.mode === "contact"
         ? `__jobAssistantReader${crypto.randomUUID().replaceAll("-", "")}`
         : null;
-    if (readerKey)
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        world: "ISOLATED",
-        func: extractJobs,
-        args: [{ readerKey }],
-      });
     try {
-      const [result] = await chrome.scripting.executeScript({
-        target: { tabId },
-        world: "ISOLATED",
-        func: applicationPageStep,
-        args: [
-          {
-            ...request,
-            job: application.job,
-            authorization,
-            readerKey,
-            conversationOrigin,
-            conversationBinding,
-          },
-        ],
-      });
+      if (readerKey)
+        await boundedApplicationScript(
+          chrome.scripting.executeScript({
+            target: { tabId },
+            world: "ISOLATED",
+            func: extractJobs,
+            args: [{ readerKey }],
+          }),
+        );
+      const [result] = await boundedApplicationScript(
+        chrome.scripting.executeScript({
+          target: { tabId },
+          world: "ISOLATED",
+          func: applicationPageStep,
+          args: [
+            {
+              ...request,
+              job: application.job,
+              authorization,
+              readerKey,
+              conversationOrigin,
+              conversationBinding,
+            },
+          ],
+        }),
+      );
       if (result?.result?.diagnostic) pageDiagnostic = result.result.diagnostic;
       return result?.result || { ok: false, reason: "page-unrecognized" };
     } finally {
@@ -286,11 +311,13 @@ export async function runExtensionApplication(api, token) {
       );
       if (navigation === "reject") throw new Error("recipient-mismatch");
       if (navigation === "ready") {
-        const [read] = await chrome.scripting.executeScript({
-          target: { tabId },
-          world: "ISOLATED",
-          func: extractJobs,
-        });
+        const [read] = await boundedApplicationScript(
+          chrome.scripting.executeScript({
+            target: { tabId },
+            world: "ISOLATED",
+            func: extractJobs,
+          }),
+        );
         if (matchesFrozenJob(read?.result?.jobs?.[0], application.job)) {
           ready = true;
           break;
