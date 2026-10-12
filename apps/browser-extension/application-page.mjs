@@ -81,6 +81,22 @@ export async function applicationPageStep(request) {
       ).length
     )
       return "verification-required";
+    // Read only visible platform notices, never job text or chat messages.
+    if (
+      nodes(
+        document,
+        ".dialog-wrap, .dialog-box, .toast, .toast-text, .chat-tip",
+      ).some((node) => {
+        const value = text(node);
+        return (
+          value.length <= 500 &&
+          /(?:今日|今天|每日|当天).{0,30}(?:沟通|招呼).{0,30}(?:上限|用完|已满)|(?:沟通|招呼).{0,30}(?:次数已达上限|次数已用完)|操作(?:过于|太)频繁|沟通(?:过于|太)频繁/.test(
+            value,
+          )
+        );
+      })
+    )
+      return "platform-limit";
     return "";
   };
   const job = request?.job;
@@ -496,7 +512,7 @@ export async function applicationPageStep(request) {
   const sent = (item) =>
     !nodes(item, ".message-fail, .send-fail, .retry").length &&
     nodes(item, ".status, .message-status, .read-status").some((node) =>
-      /^(已读|未读|已发送|已送达)$/.test(text(node)),
+      /^(已读|未读|已发送|已送达|送达)$/.test(text(node)),
     );
   const messageText = (item) => {
     const bodies = nodes(item, ".text, .message-text, .text-content");
@@ -638,7 +654,9 @@ export async function applicationPageStep(request) {
     buttons[0].click();
     for (let attempt = 0; attempt < 20; attempt++) {
       await sleep(400);
-      if (blocked() || conversation()?.editor !== current.editor)
+      const block = blocked();
+      if (block) return stop(block);
+      if (conversation()?.editor !== current.editor)
         return stop("recipient-mismatch");
       const after = outgoing(current.root);
       if (

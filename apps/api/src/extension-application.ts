@@ -17,6 +17,7 @@ import {
 } from "../../../packages/storage/src/index.ts";
 import { canonicalJobUrl } from "./automation.ts";
 import { evaluateGates } from "../../../packages/matching/src/index.ts";
+import type { BulkApplication } from "./bulk-application.ts";
 
 interface Options {
   store: Store;
@@ -30,6 +31,7 @@ interface Options {
   assessment: (job: Job) => Assessment | null;
   policy: () => MatchPolicy;
   configurationKey: () => string;
+  bulk: BulkApplication;
 }
 
 type AttachmentManifest = { name: string; size: number; sha256: string };
@@ -90,6 +92,7 @@ const identitySchema = leaseSchema.extend({ applicationId: z.string().uuid() });
 const evidenceSchema = z.enum([
   "before-action",
   "new-message",
+  "new-conversation",
   "new-attachment",
   "existing-contact",
   "recipient-mismatch",
@@ -99,6 +102,8 @@ const evidenceSchema = z.enum([
   "send-unconfirmed",
   "attachment-pending",
   "cancelled",
+  "platform-limit",
+  "daily-limit",
 ]);
 const actionSchema = identitySchema.extend({
   actionId: z.string().uuid(),
@@ -394,6 +399,8 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
       throw new Error("队列已暂停或浏览器状态不确定");
     requireConfig(application);
     requireFrozenJob(application);
+    if (!o.bulk.allowedDuringAction(application))
+      throw new Error("批量任务已暂停或结束");
   };
 
   app.post("/api/extension-application/preview", (req) => {
@@ -669,6 +676,7 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
     requireConnection();
     const candidate = store
       .tasks()
+      .reverse()
       .find(
         (t) =>
           t.status === "queued" &&
@@ -679,6 +687,10 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
       const application = store.application(
         (candidate.payload as Application).id,
       );
+      if (application?.bulkRunId) {
+        requireConnection([0, 4, 0]);
+        if (!o.bulk.canClaim(application)) return { task: null };
+      }
       let current = false;
       try {
         if (application) {
@@ -703,6 +715,7 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
           if (application) {
             application.status = "needs-review";
             store.updateApplication(application);
+            o.bulk.afterResult(application, "page-unrecognized");
           }
         });
         return { task: null };
@@ -735,9 +748,12 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
     )
       throw new Error("投递任务不匹配");
     store.heartbeat(body.taskId, body.leaseToken);
+    const application = store.application((task.payload as Application).id);
     return {
       paused:
-        store.get("paused", false) || store.get("browserUncertain", false),
+        store.get("paused", false) ||
+        store.get("browserUncertain", false) ||
+        Boolean(application && !o.bulk.allowedDuringAction(application)),
       takeover: store.get("takeover", false),
     };
   });
@@ -782,25 +798,34 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
       throw new Error("只有既有联系人招呼动作可以跳过");
     if (
       body.state === "confirmed" &&
-      body.evidence !==
-        (old.kind === "attachment" ? "new-attachment" : "new-message")
+      !(old.kind === "native-greeting"
+        ? ["new-message", "new-conversation"].includes(body.evidence)
+        : body.evidence ===
+          (old.kind === "attachment" ? "new-attachment" : "new-message"))
     )
       throw new Error("发送确认需要新消息或新附件证据");
     let execute = false;
-    const updated = store.recordAction(
-      body.taskId,
-      body.leaseToken,
-      body.applicationId,
-      {
-        ...old,
-        state: body.state,
-        evidence: body.evidence,
-        updatedAt: new Date().toISOString(),
-      },
-      (changed) => {
-        execute = changed && body.state === "started";
-      },
-    );
+    let updated: Application;
+    try {
+      updated = store.recordAction(
+        body.taskId,
+        body.leaseToken,
+        body.applicationId,
+        {
+          ...old,
+          state: body.state,
+          evidence: body.evidence,
+          updatedAt: new Date().toISOString(),
+        },
+        (changed) => {
+          execute = changed && body.state === "started";
+        },
+      );
+    } catch (error) {
+      if (error instanceof Error && error.message === "daily-limit")
+        o.bulk.pause("今日配置名额已用完，批量已暂停。");
+      throw error;
+    }
     return { execute, application: updated };
   });
   app.post("/extension/v1/application/attachment", (req) => {
@@ -896,6 +921,9 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
             "send-unconfirmed",
             "attachment-pending",
             "cancelled",
+            "existing-contact",
+            "platform-limit",
+            "daily-limit",
           ])
           .optional(),
       })
@@ -926,6 +954,22 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
       status = application.actions.every(actionCompleteForExistingContact)
         ? "completed"
         : "needs-review";
+      if (body.reason === "existing-contact") {
+        if (
+          !application.bulkRunId ||
+          !application.actions.some(
+            (a) =>
+              a.kind === "native-greeting" &&
+              a.state === "skipped" &&
+              a.evidence === "existing-contact",
+          ) ||
+          application.actions.some(
+            (a) => a.kind !== "native-greeting" && a.state !== "pending",
+          )
+        )
+          throw new Error("既有联系人跳过证据不匹配");
+        status = "cancelled";
+      }
       application.status = status;
       if (body.reason && status !== "completed")
         application.stopReason = body.reason;
@@ -938,9 +982,12 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
         body.taskId,
         body.leaseToken,
         { status },
-        status === "completed" ? "completed" : "needs-review",
+        status === "completed" || status === "cancelled"
+          ? "completed"
+          : "needs-review",
       );
       store.set(receiptKey(body.taskId), { identity, status });
+      o.bulk.afterResult(application, body.reason);
     });
     return { ok: true, status };
   });

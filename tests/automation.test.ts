@@ -12,6 +12,16 @@ const url = (id: string) => `https://www.zhipin.com/job_detail/${id}.html`;
 const job = (id: string) => ({ url: url(id), title: "工程师", company: "公司", description: "完整岗位要求", detail: true });
 const config = { keywords: ["前端", "后端"], city: "上海", maxJobs: 10, maxPages: 2, autoAssess: false, intervalSeconds: 3 };
 
+test("批量候选可采集至300个，超界请求被拒绝且不启动投递", async () => {
+  const f = await fixture();
+  try {
+    assert.equal((await f.start({ maxJobs: 301 })).statusCode, 400);
+    assert.equal((await f.start({ maxJobs: 300 })).statusCode, 200);
+    assert.equal((await f.state()).config.maxJobs, 300);
+    assert.equal(f.store.applications().length, 0);
+  } finally { await f.close(); }
+});
+
 test("只读复核只打开已入库的一个 BOSS 岗位，不搜索、不评分或投递", async () => {
   const f = await fixture();
   try {

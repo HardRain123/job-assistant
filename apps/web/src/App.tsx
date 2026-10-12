@@ -2,6 +2,7 @@ import { FormEvent, ReactNode, useEffect, useRef, useState } from "react";
 import { accountLabel, isChatGPTAccount, modelNames } from "./provider-view";
 import { ExtensionPanel } from "./ExtensionPanel";
 import { AutomationPanel } from "./AutomationPanel";
+import { BulkPanel } from "./BulkPanel";
 import type {
   Application as StoredApplication,
   ConversationProbe,
@@ -10,6 +11,7 @@ import type {
 type Tab =
   | "工作台"
   | "自动找岗位"
+  | "批量投递"
   | "岗位库"
   | "简历资料"
   | "匹配策略"
@@ -163,6 +165,7 @@ interface State {
 const tabs: Tab[] = [
   "工作台",
   "自动找岗位",
+  "批量投递",
   "岗位库",
   "简历资料",
   "匹配策略",
@@ -360,8 +363,10 @@ function App() {
         onPolicy={() => setTab("匹配策略")}
         onConnect={() => setTab("浏览器")}
       />
+    ) : tab === "批量投递" ? (
+      <BulkPanel onCollect={() => setTab("自动找岗位")} onJobs={() => setTab("岗位库")} onConnect={() => setTab("浏览器")} onRecords={() => setTab("投递记录")} onChanged={refresh} />
     ) : tab === "岗位库" ? (
-      <Jobs s={state} mutate={mutate} />
+      <Jobs s={state} mutate={mutate} onBulk={() => setTab("批量投递")} />
     ) : tab === "简历资料" ? (
       <ResumePanel resume={state.resume} mutate={mutate} />
     ) : tab === "匹配策略" ? (
@@ -1049,8 +1054,10 @@ function SourcesPanel({
 function Jobs({
   s,
   mutate,
+  onBulk,
 }: {
   s: State;
+  onBulk: () => void;
   mutate: <T>(p: string, m: string, b?: unknown) => Promise<T | undefined>;
 }) {
   const [filters, setFilters] = useState({
@@ -1177,12 +1184,7 @@ function Jobs({
         >
           评估匹配
         </button>
-        <button
-          disabled={!selected.length || selected.length > 10}
-          onClick={() => void makePreview()}
-        >
-          生成投递预览
-        </button>
+        <button onClick={onBulk}>进入批量投递</button>
         <button
           disabled={selected.length !== 1 || !s.resume}
           onClick={() => void makeSinglePreview()}
@@ -1945,6 +1947,9 @@ function Records({
     "verification-required": "需要完成 BOSS 页面验证后人工核对。",
     "send-unconfirmed": "未观察到明确发送回执，不会自动重发。",
     "attachment-pending": "简历请求正在等待对方同意，尚未确认附件送达。",
+    "existing-contact": "已存在沟通记录，本次批量跳过，未发送话术。",
+    "platform-limit": "平台提示沟通次数或操作频率限制，批量已暂停。",
+    "daily-limit": "今日配置名额已用完，批量已暂停。",
     cancelled: "暂停、配置变化或发送前授权失效，已停止。",
   };
   const [busy, setBusy] = useState(false),

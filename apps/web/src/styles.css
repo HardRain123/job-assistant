@@ -648,7 +648,81 @@ h2 {
   padding: 8px;
   border-radius: 6px;
 }
+.bulk-metrics,
+.bulk-config {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 14px;
+  margin: 18px 0;
+}
+.bulk-metrics > div {
+  background: #f0f6f5;
+  border-radius: 9px;
+  padding: 16px;
+}
+.bulk-metrics strong {
+  display: block;
+  font-size: 27px;
+  margin-bottom: 6px;
+}
+.bulk-metrics span,
+.bulk-panel .muted {
+  color: #546b70;
+  font-size: 13px;
+  line-height: 1.7;
+}
+.bulk-config {
+  align-items: end;
+}
+.bulk-config label {
+  display: grid;
+  gap: 8px;
+  font-size: 13px;
+}
+.bulk-config input {
+  min-width: 0;
+  width: 100%;
+  border: 1px solid #cfd9d7;
+  border-radius: 7px;
+  padding: 9px;
+  background: #fbfcfb;
+  color: #152b3f;
+}
+.bulk-job {
+  border-top: 1px solid #e7e4dc;
+  padding: 14px 0;
+}
+.bulk-job summary {
+  cursor: pointer;
+  font-weight: 650;
+  line-height: 1.8;
+}
+.bulk-job p {
+  margin-top: 12px;
+}
+.bulk-message {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: inherit;
+  line-height: 1.8;
+  background: #f5f7f6;
+  border-radius: 8px;
+  padding: 14px;
+}
+.bulk-panel .toolbar {
+  flex-wrap: wrap;
+}
+@media (max-width: 1000px) {
+  .bulk-metrics,
+  .bulk-config {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
 @media (max-width: 560px) {
+  .bulk-metrics,
+  .bulk-config {
+    grid-template-columns: 1fr;
+  }
   .provider {
     grid-template-columns: 1fr;
   }

@@ -608,6 +608,9 @@ function runnerFixture(
     navigationError?: boolean;
     navigationHang?: boolean;
     missingContact?: boolean;
+    wrongConversation?: boolean;
+    bulk?: boolean;
+    messageSuccess?: boolean;
   } = {},
 ) {
   const calls: any[] = [];
@@ -644,11 +647,32 @@ function runnerFixture(
         task: {
           id: "task",
           leaseToken: "lease",
-          application: { id: "app", job, actions },
+          application: {
+            id: "app",
+            job,
+            ...(options.bulk ? { bulkRunId: "batch" } : {}),
+            actions: options.bulk
+              ? [
+                  ...actions.filter((a) => a.kind !== "attachment"),
+                  {
+                    id: "message-2",
+                    kind: "message",
+                    index: 2,
+                    state: "pending",
+                    text: "目前状态：离职",
+                  },
+                ]
+              : actions,
+          },
         },
       };
     if (path.endsWith("/heartbeat")) return { paused: false, takeover: false };
     if (path.endsWith("/action")) return { execute: options.execute !== false };
+    if (path.endsWith("/result"))
+      return {
+        ok: true,
+        status: options.messageSuccess ? "completed" : "needs-review",
+      };
     return { ok: true };
   };
   const values: any = options.journal
@@ -670,6 +694,9 @@ function runnerFixture(
         status: "complete",
       }),
       query: async () => (stage === "conversation" ? [{ id: 1 }] : []),
+      remove: async (id: number) => {
+        calls.push({ removedTab: id });
+      },
     },
     storage: {
       local: {
@@ -704,7 +731,7 @@ function runnerFixture(
           return [
             {
               result: {
-                ok: true,
+                ok: !(options.wrongConversation && stage === "conversation"),
                 page: stage,
                 conversationBinding:
                   stage === "conversation" ? "fixture-binding" : undefined,
@@ -718,8 +745,18 @@ function runnerFixture(
           if (options.navigationHang) return new Promise(() => {});
           if (options.navigationError)
             throw new Error("Frame context destroyed during navigation");
-          return [{ result: { ok: true, existingContact: true } }];
+          return [
+            {
+              result: {
+                ok: true,
+                clicked: true,
+                existingContact: !options.missingContact,
+              },
+            },
+          ];
         }
+        if (args[0].mode === "message" && options.messageSuccess)
+          return [{ result: { ok: true, evidence: "new-message" } }];
         return [{ result: { ok: false, reason: "send-unconfirmed" } }];
       },
     },
@@ -822,8 +859,12 @@ test("a lost Continue navigation result is inspected without replaying the click
   );
 });
 
-test("a timed out new contact action stays unknown and never proceeds to messages", async () => {
-  const f = runnerFixture({ missingContact: true, navigationHang: true });
+test("a timed out new contact without an exact target conversation stays unknown", async () => {
+  const f = runnerFixture({
+    missingContact: true,
+    navigationHang: true,
+    wrongConversation: true,
+  });
   const pending = f.run();
   await f.contactStarted;
   f.expireScript();
@@ -842,6 +883,100 @@ test("a timed out new contact action stays unknown and never proceeds to message
     ).length,
     1,
   );
+});
+test("one new contact navigation can be confirmed by exact conversation readback without replay", async () => {
+  for (const navigationError of [false, true]) {
+    const f = runnerFixture({
+      missingContact: true,
+      navigationError,
+      bulk: true,
+      messageSuccess: true,
+    });
+    await f.run();
+    assert.equal(f.calls.filter((c) => c.mode === "contact").length, 1);
+    assert.equal(f.calls.filter((c) => c.mode === "message").length, 2);
+    assert.equal(
+      f.calls.some(
+        (c) => c.mode === "attachment" || c.path?.endsWith("/attachment"),
+      ),
+      false,
+    );
+    assert.equal(
+      f.calls.find(
+        (c) => c.body?.actionId === "greeting" && c.body?.state === "confirmed",
+      )?.body.evidence,
+      "new-conversation",
+    );
+    assert.equal(
+      f.calls.find((c) => c.mode === "message")?.conversationBinding,
+      "fixture-binding",
+    );
+    assert.deepEqual(
+      f.calls.filter((c) => c.removedTab).map((c) => c.removedTab),
+      [1],
+    );
+  }
+});
+test("bulk applications skip previously contacted recruiters without navigation or messages", async () => {
+  const f = runnerFixture({ bulk: true });
+  await f.run();
+  assert.equal(
+    f.calls.some(
+      (c) =>
+        c.mode === "contact" ||
+        c.mode === "message" ||
+        c.mode === "attachment" ||
+        c.body?.state === "started",
+    ),
+    false,
+  );
+  assert.equal(
+    f.calls.find((c) => c.path?.endsWith("/result"))?.body.reason,
+    "existing-contact",
+  );
+});
+test("bulk unknown message retains its tab and never starts the next message", async () => {
+  const f = runnerFixture({ missingContact: true, bulk: true });
+  await f.run();
+  assert.equal(f.calls.filter((c) => c.mode === "message").length, 1);
+  assert.equal(
+    f.calls.some((c) => c.body?.actionId === "message-2" || c.removedTab),
+    false,
+  );
+});
+test("the exact delivered label confirms a new matching outgoing message but failures do not", async () => {
+  for (const failed of [false, true]) {
+    const f = chatFixture();
+    f.button.click = () => {
+      f.rows.push(
+        element("您好", {
+          ".text, .message-text, .text-content": [element("您好")],
+          ".status, .message-status, .read-status": [element("送达")],
+          ".message-fail, .send-fail, .retry": failed ? [element("重试")] : [],
+        }),
+      );
+      f.editor.innerText = "";
+    };
+    assert.equal(
+      (await runPage(f.document, { mode: "message", text: "您好" })).ok,
+      !failed,
+    );
+  }
+});
+test("visible platform quota notices stop before any sending", async () => {
+  const f = chatFixture();
+  let clicks = 0;
+  f.button.click = () => clicks++;
+  const query = f.document.querySelectorAll;
+  f.document.querySelectorAll = (selector: string) =>
+    selector === ".dialog-wrap, .dialog-box, .toast, .toast-text, .chat-tip"
+      ? [element("今日沟通次数已达上限")]
+      : query(selector);
+  assert.equal(
+    (await runPage(f.document, { mode: "message", text: "您好" })).reason,
+    "platform-limit",
+  );
+  assert.equal(clicks, 0);
 });
 test("unknown greeting without a resolution or without a live Continue control cannot be replayed", async () => {
   for (const options of [

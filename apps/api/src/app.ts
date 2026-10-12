@@ -37,7 +37,11 @@ import { assessJob } from "../../../packages/matching/src/index.ts";
 import { decrypt, encrypt, equal } from "./security.ts";
 import { createExtensionAccess } from "./extension.ts";
 import { createAutomation } from "./automation.ts";
-import { attachmentManifest, registerExtensionApplication } from "./extension-application.ts";
+import {
+  attachmentManifest,
+  registerExtensionApplication,
+} from "./extension-application.ts";
+import { createBulkApplication } from "./bulk-application.ts";
 import {
   policySchema,
   providerSchema,
@@ -141,6 +145,16 @@ export async function createApp(o: AppOptions) {
         providers: getProviders(),
       }),
     ensureReady: (autoAssess) => {
+      if (
+        o.store
+          .tasks()
+          .some(
+            (task) =>
+              task.kind === "apply" &&
+              ["queued", "leased"].includes(task.status),
+          )
+      )
+        throw new Error("请等待投递任务结束或取消剩余批次后再采集岗位");
       if (autoAssess && !resume())
         throw new Error("自动评分需要先导入并核对简历");
       if (autoAssess && !getProviders().some((p) => p.enabled))
@@ -570,16 +584,30 @@ export async function createApp(o: AppOptions) {
       }))
       .sort((a, b) => b.similarity - a.similarity);
   });
-  function draft(ids: string[], manualReviewedId?: string): Application[] {
+  function draft(
+    ids: string[],
+    manualReviewedId?: string,
+    messagesOnly = false,
+  ): Application[] {
     const r = resume();
     if (!r) throw new Error("请先导入简历");
-    const t = template();
+    const t = messagesOnly
+      ? { ...template(), attachmentPolicy: "message-only" as const }
+      : template();
     const batchId = randomUUID();
     return [...new Set(ids)].map((id) => {
       const j = o.store.job(id);
       if (!j) throw new Error("岗位不存在");
       if (j.source !== "boss") throw new Error("官网岗位请打开原始申请入口");
-      if (o.store.applications().some((a) => a.jobId === id))
+      if (
+        o.store
+          .applications()
+          .some(
+            (a) =>
+              a.jobId === id &&
+              !(messagesOnly && o.store.reusableCancelledApplication(a)),
+          )
+      )
         throw new Error("该岗位已有投递记录");
       const a = assessment(j);
       const manualReviewAllowed =
@@ -637,7 +665,7 @@ export async function createApp(o: AppOptions) {
         jobId: id,
         job: j,
         resumeId: r.id,
-        resumeAttachment: r.attachmentName,
+        resumeAttachment: messagesOnly ? null : r.attachmentName,
         templateVersion: t.version,
         frozenMessages: messages,
         attachmentPolicy: t.attachmentPolicy,
@@ -647,6 +675,26 @@ export async function createApp(o: AppOptions) {
       };
     });
   }
+  const configurationKey = () =>
+    fingerprint({
+      resume: resume(),
+      template: template(),
+      policy: policy(),
+      attachment: attachmentManifest(
+        o.attachmentsDir,
+        resume()?.attachmentName ?? null,
+      ),
+    });
+  const bulk = createBulkApplication({
+    store: o.store,
+    draft,
+    assessment,
+    policy,
+    resume,
+    configurationKey,
+    status: extension.status,
+  });
+  bulk.register(app);
   registerExtensionApplication(app, {
     store: o.store,
     attachmentsDir: o.attachmentsDir,
@@ -654,9 +702,8 @@ export async function createApp(o: AppOptions) {
     draft,
     assessment,
     policy,
-    configurationKey: () =>
-      fingerprint({ resume: resume(), template: template(), policy: policy(),
-        attachment: attachmentManifest(o.attachmentsDir, resume()?.attachmentName ?? null) }),
+    configurationKey,
+    bulk,
   });
   app.post("/api/batches/preview", (req) => {
     const b = z

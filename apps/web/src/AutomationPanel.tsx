@@ -147,7 +147,7 @@ export function AutomationPanel({ mutate, onPolicy, onConnect }: { mutate: Mutat
       {canConfigure && <form className="form policy" onSubmit={submit}>
         <label>关键词（最多 5 个，用逗号分隔）<input value={form.keywords} onChange={(e) => setForm({ ...form, keywords: e.target.value })} /></label>
         <label>城市<select value={form.city} onChange={(e) => setForm({ ...form, city: e.target.value as "上海" | "全国" })}><option>上海</option><option>全国</option></select></label>
-        <label>最多岗位数<input type="number" min="1" max="50" value={form.maxJobs} onChange={(e) => setForm({ ...form, maxJobs: Math.min(50, Math.max(1, Number(e.target.value))) })} /></label>
+        <label>最多岗位数<input type="number" min="1" max="300" value={form.maxJobs} onChange={(e) => setForm({ ...form, maxJobs: Math.min(300, Math.max(1, Number(e.target.value))) })} /></label>
         <label>每个关键词最多页数<input type="number" min="1" max="10" value={form.maxPages} onChange={(e) => setForm({ ...form, maxPages: Math.min(10, Math.max(1, Number(e.target.value))) })} /></label>
         <label>每次操作间隔（秒）<input type="number" min="3" max="30" value={form.intervalSeconds} onChange={(e) => setForm({ ...form, intervalSeconds: Math.min(30, Math.max(3, Number(e.target.value))) })} /></label>
         <label className="check"><input type="checkbox" checked={form.autoAssess} onChange={(e) => setForm({ ...form, autoAssess: e.target.checked })} />导入后自动评分</label>

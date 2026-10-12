@@ -19,6 +19,14 @@ export const actionCompleteForExistingContact = (action: ApplicationAction) =>
       (action.kind === "message" &&
         action.resolution === "user-confirmed-sent")));
 
+export const shanghaiDate = (date = new Date()) =>
+  new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date);
+
 export class Store {
   db: DatabaseSync;
   constructor(path: string) {
@@ -34,6 +42,9 @@ export class Store {
       CREATE TABLE IF NOT EXISTS applications(id TEXT PRIMARY KEY, job_id TEXT UNIQUE NOT NULL, batch_id TEXT NOT NULL, body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY, kind TEXT NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL, lease_token TEXT, lease_until TEXT, result TEXT, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, event TEXT NOT NULL, body TEXT NOT NULL);`);
+    this.db.exec(
+      "CREATE TABLE IF NOT EXISTS contact_quota(action_id TEXT PRIMARY KEY, app_id TEXT NOT NULL, day TEXT NOT NULL)",
+    );
   }
   close() {
     this.db.close();
@@ -138,6 +149,102 @@ export class Store {
       .prepare("UPDATE applications SET body=? WHERE id=?")
       .run(JSON.stringify(app), app.id);
   }
+  reusableCancelledApplication(app: Application) {
+    return (
+      app.status === "cancelled" &&
+      app.actions.length > 0 &&
+      app.actions.every(
+        (action) =>
+          action.state === "pending" && !action.evidence && !action.resolution,
+      ) &&
+      !this.db
+        .prepare("SELECT action_id FROM contact_quota WHERE app_id=? LIMIT 1")
+        .get(app.id)
+    );
+  }
+  archiveCancelledApplication(app: Application) {
+    const current = this.application(app.id);
+    if (
+      !current ||
+      !this.reusableCancelledApplication(current) ||
+      this.tasks().some(
+        (task) =>
+          ["queued", "leased"].includes(task.status) &&
+          (task.payload as Application)?.id === app.id,
+      )
+    )
+      throw new Error("仅从未执行且已取消的记录可以重新进入批次");
+    // Preserve the full frozen draft and all old tasks; only release the unique job slot.
+    this.audit("application.unattemptedCancelledArchived", {
+      application: current,
+    });
+    this.db.prepare("DELETE FROM applications WHERE id=?").run(app.id);
+  }
+  dailyQuota(date = new Date(), limit = this.get("bulk.dailyLimit", 150)) {
+    // Import historical attempts once. Existing-contact navigation does not consume a new contact.
+    const applications = this.applications();
+    const insert = this.db.prepare(
+      "INSERT OR IGNORE INTO contact_quota VALUES(?,?,?)",
+    );
+    for (const application of applications) {
+      for (const action of application.actions) {
+        if (
+          action.kind === "native-greeting" &&
+          !["pending", "skipped"].includes(action.state)
+        )
+          insert.run(
+            action.id,
+            application.id,
+            shanghaiDate(new Date(action.updatedAt)),
+          );
+      }
+    }
+    const day = shanghaiDate(date);
+    const entries = this.db
+      .prepare("SELECT action_id,app_id FROM contact_quota WHERE day=?")
+      .all(day);
+    let contacts = 0,
+      completed = 0,
+      uncertain = 0;
+    for (const entry of entries) {
+      const application = applications.find((a) => a.id === entry.app_id);
+      const action = application?.actions.find((a) => a.id === entry.action_id);
+      if (action?.state === "confirmed") contacts++;
+      if (application?.status === "completed") completed++;
+      if (
+        !application ||
+        application.actions.some(
+          (a) =>
+            ["started", "unknown"].includes(a.state) &&
+            !actionCompleteForExistingContact(a),
+        )
+      )
+        uncertain++;
+    }
+    return {
+      date: day,
+      limit,
+      occupied: entries.length,
+      contacts,
+      completed,
+      uncertain,
+      remaining: Math.max(0, limit - entries.length),
+    };
+  }
+  reserveContact(application: Application, action: ApplicationAction) {
+    if (action.kind !== "native-greeting") return;
+    if (
+      this.db
+        .prepare("SELECT action_id FROM contact_quota WHERE action_id=?")
+        .get(action.id)
+    )
+      return;
+    const quota = this.dailyQuota();
+    if (quota.remaining <= 0) throw new Error("daily-limit");
+    this.db
+      .prepare("INSERT INTO contact_quota VALUES(?,?,?)")
+      .run(action.id, application.id, quota.date);
+  }
   enqueue(kind: Task["kind"], payload: unknown) {
     const id = randomUUID();
     this.db
@@ -155,7 +262,7 @@ export class Store {
   }
   tasks(): Task[] {
     return this.db
-      .prepare("SELECT * FROM tasks ORDER BY created_at DESC")
+      .prepare("SELECT * FROM tasks ORDER BY created_at DESC, rowid DESC")
       .all()
       .map((r) => this.taskRow(r));
   }
@@ -201,8 +308,8 @@ export class Store {
       const row = this.db
         .prepare(
           executor === "extension"
-            ? "SELECT * FROM tasks WHERE status='queued' AND kind='apply' AND json_extract(payload,'$.executor')='extension' ORDER BY created_at LIMIT 1"
-            : "SELECT * FROM tasks WHERE status='queued' AND (kind!='apply' OR coalesce(json_extract(payload,'$.executor'),'worker')='worker') ORDER BY created_at LIMIT 1",
+            ? "SELECT * FROM tasks WHERE status='queued' AND kind='apply' AND json_extract(payload,'$.executor')='extension' ORDER BY created_at, rowid LIMIT 1"
+            : "SELECT * FROM tasks WHERE status='queued' AND (kind!='apply' OR coalesce(json_extract(payload,'$.executor'),'worker')='worker') ORDER BY created_at, rowid LIMIT 1",
         )
         .get();
       if (!row) return null;
@@ -291,6 +398,7 @@ export class Store {
         )
       )
         throw new Error("前序话术尚未确认发送");
+      if (action.state === "started") this.reserveContact(app, action);
       app.actions = app.actions.map((a) =>
         a.id === action.id
           ? { ...action, updatedAt: new Date().toISOString() }

@@ -18,6 +18,9 @@ const reasons = new Set([
   "verification-required",
   "send-unconfirmed",
   "attachment-pending",
+  "platform-limit",
+  "daily-limit",
+  "existing-contact",
   "cancelled",
 ]);
 export function canonicalApplicationUrl(value) {
@@ -118,6 +121,8 @@ export async function runExtensionApplication(api, token) {
     applicationId: application?.id,
   };
   let tabId;
+  let createdTabId;
+  let completed = false;
   let actionStarted = null;
   let interrupted = false;
   let stopReason;
@@ -268,11 +273,16 @@ export async function runExtensionApplication(api, token) {
         return true;
       }
       if (
-        ["login-required", "verification-required", "cancelled"].includes(
-          view.reason,
-        )
-      )
+        [
+          "login-required",
+          "verification-required",
+          "platform-limit",
+          "cancelled",
+        ].includes(view.reason)
+      ) {
+        stopReason = view.reason;
         return false;
+      }
       await sleep(500);
     }
     return false;
@@ -301,6 +311,7 @@ export async function runExtensionApplication(api, token) {
       active: true,
     });
     tabId = tab.id;
+    createdTabId = tab.id;
     let ready = false;
     for (let attempt = 0; attempt < 30; attempt++) {
       if (!(await heartbeat())) throw new Error("cancelled");
@@ -344,6 +355,11 @@ export async function runExtensionApplication(api, token) {
         if (resolvedContact(action) && !view.existingContact)
           throw new Error("recipient-mismatch");
         if (view.existingContact) {
+          if (application.bulkRunId) {
+            await progress(action, "skipped", "existing-contact");
+            stopReason = "existing-contact";
+            break;
+          }
           if (!resolvedContact(action))
             await progress(action, "skipped", "existing-contact");
           const originalTab = tabId;
@@ -375,18 +391,23 @@ export async function runExtensionApplication(api, token) {
       let result;
       if (action.kind === "native-greeting") {
         const originalTab = tabId;
-        const contact = await page({
-          mode: "contact",
-          expectedExisting: false,
-        });
-        if (contact.ok && contact.contactConfirmed)
+        let contact;
+        try {
+          contact = await page({ mode: "contact", expectedExisting: false });
+        } catch {
+          // Navigation may destroy the isolated script after its one click.
+          // Read back the exact target conversation; never replay the click.
+        }
+        if (!contact || (contact.ok && contact.clicked))
           conversationOrigin = canonicalApplicationUrl(application.job.url);
         result =
-          contact.ok &&
-          contact.contactConfirmed &&
+          (!contact || (contact.ok && contact.clicked)) &&
           (await waitConversation(originalTab))
-            ? { ok: true, evidence: "new-message" }
-            : { ok: false, reason: contact.reason || "send-unconfirmed" };
+            ? { ok: true, evidence: "new-conversation" }
+            : {
+                ok: false,
+                reason: stopReason || contact?.reason || "send-unconfirmed",
+              };
       } else if (action.kind === "message") {
         result = await page({ mode: "message", text: action.text });
       } else if (action.kind === "attachment") {
@@ -412,11 +433,14 @@ export async function runExtensionApplication(api, token) {
         break;
       }
     }
-    await call("result", {
+    const receipt = await call("result", {
       ...identity,
       ...(stopReason ? { reason: stopReason } : {}),
       ...(pageDiagnostic ? { diagnostic: pageDiagnostic } : {}),
     });
+    completed =
+      receipt?.status === "completed" ||
+      (receipt?.ok === true && stopReason === "existing-contact");
     return true;
   } catch (error) {
     const reason = reasons.has(error?.message)
@@ -434,7 +458,14 @@ export async function runExtensionApplication(api, token) {
   } finally {
     clearInterval(timer);
     chrome.runtime.onMessage.removeListener(authorizeMessage);
-    // Leave the dedicated tab open for inspection. Never automatically reopen or
-    // replay an uncertain send, including after extension/service worker restart.
+    // Bulk success can close only the dedicated task tab and its directly opened
+    // chat. Keep uncertain results open for inspection; never replay a send.
+    if (application?.bulkRunId && completed && chrome.tabs.remove) {
+      const owned = [
+        ...new Set([createdTabId, tabId].filter(Number.isInteger)),
+      ];
+      for (const id of owned)
+        await chrome.tabs.remove(id).catch(() => undefined);
+    }
   }
 }

@@ -157,6 +157,7 @@ export interface ConversationProbe {
 }
 export interface Application {
   id: string;
+  bulkRunId?: string;
   executor?: "worker" | "extension";
   stopReason?: string;
   pageDiagnostic?:
@@ -192,6 +193,25 @@ export interface Application {
     | "cancelled";
   actions: ApplicationAction[];
   createdAt: string;
+}
+export interface BulkRun {
+  id: string;
+  state: "running" | "paused" | "completed" | "cancelled";
+  target: number;
+  dailyLimit: number;
+  intervalSeconds: number;
+  message: string;
+  createdAt: string;
+  updatedAt: string;
+  nextRunAt?: string;
+  counts: {
+    queued: number;
+    running: number;
+    completed: number;
+    review: number;
+    skipped: number;
+    cancelled: number;
+  };
 }
 export interface Task {
   id: string;

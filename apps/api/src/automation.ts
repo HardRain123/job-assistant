@@ -9,7 +9,7 @@ const configSchema = z
   .object({
     keywords: z.array(z.string().trim().min(1).max(80)).min(1).max(5),
     city: z.enum(["上海", "全国"]),
-    maxJobs: z.number().int().min(1).max(50),
+    maxJobs: z.number().int().min(1).max(300),
     maxPages: z.number().int().min(1).max(10),
     autoAssess: z.boolean(),
     intervalSeconds: z.number().int().min(3).max(30),
