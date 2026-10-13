@@ -317,22 +317,21 @@ export async function applicationPageStep(request) {
       const salaries = fields
         .map((node) =>
           text(node).match(
-            /^(\d+(?:\.\d+)?)\s*[-–—~至]\s*(\d+(?:\.\d+)?)\s*[kK]$/,
+            /^(\d+(?:\.\d+)?)\s*[-–—~至]\s*(\d+(?:\.\d+)?)\s*[kK](?:\s*[·•・]\s*(\d+(?:\.\d+)?)\s*薪)?$/,
           ),
         )
         .filter(Boolean);
+      const salaryMatches = (salary) =>
+        Number(salary[1]) * 1000 === job.salaryMin &&
+        Number(salary[2]) * 1000 === job.salaryMax &&
+        (!salary[3] || job.salaryMonths == null || Number(salary[3]) === job.salaryMonths);
       count(
         "salaryMatchCount",
-        salaries.filter(
-          (salary) =>
-            Number(salary[1]) * 1000 === job.salaryMin &&
-            Number(salary[2]) * 1000 === job.salaryMax,
-        ).length,
+        salaries.filter(salaryMatches).length,
       );
       if (
         salaries.length !== 1 ||
-        Number(salaries[0][1]) * 1000 !== job.salaryMin ||
-        Number(salaries[0][2]) * 1000 !== job.salaryMax
+        !salaryMatches(salaries[0])
       )
         continue;
       const links = [

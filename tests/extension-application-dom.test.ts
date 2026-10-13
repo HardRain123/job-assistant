@@ -296,6 +296,27 @@ test("button job bar requires verified navigation and all visible identity field
   assert.equal((await runPage(f.document, request)).ok, false);
 });
 
+test("chat salary accepts the actual 23-29K·13薪 format but rejects different amounts or stated months", async () => {
+  const f = semanticChatFixture();
+  const request = {
+    mode: "inspect",
+    conversationOrigin: job.url,
+    job: { ...job, salaryMin: 23000, salaryMax: 29000, salaryMonths: 13 },
+  };
+  for (const salary of ["23-29K·13薪", "23 - 29k · 13 薪", "23–29K•13薪", "23-29K"]) {
+    f.salary.innerText = salary;
+    assert.equal((await runPage(f.document, request)).page, "conversation", salary);
+  }
+  for (const salary of ["23-29K·14薪", "23-29K·13.5薪", "22-29K·13薪", "23-30K·13薪", "23-29K/月·13薪", "23-29K·13薪 其他岗位", "2\uE123-29K·13薪"]) {
+    f.salary.innerText = salary;
+    const result = await runPage(f.document, request);
+    assert.equal(result.ok, false, salary);
+    assert.equal(result.diagnostic.probes.at(-1).result, "salary");
+  }
+  f.salary.innerText = "23-29K·13.5薪";
+  assert.equal((await runPage(f.document, { ...request, job: { ...request.job, salaryMonths: 13.5 } })).page, "conversation");
+});
+
 test("semantic header rejects sidebar geometry, history controls and duplicate job bars", async () => {
   for (const modify of [
     (f: any) => {
