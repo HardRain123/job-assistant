@@ -447,6 +447,33 @@ test("native contact must match the frozen URL and existing-contact state before
   );
   assert.equal(clicks, 1);
 });
+test("a new greeting that stays on the detail opens its changed Continue control exactly once", async () => {
+  for (const change of ["continue", "unchanged", "job-changed", "closed", "revoked"]) {
+    let clicks = 0;
+    let permissions = 0;
+    let live = { ...job, detail: true, status: "active", salaryText: "20-30K" };
+    const control = element("立即沟通");
+    control.click = () => {
+      clicks++;
+      if (change !== "unchanged") control.innerText = "继续沟通";
+      if (change === "job-changed") live = { ...live, description: "另一岗位职责" };
+      if (change === "closed") live = { ...live, status: "closed" };
+    };
+    const banner = element(job.title, { "a, button, .btn-startchat, .op-btn-chat, [role='button']": [control] });
+    const document = element("", { ".job-banner": [banner] });
+    const result = await runPage(document, { mode: "contact", expectedExisting: false }, "/job_detail/example.html", {
+      __jobAssistantReader00000000000000000000000000000000: () => ({ jobs: [live] }),
+      chrome: { runtime: { sendMessage: async () => ({ allowed: !(change === "revoked" && ++permissions > 1), expiresAt: Date.now() + 1500 }) } },
+    });
+    assert.equal(clicks, change === "continue" ? 2 : 1, change);
+    if (change === "continue") {
+      assert.equal(result.ok, true);
+      assert.equal(result.contactConfirmed, false); // Continue is not a delivery receipt.
+    }
+    if (["job-changed", "closed", "revoked"].includes(change)) assert.equal(result.ok, false);
+  }
+});
+
 test("composer clearing alone is unknown; only one new sent message confirms, and drafts are preserved", async () => {
   const f = chatFixture();
   let clicks = 0;
@@ -917,6 +944,16 @@ test("one new contact navigation can be confirmed by exact conversation readback
     );
   }
 });
+test("an explicitly reconciled bulk contact resumes only pending messages without replaying the greeting", async () => {
+  const f = runnerFixture({ bulk: true, resolvedContact: true, journal: true, messageSuccess: true });
+  await f.run();
+  assert.equal(f.calls.filter((c) => c.mode === "contact").length, 1);
+  assert.equal(f.calls.find((c) => c.mode === "contact")?.expectedExisting, true);
+  assert.equal(f.calls.filter((c) => c.mode === "message").length, 2);
+  assert.equal(f.calls.some((c) => c.body?.actionId === "greeting"), false);
+  assert.equal(f.calls.find((c) => c.path?.endsWith("/result"))?.body.reason, undefined);
+});
+
 test("bulk applications skip previously contacted recruiters without navigation or messages", async () => {
   const f = runnerFixture({ bulk: true });
   await f.run();

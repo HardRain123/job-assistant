@@ -688,7 +688,7 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
         (candidate.payload as Application).id,
       );
       if (application?.bulkRunId) {
-        requireConnection([0, 4, 0]);
+        requireConnection([0, 4, 2]);
         if (!o.bulk.canClaim(application)) return { task: null };
       }
       let current = false;

@@ -114,6 +114,8 @@ export async function applicationPageStep(request) {
     const found = readJob()?.jobs?.[0];
     if (
       !found?.detail ||
+      found.status === "closed" ||
+      found.status === "unknown" ||
       canonical(found.url) !== canonical(job.url) ||
       clean(found.title) !== clean(job.title) ||
       !companies.includes(normCompany(found.company)) ||
@@ -616,6 +618,20 @@ export async function applicationPageStep(request) {
       }
       if (conversation())
         return { ok: true, clicked: true, existingContact, contactConfirmed };
+      // Some details remain open after the native greeting and replace the
+      // original button with Continue. This second click only opens that exact
+      // contact; it is never another greeting and never confirms delivery alone.
+      const next = !existingContact ? contactControl() : null;
+      if (next && text(next) === "继续沟通") {
+        if (!fullJobMatches()) return stop("recipient-mismatch");
+        if (!(await authorize())) return stop("cancelled");
+        const nextBlock = blocked();
+        if (nextBlock) return stop(nextBlock);
+        if (contactControl() !== next || text(next) !== "继续沟通" || !fullJobMatches())
+          return stop("recipient-mismatch");
+        next.click();
+        return { ok: true, clicked: true, existingContact, contactConfirmed };
+      }
     }
     return { ok: true, clicked: true, existingContact, contactConfirmed };
   }

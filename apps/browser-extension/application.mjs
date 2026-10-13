@@ -357,7 +357,7 @@ export async function runExtensionApplication(api, token) {
         if (resolvedContact(action) && !view.existingContact)
           throw new Error("recipient-mismatch");
         if (view.existingContact) {
-          if (application.bulkRunId) {
+          if (application.bulkRunId && !resolvedContact(action)) {
             await progress(action, "skipped", "existing-contact");
             stopReason = "existing-contact";
             break;

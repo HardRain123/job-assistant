@@ -126,7 +126,7 @@ async function fixture() {
       payload: { code },
     })
   ).json().token;
-  const extension = (url: string, payload: any = {}, version = "0.4.1") =>
+  const extension = (url: string, payload: any = {}, version = "0.4.2") =>
     app.inject({
       method: "POST",
       url,
@@ -245,7 +245,7 @@ test("bulk start freezes configuration and job content and enqueues atomically o
     const job = f.addJob("甲公司");
     f.addJob("乙公司");
     const p = await f.preview();
-    await f.extension("/extension/v1/status", {}, "0.4.0");
+    await f.extension("/extension/v1/status", {}, "0.4.1");
     assert.equal(
       (
         await f.workbench("/api/bulk-application/start", {

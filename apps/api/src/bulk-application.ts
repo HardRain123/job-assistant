@@ -93,11 +93,11 @@ export function createBulkApplication(o: Options) {
       .map(Number);
     if (
       !status.paired ||
-      !(major > 0 || minor > 4 || (minor === 4 && patch >= 1)) ||
+      !(major > 0 || minor > 4 || (minor === 4 && patch >= 2)) ||
       !status.lastSeen ||
       Date.now() - Date.parse(status.lastSeen) > 90000
     )
-      throw new Error("请连接并刷新浏览器扩展到 0.4.1 或更新版本");
+      throw new Error("请连接并刷新浏览器扩展到 0.4.2 或更新版本");
   };
   const idle = () => {
     if (
