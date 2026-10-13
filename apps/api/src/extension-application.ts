@@ -10,6 +10,7 @@ import type {
   BulkRun,
   Job,
   MatchPolicy,
+  MessageTemplate,
   Resume,
 } from "../../../packages/contracts/src/index.ts";
 import {
@@ -19,6 +20,7 @@ import {
 import { canonicalJobUrl } from "./automation.ts";
 import { evaluateGates } from "../../../packages/matching/src/index.ts";
 import type { BulkApplication } from "./bulk-application.ts";
+import { renderTemplate } from "../../../packages/templates/src/index.ts";
 
 interface Options {
   store: Store;
@@ -32,6 +34,7 @@ interface Options {
   assessment: (job: Job) => Assessment | null;
   policy: () => MatchPolicy;
   configurationKey: () => string;
+  configurationKeyForTemplate: (version: number) => string | null;
   bulk: BulkApplication;
 }
 
@@ -575,6 +578,17 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
         actionId: z.string().uuid(),
         expectedTextHash: z.string().regex(/^[a-f0-9]{64}$/),
         inspectionRunId: z.string().uuid(),
+        updatedTemplate: z
+          .object({
+            version: z.number().int().positive(),
+            expectedConfigurationKey: z.string().regex(/^[a-f0-9]{64}$/),
+            expectedMessages: z
+              .array(z.string().min(1).max(2000))
+              .min(1)
+              .max(5),
+          })
+          .strict()
+          .optional(),
       })
       .strict()
       .parse(req.body);
@@ -632,7 +646,6 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
       // Reconciliation only queues untouched work. A paused batch must be
       // resolvable before it can resume; actual claims/actions still require a
       // running batch. Never resurrect a cancelled, completed or replaced run.
-      requireConfig(application);
       requireFrozenJob(application);
       if (application.bulkRunId) {
         const run = store.get<BulkRun | null>("bulk.current", null);
@@ -643,6 +656,94 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
         )
           throw new Error("原批量任务已结束或被替换，无法接续");
       }
+      if (body.updatedTemplate) {
+        // Explicitly reviewed template updates are restricted to a one-job,
+        // text-only batch. Reconstructing the prior hash proves that the resume,
+        // policy and attachment bytes have not changed along with the template.
+        const originalKey = store.get<string | null>(
+          configKey(application.id),
+          null,
+        );
+        const batch = store.get<
+          (BulkRun & { configurationKey: string }) | null
+        >("bulk.current", null);
+        const template = store.get<MessageTemplate | null>("template", null);
+        const resume = store.get<Resume | null>("resume", null);
+        const selection = o.assessment(application.job);
+        if (
+          !application.bulkRunId ||
+          !batch ||
+          batch.state !== "paused" ||
+          batch.id !== application.bulkRunId ||
+          batch.configurationKey !== originalKey ||
+          store.applications().filter((item) => item.bulkRunId === batch.id)
+            .length !== 1 ||
+          application.attachmentPolicy !== "message-only" ||
+          application.resumeAttachment ||
+          application.actions.some((item) => item.kind === "attachment") ||
+          !originalKey ||
+          o.configurationKeyForTemplate(application.templateVersion) !==
+            originalKey ||
+          !template ||
+          !resume ||
+          resume.id !== application.resumeId ||
+          template.version !== body.updatedTemplate.version ||
+          o.configurationKey() !==
+            body.updatedTemplate.expectedConfigurationKey ||
+          selection?.decision !== "eligible" ||
+          !selection.gates.length ||
+          selection.gates.some((gate) => gate.status !== "pass")
+        )
+          throw new Error(
+            "仅限配置未变的单岗位暂停批次更新未发送话术，请重新核对",
+          );
+        const messages = renderTemplate(
+          { ...template, attachmentPolicy: "message-only" },
+          {
+            company: application.job.company,
+            title: application.job.title,
+            candidateName: resume.name,
+            years: String(resume.years),
+            skills: resume.skills.join("、"),
+          },
+        );
+        if (
+          messages.length !== application.frozenMessages.length ||
+          JSON.stringify(messages) !==
+            JSON.stringify(body.updatedTemplate.expectedMessages) ||
+          application.actions
+            .filter((item) => item.kind === "message")
+            .some(
+              (item) =>
+                item.index <= action.index &&
+                messages[item.index - 1] !== item.text,
+            )
+        )
+          throw new Error("话术预览已变化，或已尝试的段落被修改，无法接续");
+        store.audit("extensionApplication.pendingTemplateUpdated", {
+          applicationId: application.id,
+          bulkRunId: batch.id,
+          previousVersion: application.templateVersion,
+          version: template.version,
+          previousConfigurationKey: originalKey,
+          configurationKey: body.updatedTemplate.expectedConfigurationKey,
+          changes: later.map((item) => ({
+            actionId: item.id,
+            before: item.text,
+            after: messages[item.index - 1],
+          })),
+        });
+        for (const item of later) item.text = messages[item.index - 1]!;
+        application.frozenMessages = messages;
+        application.templateVersion = template.version;
+        store.set(
+          configKey(application.id),
+          body.updatedTemplate.expectedConfigurationKey,
+        );
+        batch.configurationKey = body.updatedTemplate.expectedConfigurationKey;
+        store.set("bulk.current", batch);
+      }
+      requireConfig(application);
       requireExistingContactAudit(application);
       for (const item of earlier.filter(manuallyConfirmedMessage))
         requireMessageConfirmationAudit(application, item);

@@ -26,6 +26,7 @@ import {
   type ApplicationAction,
   type Job,
   type MatchPolicy,
+  type MessageTemplate,
 } from "../../../packages/contracts/src/index.ts";
 import {
   chat,
@@ -386,6 +387,8 @@ export async function createApp(o: AppOptions) {
     const r = resume();
     const j = b.jobId ? o.store.job(b.jobId) : null;
     return {
+      templateVersion: template().version,
+      configurationKey: configurationKey(),
       messages: renderTemplate(template(), {
         company: j?.company ?? "示例公司",
         title: j?.title ?? "AI 应用开发工程师",
@@ -675,16 +678,17 @@ export async function createApp(o: AppOptions) {
       };
     });
   }
-  const configurationKey = () =>
+  const configurationKeyFor = (messageTemplate: MessageTemplate) =>
     fingerprint({
       resume: resume(),
-      template: template(),
+      template: messageTemplate,
       policy: policy(),
       attachment: attachmentManifest(
         o.attachmentsDir,
         resume()?.attachmentName ?? null,
       ),
     });
+  const configurationKey = () => configurationKeyFor(template());
   const bulk = createBulkApplication({
     store: o.store,
     draft,
@@ -703,6 +707,13 @@ export async function createApp(o: AppOptions) {
     assessment,
     policy,
     configurationKey,
+    configurationKeyForTemplate: (version) => {
+      const saved = o.store.get<MessageTemplate | null>(
+        `template:${version}`,
+        null,
+      );
+      return saved ? configurationKeyFor(saved) : null;
+    },
     bulk,
   });
   app.post("/api/batches/preview", (req) => {

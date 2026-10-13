@@ -127,6 +127,7 @@ interface Policy {
 }
 interface Application {
   id: string;
+  bulkRunId?: string;
   stopReason?: string;
   pageDiagnostic?: StoredApplication["pageDiagnostic"];
   job: Job;
@@ -1805,6 +1806,11 @@ function ConfirmSentMessage({
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [latest, setLatest] = useState<{
+    templateVersion: number;
+    configurationKey: string;
+    messages: string[];
+  } | null>(null);
   const mounted = useRef(true);
   useEffect(() => {
     mounted.current = true;
@@ -1892,6 +1898,15 @@ function ConfirmSentMessage({
             .map((byte) => byte.toString(16).padStart(2, "0"))
             .join(""),
           inspectionRunId: run.id,
+          ...(latest
+            ? {
+                updatedTemplate: {
+                  version: latest.templateVersion,
+                  expectedConfigurationKey: latest.configurationKey,
+                  expectedMessages: latest.messages,
+                },
+              }
+            : {}),
         },
       );
       if (result && mounted.current) setOpen(false);
@@ -1931,7 +1946,48 @@ function ConfirmSentMessage({
             确认后记录为“人工核对已发送”，保留原始未知回执，只将未发送的后续步骤排队。该消息不会重发。
           </p>
           {application.bulkRunId && (
-            <p>若批次已暂停，核对后请到“批量投递”页继续批次。</p>
+            <>
+              <p>若批次已暂停，核对后请到“批量投递”页继续批次。</p>
+              <button
+                className="quiet"
+                disabled={busy}
+                onClick={() => {
+                  setError("");
+                  void api<{
+                    templateVersion: number;
+                    configurationKey: string;
+                    messages: string[];
+                  }>("/api/template/preview", "POST", {
+                    jobId: application.job.id,
+                  })
+                    .then(setLatest)
+                    .catch((e) =>
+                      setError(e instanceof Error ? e.message : "预览失败"),
+                    );
+                }}
+              >
+                预览最新话术后接续（单岗位批次）
+              </button>
+              {latest && (
+                <div>
+                  <p>
+                    本次将使用以下新版后续话术，已发送段落保持原记录；附件仍不发送。
+                  </p>
+                  {latest.messages.slice(action.index).map((message, index) => (
+                    <blockquote key={index} style={{ whiteSpace: "pre-wrap" }}>
+                      {message}
+                    </blockquote>
+                  ))}
+                  <button
+                    className="quiet"
+                    disabled={busy}
+                    onClick={() => setLatest(null)}
+                  >
+                    取消使用新版
+                  </button>
+                </div>
+              )}
+            </>
           )}
           {error && <p role="alert">{error}</p>}
           <button disabled={busy || paused} onClick={() => void resume()}>

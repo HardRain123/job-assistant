@@ -652,6 +652,219 @@ test("a paused bulk message can be reconciled without unpausing or resending it"
   }
 });
 
+async function stageUpdatedTemplate(f: Awaited<ReturnType<typeof fixture>>) {
+  f.store.set("template", {
+    ...f.store.get<any>("template", null),
+    attachmentPolicy: "message-only",
+  });
+  const staged = await stageUncertainMessage(f);
+  const application = f.store.application(staged.identity.applicationId)!;
+  application.bulkRunId = randomUUID();
+  // Bulk drafts deliberately omit the attachment even when a resume file exists.
+  application.resumeAttachment = null;
+  f.store.set(`extensionApplication.attachment:${application.id}`, null);
+  f.store.updateApplication(application);
+  f.store.set("bulk.current", {
+    id: application.bulkRunId,
+    state: "paused",
+    target: 1,
+    dailyLimit: 150,
+    intervalSeconds: 30,
+    configurationKey: f.store.get(
+      `extensionApplication.configuration:${application.id}`,
+      null,
+    ),
+    message: "等待核对",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    counts: {
+      queued: 0,
+      running: 0,
+      completed: 0,
+      review: 1,
+      skipped: 0,
+      cancelled: 0,
+    },
+  });
+  const previous = f.store.get<any>("template", null);
+  f.store.set(`template:${previous.version}`, previous);
+  const next = {
+    ...previous,
+    version: previous.version + 1,
+    attachmentPolicy: "send-after-messages",
+    segments: [previous.segments[0], "到岗时间：拿到 offer 后一周"],
+  };
+  f.store.set(`template:${next.version}`, next);
+  f.store.set("template", next);
+  const preview = (
+    await f.workbench("/api/template/preview", { jobId: application.jobId })
+  ).json();
+  const request = {
+    ...staged.request,
+    updatedTemplate: {
+      version: preview.templateVersion,
+      expectedConfigurationKey: preview.configurationKey,
+      expectedMessages: preview.messages,
+    },
+  };
+  return { ...staged, application, request, preview };
+}
+
+test("reviewed latest template replaces only pending text in a single paused batch, never adds attachments", async () => {
+  const f = await fixture("eligible", undefined, "0.4.4");
+  try {
+    const staged = await stageUpdatedTemplate(f);
+    const url = "/api/extension-application/confirm-message-and-resume";
+    const { updatedTemplate, ...withoutReview } = staged.request;
+    assert.equal((await f.workbench(url, withoutReview)).statusCode, 400);
+    const result = await f.workbench(url, staged.request);
+    assert.equal(result.statusCode, 200, result.body);
+    const saved = f.store.application(staged.application.id)!;
+    assert.equal(saved.actions.length, 3);
+    assert.deepEqual(saved.actions[0], staged.application.actions[0]);
+    assert.equal(saved.actions[1]!.text, staged.application.actions[1]!.text);
+    assert.equal(saved.actions[1]!.resolution, "user-confirmed-sent");
+    assert.equal(saved.actions[2]!.text, "到岗时间：拿到 offer 后一周");
+    assert.equal(saved.actions[2]!.state, "pending");
+    assert.equal(saved.attachmentPolicy, "message-only");
+    assert.equal(saved.resumeAttachment, null);
+    assert.equal(f.store.get<any>("bulk.current", null).state, "paused");
+    assert.equal(
+      (await f.extension("/extension/v1/application/claim")).json().task,
+      null,
+    );
+    assert.equal(
+      (await f.workbench("/api/bulk-application/control", { action: "resume" }))
+        .statusCode,
+      200,
+    );
+    const task = (await f.extension("/extension/v1/application/claim")).json()
+      .task;
+    assert.ok(task);
+    assert.deepEqual(
+      task.application.actions.map((item: any) => item.id),
+      [saved.actions[0]!.id, saved.actions[2]!.id],
+    );
+    assert.equal(task.application.actions[1].text, saved.actions[2]!.text);
+    assert.equal(
+      f.store.db
+        .prepare(
+          "SELECT COUNT(*) AS n FROM audit WHERE event='extensionApplication.pendingTemplateUpdated'",
+        )
+        .get()?.n,
+      1,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("latest-template review cannot hide changed inputs, modify attempted text or reconfigure other batch jobs", async () => {
+  for (const change of [
+    "hash",
+    "version",
+    "text",
+    "prefix",
+    "resume",
+    "policy",
+    "history",
+    "other-job",
+    "inspection",
+    "audit",
+  ]) {
+    const f = await fixture("eligible", undefined, "0.4.4");
+    try {
+      const staged = await stageUpdatedTemplate(f);
+      if (change === "hash")
+        staged.request.updatedTemplate.expectedConfigurationKey = "0".repeat(
+          64,
+        );
+      if (change === "version") staged.request.updatedTemplate.version++;
+      if (change === "text")
+        staged.request.updatedTemplate.expectedMessages[1] = "未预览的话术";
+      if (change === "resume")
+        f.store.set("resume", {
+          ...f.store.get<any>("resume", null),
+          text: "新的履历",
+        });
+      if (change === "policy")
+        f.store.set("policy", { ...DEFAULT_POLICY, salaryMin: 30000 });
+      if (change === "history")
+        f.store.set(`template:${staged.application.templateVersion}`, null);
+      if (change === "other-job")
+        f.store.insertApplication({
+          ...staged.application,
+          id: randomUUID(),
+          jobId: randomUUID(),
+        });
+      if (change === "inspection")
+        f.store.set("automation.current", {
+          ...staged.run,
+          updatedAt: new Date(Date.now() - 100000).toISOString(),
+        });
+      if (change === "audit")
+        f.store.db
+          .prepare(
+            "DELETE FROM audit WHERE event='extensionApplication.existingContactResumed'",
+          )
+          .run();
+      if (change === "prefix") {
+        const t = f.store.get<any>("template", null);
+        f.store.set("template", {
+          ...t,
+          segments: ["另一段已经尝试的话术", t.segments[1]],
+        });
+      }
+      if (["prefix", "resume", "policy"].includes(change)) {
+        const p = (
+          await f.workbench("/api/template/preview", {
+            jobId: staged.application.jobId,
+          })
+        ).json();
+        staged.request.updatedTemplate = {
+          version: p.templateVersion,
+          expectedConfigurationKey: p.configurationKey,
+          expectedMessages: p.messages,
+        };
+      }
+      const before = f.store.application(staged.application.id);
+      const oldKey = f.store.get(
+        `extensionApplication.configuration:${staged.application.id}`,
+        null,
+      );
+      const response = await f.workbench(
+        "/api/extension-application/confirm-message-and-resume",
+        staged.request,
+      );
+      assert.equal(response.statusCode, 400, change + response.body);
+      assert.deepEqual(
+        f.store.application(staged.application.id),
+        before,
+        change,
+      );
+      assert.equal(
+        f.store.get(
+          `extensionApplication.configuration:${staged.application.id}`,
+          null,
+        ),
+        oldKey,
+        change,
+      );
+      assert.equal(
+        f.store.db
+          .prepare(
+            "SELECT COUNT(*) AS n FROM audit WHERE event='extensionApplication.pendingTemplateUpdated'",
+          )
+          .get()?.n,
+        0,
+        change,
+      );
+    } finally {
+      await f.close();
+    }
+  }
+});
+
 test("bulk reconciliation rejects ended, missing or replaced runs and global browser pauses", async () => {
   for (const state of [
     "completed",
