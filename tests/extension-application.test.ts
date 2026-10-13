@@ -1204,6 +1204,101 @@ test("another unknown segment can be reconciled once after a new inspection, wit
   }
 });
 
+test("confirming the final text completes the record and paused batch without enqueueing or rewriting unknown receipts", async () => {
+  const f = await fixture("eligible", undefined, "0.4.4");
+  try {
+    f.store.set("template", {
+      ...f.store.get<any>("template", null),
+      attachmentPolicy: "message-only",
+    });
+    const staged = await stageUncertainMessage(f);
+    const url = "/api/extension-application/confirm-message-and-resume";
+    assert.equal((await f.workbench(url, staged.request)).statusCode, 200);
+    const task = (await f.extension("/extension/v1/application/claim")).json()
+      .task;
+    const identity = {
+      taskId: task.id,
+      leaseToken: task.leaseToken,
+      applicationId: staged.identity.applicationId,
+    };
+    const last = task.application.actions.find(
+      (item: any) => item.kind === "message",
+    );
+    for (const [state, evidence] of [
+      ["started", "before-action"],
+      ["unknown", "send-unconfirmed"],
+    ])
+      assert.equal(
+        (
+          await f.extension("/extension/v1/application/action", {
+            ...identity,
+            actionId: last.id,
+            state,
+            evidence,
+          })
+        ).statusCode,
+        200,
+      );
+    await f.extension("/extension/v1/application/result", {
+      ...identity,
+      reason: "send-unconfirmed",
+    });
+    const application = f.store.application(identity.applicationId)!;
+    application.bulkRunId = randomUUID();
+    f.store.updateApplication(application);
+    f.store.set("bulk.current", {
+      id: application.bulkRunId,
+      state: "paused",
+      target: 1,
+      dailyLimit: 150,
+      intervalSeconds: 30,
+      configurationKey: f.store.get(
+        `extensionApplication.configuration:${application.id}`,
+        null,
+      ),
+      counts: {
+        queued: 0,
+        running: 0,
+        completed: 0,
+        review: 1,
+        skipped: 0,
+        cancelled: 0,
+      },
+    });
+    const run = {
+      ...staged.run,
+      id: randomUUID(),
+      updatedAt: new Date().toISOString(),
+    };
+    f.store.set("automation.current", run);
+    const count = f.store.tasks().length;
+    const response = await f.workbench(url, {
+      applicationId: application.id,
+      actionId: last.id,
+      expectedTextHash: createHash("sha256").update(last.text).digest("hex"),
+      inspectionRunId: run.id,
+    });
+    assert.equal(response.statusCode, 200, response.body);
+    assert.equal(response.json().status, "completed");
+    const saved = f.store.application(application.id)!;
+    assert.deepEqual(
+      saved.actions.slice(0, 2),
+      application.actions.slice(0, 2),
+    );
+    assert.equal(saved.actions[2]!.state, "unknown");
+    assert.equal(saved.actions[2]!.resolution, "user-confirmed-sent");
+    assert.equal(f.store.tasks().length, count);
+    assert.equal(
+      (await f.extension("/extension/v1/application/claim")).json().task,
+      null,
+    );
+    assert.equal(f.store.get<any>("bulk.current", null).state, "completed");
+    assert.equal(f.store.get<any>("bulk.current", null).counts.completed, 1);
+  } finally {
+    await f.close();
+  }
+});
+
 test("fresh exact read-only inspection resumes only pending messages while native remains unknown", async () => {
   const f = await fixture("eligible");
   try {

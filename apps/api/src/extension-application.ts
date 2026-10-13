@@ -639,7 +639,15 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
         earlier.some(
           (item) => item.id !== native.id && !manuallyConfirmedMessage(item),
         ) ||
-        !later.length ||
+        application.actions.length !==
+          1 +
+            application.frozenMessages.length +
+            (application.attachmentPolicy === "send-after-messages" ? 1 : 0) ||
+        application.actions.some(
+          (item) =>
+            item.kind === "message" &&
+            item.text !== application.frozenMessages[item.index - 1],
+        ) ||
         later.some((item) => item.state !== "pending" || item.resolution)
       )
         throw new Error("前序动作未核对，或后续动作已执行，无法安全接续");
@@ -767,7 +775,7 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
       // missing browser receipt as an automatically confirmed send.
       action.resolution = "user-confirmed-sent";
       action.updatedAt = new Date().toISOString();
-      application.status = "queued";
+      application.status = later.length ? "queued" : "completed";
       delete application.stopReason;
       delete application.pageDiagnostic;
       store.audit("extensionApplication.messageConfirmedAndResumed", {
@@ -781,10 +789,12 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
         previousDiagnostic,
         resolution: action.resolution,
         currentHash: current.contentHash,
+        completed: application.status === "completed",
       });
       store.updateApplication(application);
-      store.enqueue("apply", application);
-      return { applicationId: application.id };
+      if (later.length) store.enqueue("apply", application);
+      else o.bulk.afterResult(application);
+      return { applicationId: application.id, status: application.status };
     });
   });
   app.post("/extension/v1/application/claim", () => {

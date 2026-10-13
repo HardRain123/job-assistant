@@ -1841,12 +1841,14 @@ function ConfirmSentMessage({
           previous.state !== "unknown" ||
           previous.resolution !== "user-confirmed-sent"),
     ) ||
-    !application.actions.some((later) => later.index > action.index) ||
     application.actions.some(
       (later) => later.index > action.index && later.state !== "pending",
     )
   )
     return null;
+  const hasPending = application.actions.some(
+    (later) => later.index > action.index,
+  );
 
   const resume = async () => {
     if (busy) return;
@@ -1943,9 +1945,11 @@ function ConfirmSentMessage({
             {action.text}
           </blockquote>
           <p>
-            确认后记录为“人工核对已发送”，保留原始未知回执，只将未发送的后续步骤排队。该消息不会重发。
+            {hasPending
+              ? "确认后记录为“人工核对已发送”，保留原始未知回执，只将未发送的后续步骤排队。该消息不会重发。"
+              : "确认后完成本条投递记录，保留原始未知回执及人工核对标记，不再执行任何发送。"}
           </p>
-          {application.bulkRunId && (
+          {application.bulkRunId && hasPending && (
             <>
               <p>若批次已暂停，核对后请到“批量投递”页继续批次。</p>
               <button
@@ -1991,7 +1995,11 @@ function ConfirmSentMessage({
           )}
           {error && <p role="alert">{error}</p>}
           <button disabled={busy || paused} onClick={() => void resume()}>
-            {busy ? "正在核对岗位并接续…" : "已在 BOSS 核对，继续后续步骤"}
+            {busy
+              ? "正在核对岗位…"
+              : hasPending
+                ? "已在 BOSS 核对，继续后续步骤"
+                : "已在 BOSS 核对，完成记录"}
           </button>
         </Dialog>
       )}

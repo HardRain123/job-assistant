@@ -141,7 +141,12 @@ export function createBulkApplication(o: Options) {
       run.state = "paused";
       run.message = "存在待核对的投递结果，批量已暂停；不会自动重发。";
     }
-    if (run.state === "running" && !run.counts.queued && !run.counts.running) {
+    if (
+      (run.state === "running" ||
+        (run.state === "paused" && !run.counts.review)) &&
+      !run.counts.queued &&
+      !run.counts.running
+    ) {
       run.state = "completed";
       run.message =
         "本批岗位处理结束，请分别查看已确认发送、待核对和跳过数量。";

@@ -626,6 +626,66 @@ test("receipt accepts nested text and sibling delivery labels while unrelated hi
   );
 });
 
+test("whole-bubble matching accepts a separately rendered boundary receipt without a text class", async () => {
+  for (const placement of ["after", "before", "no-space", "nested-status"]) {
+    const f = chatFixture();
+    const expected = "目前状态：离职\n平均月薪是18350元";
+    const normalized = expected.replace(/\s+/g, " ");
+    const label = element("送达");
+    const value =
+      placement === "before"
+        ? `送达 ${normalized}`
+        : placement === "no-space"
+          ? `${normalized}送达`
+          : `${normalized} 送达`;
+    const body = element(value, { span: [label] });
+    const sent = element(value, {
+      ".status, .message-status, .read-status": [label],
+      ".text, .message-text, .text-content, .bubble-content":
+        placement === "nested-status" ? [body] : [],
+    });
+    f.button.click = () => {
+      f.rows.push(sent);
+      f.editor.innerText = "";
+    };
+    assert.equal(
+      (await runPage(f.document, { mode: "message", text: expected })).evidence,
+      "new-message",
+      placement,
+    );
+  }
+});
+
+test("boundary receipt cannot be inferred from body text alone, partial quotes, hidden labels or failures", async () => {
+  for (const example of [
+    { value: "您好 送达", expected: "您好 送达" },
+    { value: "引用：您好 送达", expected: "您好" },
+    { value: "您好 已修改 送达", expected: "您好" },
+    { value: "您好 送达", expected: "您好", hidden: true },
+    { value: "您好 送达", expected: "您好", failed: true },
+  ]) {
+    const f = chatFixture();
+    f.button.click = () => {
+      f.rows.push(
+        element(example.value, {
+          ".status, .message-status, .read-status": [
+            element("送达", {}, example.hidden),
+          ],
+          ".message-fail, .send-fail, .retry": example.failed
+            ? [element("失败")]
+            : [],
+        }),
+      );
+      f.editor.innerText = "";
+    };
+    assert.equal(
+      (await runPage(f.document, { mode: "message", text: example.expected }))
+        .reason,
+      "send-unconfirmed",
+    );
+  }
+});
+
 test("message-content rows require an explicit unambiguous self class, never right-hand geometry", async () => {
   for (const sender of [
     "item-myself",

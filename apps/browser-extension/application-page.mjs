@@ -559,31 +559,65 @@ export async function applicationPageStep(request) {
     );
     return outer.length === 1 ? outer[0] : null;
   };
-  const messageReceipt = (item) => {
+  const messageReceipt = (item, expected) => {
     const body = messageBody(item);
     const outsideBody = (node) =>
-      body && node !== body && !body.contains(node) && !node.contains(body);
-    const labels = [
+      node !== body &&
+      (!body || (!body.contains(node) && !node.contains(body)));
+    const explicit = new Set(
+      nodes(item, ".status, .message-status, .read-status"),
+    );
+    const labelNodes = [
       ...new Set([
-        ...nodes(item, ".status, .message-status, .read-status"),
+        ...explicit,
         ...nodes(item, "span, div, em, i, b, small").filter(
           (node) => node.children.length === 0,
         ),
       ]),
-    ]
-      .filter(outsideBody)
-      .map(text);
+    ].filter(
+      (node) => node !== body && (explicit.has(node) || outsideBody(node)),
+    );
+    const labels = labelNodes.map(text);
     const failed =
       Boolean(nodes(item, ".message-fail, .send-fail, .retry").length) ||
       labels.some((value) => /^(发送失败|发送中|未发送|重试)$/.test(value));
-    const acknowledged =
-      !failed &&
-      labels.some((value) =>
-        /^(已读|未读|已发送|已送达|送达|\[(?:已读|已送达|送达)\]|【(?:已读|已送达|送达)】)$/.test(
-          value,
-        ),
+    const successLabels = labels.filter((value) =>
+      /^(已读|未读|已发送|已送达|送达|\[(?:已读|已送达|送达)\]|【(?:已读|已送达|送达)】)$/.test(
+        value,
+      ),
+    );
+    // Some bubbles have no known text class, or wrap the status in that class.
+    // Accept only the exact entire message plus a separately rendered status at
+    // one boundary. Never strip arbitrary text, timestamps or quoted messages.
+    const whole = text(item);
+    const wholeMatches =
+      Boolean(expected) &&
+      successLabels.some((label) =>
+        [
+          expected + label,
+          label + expected,
+          `${expected} ${label}`,
+          `${label} ${expected}`,
+        ].includes(whole),
       );
-    return { body: body ? text(body) : "", acknowledged, failed };
+    const bodyText = wholeMatches
+      ? expected
+      : body
+        ? text(body)
+        : whole === expected
+          ? expected
+          : "";
+    const independentStatus =
+      Boolean(body) &&
+      text(body) === expected &&
+      labelNodes.some(
+        (node) => outsideBody(node) && successLabels.includes(text(node)),
+      );
+    return {
+      body: bodyText,
+      acknowledged: !failed && (wholeMatches || independentStatus),
+      failed,
+    };
   };
   if (request.mode === "inspect") {
     const control = contactControl();
@@ -719,7 +753,7 @@ export async function applicationPageStep(request) {
     const before = new Set(outgoing(current.root));
     const expected = clean(request.text);
     const previousMatches = [...before].filter(
-      (item) => messageReceipt(item).body === expected,
+      (item) => messageReceipt(item, expected).body === expected,
     ).length;
     current.editor.focus();
     // Normal editable input only; no trusted-event hooks or security bypasses.
@@ -750,11 +784,11 @@ export async function applicationPageStep(request) {
         return stop("recipient-mismatch");
       const after = outgoing(current.root);
       const matching = after.filter(
-        (item) => messageReceipt(item).body === expected,
+        (item) => messageReceipt(item, expected).body === expected,
       );
       const added = matching.filter((item) => !before.has(item));
       const acknowledged = added.filter(
-        (item) => messageReceipt(item).acknowledged,
+        (item) => messageReceipt(item, expected).acknowledged,
       );
       const bounded = (count) => Math.min(1000, count);
       diagnostic = {
@@ -768,7 +802,7 @@ export async function applicationPageStep(request) {
         newMatchingCount: bounded(added.length),
         acknowledgedCount: bounded(acknowledged.length),
         failedCount: bounded(
-          added.filter((item) => messageReceipt(item).failed).length,
+          added.filter((item) => messageReceipt(item, expected).failed).length,
         ),
         editorEmpty: !text(current.editor),
       };
