@@ -47,6 +47,8 @@ export function matchesFrozenJob(found, expected) {
     return false;
   if (
     !found.detail ||
+    found.status === "closed" ||
+    found.status === "unknown" ||
     clean(found.title) !== clean(expected.title) ||
     clean(found.description) !== clean(expected.description)
   )

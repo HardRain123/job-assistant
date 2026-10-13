@@ -236,7 +236,7 @@ test("扩展弹窗请求与真实 API 契约一致：配对、导入、查询和
     });
     const headers = { Authorization: `Bearer ${pair.token}` };
     const jobs = importPayload([
-      { ...item(), sourceJobId: "client-field", secret: "must-not-send" },
+      { ...item(), status: "closed", sourceJobId: "client-field", secret: "must-not-send" },
     ]);
     const imported = await api("/extension/v1/jobs", {
       method: "POST",
@@ -244,6 +244,8 @@ test("扩展弹窗请求与真实 API 契约一致：配对、导入、查询和
       body: JSON.stringify({ jobs }),
     });
     assert.equal(imported.count, 1);
+    assert.equal(f.store.jobs()[0]!.status, "closed");
+    assert.equal(importPayload([{ ...item(), status: "unexpected" }])[0].status, "unknown");
     assert.equal(
       (await api("/extension/v1/status", { method: "POST", headers })).connected,
       true,
@@ -357,6 +359,41 @@ test("岗位导入规范化、去重、保留详情，并整批拒绝非法链�
       ).statusCode >= 400,
     );
     assert.equal(f.store.jobs().length, 1);
+  } finally {
+    await f.close();
+  }
+});
+
+test("岗位关闭状态入库并使内容指纹失效，旧客户端和列表刷新不会误将岗位重新开启", async () => {
+  const f = await fixture();
+  try {
+    const token = (await f.pair(await f.code())).json().token;
+    const importJobs = (jobs: any[]) =>
+      f.request(token, "POST", "/extension/v1/jobs", { jobs });
+    assert.equal((await importJobs([item()])).statusCode, 200);
+    const active = f.store.jobs()[0]!;
+    assert.equal(active.status, "active");
+    assert.equal((await importJobs([{ ...item(), status: "closed" }])).statusCode, 200);
+    const closed = f.store.jobs()[0]!;
+    assert.equal(closed.id, active.id);
+    assert.equal(closed.status, "closed");
+    assert.notEqual(closed.contentHash, active.contentHash);
+
+    await importJobs([item()]);
+    assert.equal(f.store.jobs()[0]!.status, "closed");
+    await importJobs([{ ...item(), detail: false, status: "active", description: "列表摘要" }]);
+    assert.equal(f.store.jobs()[0]!.status, "closed");
+    assert.equal(f.store.jobs()[0]!.description, closed.description);
+
+    await importJobs([{ ...item(), status: "active" }]);
+    assert.equal(f.store.jobs()[0]!.status, "active");
+    await importJobs([{ ...item(), detail: false, status: "closed", description: "列表摘要" }]);
+    assert.equal(f.store.jobs()[0]!.status, "closed");
+    assert.equal(f.store.jobs()[0]!.description, closed.description);
+    await importJobs([{ ...item(), status: "unknown" }]);
+    assert.equal(f.store.jobs()[0]!.status, "unknown");
+    assert.ok((await importJobs([{ ...item(), status: "applied" }])).statusCode >= 400);
+    assert.equal(f.store.jobs()[0]!.status, "unknown");
   } finally {
     await f.close();
   }

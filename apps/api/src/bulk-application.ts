@@ -88,16 +88,16 @@ export function createBulkApplication(o: Options) {
   };
   const connection = () => {
     const status = o.status();
-    const [major = 0, minor = 0] = (status.version ?? "")
+    const [major = 0, minor = 0, patch = 0] = (status.version ?? "")
       .split(".")
       .map(Number);
     if (
       !status.paired ||
-      !(major > 0 || minor >= 4) ||
+      !(major > 0 || minor > 4 || (minor === 4 && patch >= 1)) ||
       !status.lastSeen ||
       Date.now() - Date.parse(status.lastSeen) > 90000
     )
-      throw new Error("请连接并刷新浏览器扩展到 0.4.0 或更新版本");
+      throw new Error("请连接并刷新浏览器扩展到 0.4.1 或更新版本");
   };
   const idle = () => {
     if (

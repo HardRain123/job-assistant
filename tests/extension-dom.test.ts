@@ -247,6 +247,47 @@ test("公司展示名只有在唯一信息区内有可见 BOSS 公司链接时�
   assert.equal(run(layout.document).jobs[0].companyAliases, undefined);
 });
 
+test("无链接品牌仅由同页工商全称及唯一完整公司区绑定，拒绝未知、隐藏与冲突", () => {
+  const layout = screenshotLayout("示例信息技术（上海）有限公司");
+  layout.heading.parentElement = node("公司基本信息\nExampleTech\n已上市\n1000-9999人\n计算机软件\n查看全部职位");
+  const registration = node("工商信息");
+  const registeredSection = node("工商信息\n公司名称\n示例信息技术（上海）有限公司\n经营状态\n存续");
+  registration.parentElement = registeredSection;
+  layout.fields["h2, h3, h4, h5, dt"] = [layout.heading, registration];
+  const accepted = run(layout.document);
+  assert.equal(accepted.jobs[0].industry, "计算机软件");
+  assert.deepEqual(Array.from(accepted.jobs[0].companyAliases), ["ExampleTech"]);
+  assert.equal(accepted.pageEvidence.registeredCompany, "示例信息技术（上海）有限公司");
+  registeredSection.innerText = "工商信息\n公司名称\n另一公司";
+  assert.equal(run(layout.document).jobs[0].industry, "");
+  registeredSection.innerText = "工商信息\n公司名称\n示例信息技术（上海）有限公司";
+  registeredSection.style = { display: "none" };
+  assert.equal(run(layout.document).jobs[0].industry, "");
+  registeredSection.style = {};
+  const conflicting = node("公司基本信息");
+  conflicting.parentElement = node("公司基本信息\n另一品牌\n100-499人\n保险\n查看全部职位");
+  layout.fields["h2, h3, h4, h5, dt"].push(conflicting);
+  assert.equal(run(layout.document).jobs[0].industry, "");
+  assert.equal(run(layout.document).jobs[0].companyAliases, undefined);
+  layout.fields["h2, h3, h4, h5, dt"].pop();
+  layout.banner.querySelectorAll = () => [node("客户公司：示例信息技术（上海）有限公司")];
+  assert.equal(run(layout.document).jobs[0].industry, "");
+  assert.equal(run(layout.document).jobs[0].companyAliases, undefined);
+});
+
+test("关闭状态只来自当前岗位可见头部，忽略职责、推荐与隐藏头部", () => {
+  const layout = screenshotLayout();
+  assert.equal(run(layout.document).jobs[0].status, "active");
+  layout.fields[".job-sec-text"].innerText += " 职位已关闭";
+  assert.equal(run(layout.document).jobs[0].status, "active");
+  layout.fields[".job-banner"] = [layout.banner, node("职位已关闭\n智能体开发工程师", true)];
+  assert.equal(run(layout.document).jobs[0].status, "active");
+  layout.banner.innerText = layout.banner.innerText.replace("招聘中", "职位已关闭");
+  assert.equal(run(layout.document).jobs[0].status, "closed");
+  layout.banner.innerText = layout.banner.innerText.replace("职位已关闭", "该职位已下线");
+  assert.equal(run(layout.document).jobs[0].status, "closed");
+});
+
 test("公司名称仅去除明确标签前缀，保留普通名称主体", () => {
   const fields: Record<string, any> = {
     ".job-banner .name h1": node("AI 开发"),

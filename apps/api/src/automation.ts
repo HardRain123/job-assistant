@@ -148,6 +148,7 @@ function diagnosticMessage(diagnostic: z.infer<typeof diagnosticSchema>) {
 const pageEvidenceSchema = z.object({
   title: z.string().max(160),
   company: z.string().max(160),
+  registeredCompany: z.string().max(160).optional(),
   descriptionPresent: z.boolean(),
   clientLabelSeen: z.boolean(),
   clientNames: z.array(z.string().max(160)).max(3),

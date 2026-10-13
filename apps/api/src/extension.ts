@@ -30,6 +30,7 @@ const itemSchema = z
     industry: z.string().trim().max(200).nullable().optional(),
     experienceText: z.string().trim().max(200).nullable().optional(),
     education: z.string().trim().max(200).nullable().optional(),
+    status: z.enum(["active", "unknown", "closed"]).optional(),
     detail: z.boolean().default(false),
   })
   .strict();
@@ -230,7 +231,13 @@ export function createExtensionAccess(store: Store, now = Date.now) {
             !item.detail &&
             store.get(`browserExtension.detail:${existing.id}`, true)
           ) {
-            store.upsertJob({ ...existing, lastSeen: timestamp });
+            store.upsertJob({
+              ...existing,
+              lastSeen: timestamp,
+              // A list refresh may close a saved detail, but only a fresh
+              // detail can establish that a previously closed job reopened.
+              status: item.status === "closed" ? "closed" : existing.status,
+            });
             ids.add(existing.id);
             continue;
           }
@@ -267,7 +274,7 @@ export function createExtensionAccess(store: Store, now = Date.now) {
             firstSeen: timestamp,
             lastSeen: timestamp,
             contentHash: "pending",
-            status: "active",
+            status: item.status ?? existing?.status ?? "active",
           };
           store.upsertJob(j);
           store.set(`browserExtension.detail:${j.id}`, item.detail);

@@ -3,7 +3,7 @@ import { inspectSplitSearch, clickAndReadSplitDetail } from "./split-page.mjs";
 import { runExtensionApplication } from "./application.mjs";
 
 const API_BASE = "http://127.0.0.1:3000";
-const VERSION = "0.4.0";
+const VERSION = "0.4.1";
 const STATE_KEY = "jobAssistantAutomationTabs";
 const DIAGNOSTIC_KEY = "jobAssistantAutomationDiagnostic";
 const ALARM = "job-assistant-automation-poll";
@@ -210,6 +210,7 @@ function strictImportPayload(jobs) {
       description: String(job.description || "").trim(),
       detail: Boolean(job.detail),
     };
+    if (job.status !== undefined) item.status = ["active", "unknown", "closed"].includes(job.status) ? job.status : "unknown";
     for (const key of ["location", "salaryText", "industry", "experienceText", "education"]) {
       if (job[key]) item[key] = String(job[key]).trim();
     }
@@ -428,6 +429,13 @@ export async function execute(command, tokenValue) {
       if (inlineFallback) {
         const base = inlineFallback.job;
         const detail = jobs[0];
+        // Both records are bound to the exact commanded job URL. Never lose
+        // a closing notice when supplementing a cached search-panel record.
+        const status = ["closed", "unknown", "active"].find((value) => base.status === value || detail.status === value);
+        if (status) {
+          base.status = status;
+          detail.status = status;
+        }
         const normalized = (name) => String(name || "").replace(/\s+/g, "").replace(/(?:股份有限公司|有限责任公司|有限公司)$/, "");
         if (base.title !== detail.title) {
           fieldReading.merge = "title-mismatch";

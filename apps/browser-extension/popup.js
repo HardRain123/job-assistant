@@ -132,6 +132,7 @@ function importPayload(jobs) {
       industry,
       experienceText,
       education,
+      status,
       detail,
     }) => {
       const item = {
@@ -141,6 +142,7 @@ function importPayload(jobs) {
         description,
         detail: Boolean(detail),
       };
+      if (status !== undefined) item.status = ["active", "unknown", "closed"].includes(status) ? status : "unknown";
       if (Array.isArray(companyAliases)) item.companyAliases = companyAliases;
       for (const [key, value] of Object.entries({
         location,

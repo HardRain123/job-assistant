@@ -53,7 +53,7 @@ export function extractJobs(options) {
       for (let depth = 0; parent && depth < 3; depth++, parent = parent.parentElement) {
         if (!visible(parent) || String(parent.innerText || "").length > 1200) break;
         const lines = linesOf(parent);
-        if (lines[0] !== heading || lines.some((line) => /^(职位描述|推荐职位|相似职位|热门职位|公司介绍|工商信息)$/.test(line))) break;
+        if (lines[0] !== heading || lines.some((line) => line !== heading && /^(职位描述|推荐职位|相似职位|热门职位|公司介绍|工商信息|公司基本信息|工作地址)$/.test(line))) break;
         if (lines.length > 1) sections.push({ lines, root: parent });
       }
     }
@@ -141,6 +141,7 @@ export function extractJobs(options) {
     const headers = [...new Set(headerCandidates)].filter((banner) =>
       visible(banner) && title && renderedText(banner, 4000).includes(title)
       && !/职位描述|推荐职位|相似职位/.test(renderedText(banner, 4000)));
+    const status = headers.some((banner) => linesOf(banner).some((line) => /^(职位已关闭|该职位已关闭|职位已下线|该职位已下线)$/.test(line))) ? "closed" : "active";
     const salaryPattern = /^(?:\d+(?:\.\d+)?\s*[-–—~至]\s*\d+(?:\.\d+)?\s*[kK千万元](?:元)?(?:\s*[/／]\s*[月天日年])?(?:\s*[·•・]\s*\d+\s*薪)?|面议)$/;
     const headerSalaryCandidates = headers.flatMap((banner) => [
       ...linesOf(banner),
@@ -166,7 +167,23 @@ export function extractJobs(options) {
         return url.origin === location.origin && !url.username && !url.password && /^\/gongsi\/[a-zA-Z0-9_-]+\.html$/.test(url.pathname) ? name : "";
       } catch { return ""; }
     }));
-    const displayCompany = unique(companySections.map(linkedCompanyName));
+    const sectionIndustry = ({ lines }) => {
+      const size = lines.findIndex((line) => /^(?:\d+\s*[-–至]\s*\d+人|\d+人以上|少于\d+人)$/.test(line));
+      const value = lines[size + 1];
+      return size >= 2 && value && /^[\p{Script=Han}A-Za-z/、·&（）()\s-]{2,40}$/u.test(value)
+        && !/公司|职位|招聘|查看|融资|轮|未融资|不需要融资/.test(value)
+        && /^(查看全部职位|查看所有职位)$/.test(lines[size + 2] || "") ? value : "";
+    };
+    // BOSS also renders brand names as plain text. Bind such a brand only when
+    // this page's visible registration block confirms the exact legal employer,
+    // and its bounded company summary has one unambiguous name and industry.
+    const registeredCompany = unique(sectionLines("工商信息").flatMap(({ lines }) =>
+      lines.flatMap((line, index) => line === "公司名称" ? [lines[index + 1] || ""]
+        : /^公司名称\s*[:：]/.test(line) ? [companyName(line)] : [])));
+    const registeredEmployer = Boolean(company && registeredCompany && clean(registeredCompany, 160) === clean(company, 160));
+    const summaryCompany = unique(companySections.filter((section) => sectionIndustry(section)).map(({ lines }) => lines[1]));
+    const linkedCompany = unique(companySections.map(linkedCompanyName));
+    const displayCompany = linkedCompany || (registeredEmployer ? summaryCompany : "");
     // Bounded public field evidence helps diagnose real layouts without reading
     // page HTML, hidden state, chat history or unrelated page text.
     const evidenceSections = companySections.map(({ lines, root }) => ({
@@ -181,6 +198,7 @@ export function extractJobs(options) {
     }));
     result.pageEvidence = {
       title, company, descriptionPresent: Boolean(description), clientLabelSeen,
+      registeredCompany: clean(registeredCompany, 160),
       clientNames: [...clientNames].slice(0, 3),
       headerLines: [...new Set(headers.flatMap(linesOf))].slice(0, 20).map((line) => clean(line, 160)),
       companySections: [...new Map(evidenceSections.map((section) => [JSON.stringify(section), section])).values()].slice(0, 3),
@@ -191,14 +209,12 @@ export function extractJobs(options) {
       for (const section of companySections) {
         const { lines } = section;
         if (!lines.some((line) => normalizeCompany(line) === normalizeCompany(company))
-          && !(displayCompany && linkedCompanyName(section) === displayCompany)) continue;
+          && !(displayCompany && (linkedCompanyName(section) === displayCompany
+            || (registeredEmployer && summaryCompany === displayCompany && lines[1] === displayCompany)))) continue;
         matchingCompanySection = true;
         // Only the single industry line between company size and the jobs link.
-        const size = lines.findIndex((line) => /^(?:\d+\s*[-–至]\s*\d+人|\d+人以上|少于\d+人)$/.test(line));
-        const industry = lines[size + 1];
-        if (size >= 0 && industry && /^[\p{Script=Han}A-Za-z/、·&（）()\s-]{2,40}$/u.test(industry)
-          && !/公司|职位|招聘|查看|融资|轮|未融资|不需要融资/.test(industry)
-          && /^(查看全部职位|查看所有职位)$/.test(lines[size + 2] || "")) industries.push(industry);
+        const value = sectionIndustry(section);
+        if (value) industries.push(value);
       }
     }
     const explicitIndustry = textFrom(document, [".company-info .industry"], 160);
@@ -235,6 +251,7 @@ export function extractJobs(options) {
         company,
         ...(companyAliases.length ? { companyAliases } : {}),
         description,
+        status,
         detail: true,
         location: locationText,
         salaryText,

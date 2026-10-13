@@ -212,7 +212,7 @@ export function BulkPanel({
   const version = (data?.extension.version ?? "").split(".").map(Number);
   const connected = Boolean(
     data?.extension.paired &&
-      (version[0]! > 0 || version[1]! >= 4) &&
+      (version[0]! > 0 || version[1]! > 4 || (version[1] === 4 && version[2]! >= 1)) &&
       data.extension.lastSeen &&
       Date.now() - Date.parse(data.extension.lastSeen) < 90000,
   );
@@ -236,7 +236,7 @@ export function BulkPanel({
         {!connected && (
           <div className="notice">
           {data && !data.extension.paired ? "配对已失效或尚未连接，请重新生成配对码并连接扩展。" : ""}
-            请保持 BOSS 已登录，并将普通浏览器扩展刷新到 0.4.0。当前上报版本：
+            请保持 BOSS 已登录，并将普通浏览器扩展刷新到 0.4.1。当前上报版本：
             {data?.extension.version ?? "未连接"}。{" "}
             <button className="link" onClick={onConnect}>
               查看连接

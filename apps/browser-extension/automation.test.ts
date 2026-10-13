@@ -171,9 +171,9 @@ test("同页缺字段时核验独立详情，保留完整雇主记录，拒绝�
   const originalTimeout = globalThis.setTimeout;
   const url = "https://www.zhipin.com/job_detail/a.html";
   const searchUrl = "https://www.zhipin.com/web/geek/jobs?query=AI&city=101020100";
-  const base = { url, title: "AI工程师", company: "示例公司", description: "企业 AI 应用开发", detail: true, location: "上海", salaryText: "", industry: "" };
+  const base = { url, title: "AI工程师", company: "示例公司", description: "企业 AI 应用开发", detail: true, location: "上海", salaryText: "", industry: "", status: "active" };
   const detail = { ...base, company: "示例公司有限公司", salaryText: "25-35K", industry: "计算机软件" };
-  const evidence = { title: base.title, company: base.company, descriptionPresent: true, clientLabelSeen: false, clientNames: [], headerLines: ["25-35K"], companySections: [] };
+  const evidence = { title: base.title, company: base.company, registeredCompany: "示例公司有限公司", descriptionPresent: true, clientLabelSeen: false, clientNames: [], headerLines: ["25-35K"], companySections: [] };
   const reports: Array<Record<string, any>> = [];
   try {
     globalThis.setTimeout = ((fn: () => void) => { queueMicrotask(fn); return 1 as unknown as ReturnType<typeof setTimeout>; }) as typeof setTimeout;
@@ -209,6 +209,14 @@ test("同页缺字段时核验独立详情，保留完整雇主记录，拒绝�
     assert.deepEqual(supplemented.fieldReading, { route: "supplement", merge: "merged", salary: "encoded", industry: "section-missing", location: "readable", finalSalary: true, finalLocation: true, finalIndustry: true });
     assert.ok(!JSON.stringify(supplemented).includes("should-not-leak"));
     assert.deepEqual(supplemented.pageEvidence, evidence);
+    assert.equal(supplemented.jobs[0].status, "active");
+    const closed = await run(base, { ...detail, status: "closed" });
+    assert.equal(closed.jobs[0].status, "closed");
+    assert.equal((await run({ ...base, status: "closed" }, detail)).jobs[0].status, "closed");
+    assert.equal((await run(base, { ...detail, status: "unknown" })).jobs[0].status, "unknown");
+    assert.equal((await run(base, { ...detail, status: "unexpected" })).jobs[0].status, "unknown");
+    assert.equal((await run(base, { ...detail, company: "另一公司", status: "closed" })).jobs[0].status, "closed");
+    assert.equal((await run(base, { ...detail, title: "另一职位", status: "closed" })).jobs[0].status, "closed");
     const wrongEvidence = await run(base, detail, {}, "https://www.zhipin.com/job_detail/other.html");
     assert.equal(wrongEvidence.pageEvidence, undefined);
     const conflict = await run({ ...base, salaryText: "20-30K", industry: "保险", location: "" }, detail);
