@@ -162,6 +162,17 @@ export interface Application {
   stopReason?: string;
   pageDiagnostic?:
     | {
+        stage: "message-receipt";
+        beforeCount: number;
+        afterCount: number;
+        messageRowCount: number;
+        matchingCount: number;
+        newMatchingCount: number;
+        acknowledgedCount: number;
+        failedCount: number;
+        editorEmpty: boolean;
+      }
+    | {
         stage: "detail-entry";
         controlCount: number;
         knownControlCount: number;

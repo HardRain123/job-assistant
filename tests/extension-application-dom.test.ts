@@ -197,7 +197,7 @@ function semanticChatFixture() {
 }
 function row(value: string, sent = true) {
   return element(value, {
-    ".text, .message-text, .text-content": [element(value)],
+    ".text, .message-text, .text-content, .bubble-content": [element(value)],
     ".status, .message-status, .read-status": sent ? [element("已发送")] : [],
   });
 }
@@ -303,18 +303,43 @@ test("chat salary accepts the actual 23-29K·13薪 format but rejects different 
     conversationOrigin: job.url,
     job: { ...job, salaryMin: 23000, salaryMax: 29000, salaryMonths: 13 },
   };
-  for (const salary of ["23-29K·13薪", "23 - 29k · 13 薪", "23–29K•13薪", "23-29K"]) {
+  for (const salary of [
+    "23-29K·13薪",
+    "23 - 29k · 13 薪",
+    "23–29K•13薪",
+    "23-29K",
+  ]) {
     f.salary.innerText = salary;
-    assert.equal((await runPage(f.document, request)).page, "conversation", salary);
+    assert.equal(
+      (await runPage(f.document, request)).page,
+      "conversation",
+      salary,
+    );
   }
-  for (const salary of ["23-29K·14薪", "23-29K·13.5薪", "22-29K·13薪", "23-30K·13薪", "23-29K/月·13薪", "23-29K·13薪 其他岗位", "2\uE123-29K·13薪"]) {
+  for (const salary of [
+    "23-29K·14薪",
+    "23-29K·13.5薪",
+    "22-29K·13薪",
+    "23-30K·13薪",
+    "23-29K/月·13薪",
+    "23-29K·13薪 其他岗位",
+    "2\uE123-29K·13薪",
+  ]) {
     f.salary.innerText = salary;
     const result = await runPage(f.document, request);
     assert.equal(result.ok, false, salary);
     assert.equal(result.diagnostic.probes.at(-1).result, "salary");
   }
   f.salary.innerText = "23-29K·13.5薪";
-  assert.equal((await runPage(f.document, { ...request, job: { ...request.job, salaryMonths: 13.5 } })).page, "conversation");
+  assert.equal(
+    (
+      await runPage(f.document, {
+        ...request,
+        job: { ...request.job, salaryMonths: 13.5 },
+      })
+    ).page,
+    "conversation",
+  );
 });
 
 test("semantic header rejects sidebar geometry, history controls and duplicate job bars", async () => {
@@ -469,7 +494,13 @@ test("native contact must match the frozen URL and existing-contact state before
   assert.equal(clicks, 1);
 });
 test("a new greeting that stays on the detail opens its changed Continue control exactly once", async () => {
-  for (const change of ["continue", "unchanged", "job-changed", "closed", "revoked"]) {
+  for (const change of [
+    "continue",
+    "unchanged",
+    "job-changed",
+    "closed",
+    "revoked",
+  ]) {
     let clicks = 0;
     let permissions = 0;
     let live = { ...job, detail: true, status: "active", salaryText: "20-30K" };
@@ -477,21 +508,39 @@ test("a new greeting that stays on the detail opens its changed Continue control
     control.click = () => {
       clicks++;
       if (change !== "unchanged") control.innerText = "继续沟通";
-      if (change === "job-changed") live = { ...live, description: "另一岗位职责" };
+      if (change === "job-changed")
+        live = { ...live, description: "另一岗位职责" };
       if (change === "closed") live = { ...live, status: "closed" };
     };
-    const banner = element(job.title, { "a, button, .btn-startchat, .op-btn-chat, [role='button']": [control] });
-    const document = element("", { ".job-banner": [banner] });
-    const result = await runPage(document, { mode: "contact", expectedExisting: false }, "/job_detail/example.html", {
-      __jobAssistantReader00000000000000000000000000000000: () => ({ jobs: [live] }),
-      chrome: { runtime: { sendMessage: async () => ({ allowed: !(change === "revoked" && ++permissions > 1), expiresAt: Date.now() + 1500 }) } },
+    const banner = element(job.title, {
+      "a, button, .btn-startchat, .op-btn-chat, [role='button']": [control],
     });
+    const document = element("", { ".job-banner": [banner] });
+    const result = await runPage(
+      document,
+      { mode: "contact", expectedExisting: false },
+      "/job_detail/example.html",
+      {
+        __jobAssistantReader00000000000000000000000000000000: () => ({
+          jobs: [live],
+        }),
+        chrome: {
+          runtime: {
+            sendMessage: async () => ({
+              allowed: !(change === "revoked" && ++permissions > 1),
+              expiresAt: Date.now() + 1500,
+            }),
+          },
+        },
+      },
+    );
     assert.equal(clicks, change === "continue" ? 2 : 1, change);
     if (change === "continue") {
       assert.equal(result.ok, true);
       assert.equal(result.contactConfirmed, false); // Continue is not a delivery receipt.
     }
-    if (["job-changed", "closed", "revoked"].includes(change)) assert.equal(result.ok, false);
+    if (["job-changed", "closed", "revoked"].includes(change))
+      assert.equal(result.ok, false);
   }
 });
 
@@ -555,6 +604,103 @@ test("contact rechecks the full live job after authorization, before any click",
   );
   assert.equal(result.ok, false);
   assert.equal(clicks, 0);
+});
+test("receipt accepts nested text and sibling delivery labels while unrelated history is removed", async () => {
+  const f = chatFixture();
+  const child = element("第一行 第二行");
+  const body = element("第一行\n第二行", { span: [child] });
+  const status = element("送达");
+  const own = element("第一行\n第二行 送达", {
+    ".text, .message-text, .text-content, .bubble-content": [body, child],
+    "span, div, em, i, b, small": [child, status],
+  });
+  f.rows.push(row("更早的历史消息"));
+  f.button.click = () => {
+    f.rows.splice(0, f.rows.length, own);
+    f.editor.innerText = "";
+  };
+  assert.equal(
+    (await runPage(f.document, { mode: "message", text: "第一行\n第二行" }))
+      .evidence,
+    "new-message",
+  );
+});
+
+test("message-content rows require an explicit unambiguous self class, never right-hand geometry", async () => {
+  for (const sender of [
+    "item-myself",
+    "item-friend",
+    "item-myself item-friend",
+    "",
+  ]) {
+    const f = chatFixture();
+    const contents: any[] = [];
+    const oldQuery = f.root.querySelectorAll;
+    f.root.querySelectorAll = (selector: string) =>
+      selector === ".message-item, .message-content"
+        ? contents
+        : oldQuery(selector);
+    const own = row("您好");
+    own.parentElement = element();
+    own.parentElement.getAttribute = (name: string) =>
+      name === "class" ? sender : null;
+    own.getBoundingClientRect = () => ({ left: 800, right: 1000 });
+    f.button.click = () => {
+      contents.push(own);
+      f.editor.innerText = "";
+    };
+    const result = await runPage(f.document, { mode: "message", text: "您好" });
+    assert.equal(result.ok, sender === "item-myself", sender);
+  }
+});
+
+test("receipt ignores old/remounted messages, duplicate new copies, incoming text and statuses inside the body", async () => {
+  for (const kind of [
+    "old",
+    "remounted",
+    "duplicate",
+    "incoming",
+    "inside-body",
+    "hidden",
+    "failed",
+    "draft-remains",
+  ]) {
+    const f = chatFixture();
+    const previous = row("您好");
+    if (["old", "remounted"].includes(kind)) f.rows.push(previous);
+    let clicks = 0;
+    f.button.click = () => {
+      clicks++;
+      f.editor.innerText = kind === "draft-remains" ? "您好" : "";
+      if (kind === "old" || kind === "incoming") return;
+      if (kind === "remounted") {
+        f.rows.splice(0, 1, row("您好"));
+        return;
+      }
+      if (kind === "duplicate") {
+        f.rows.push(row("您好"), row("您好"));
+        return;
+      }
+      const label = element("送达", {}, kind === "hidden");
+      const body = element(
+        "您好",
+        kind === "inside-body" ? { span: [label] } : {},
+      );
+      f.rows.push(
+        element("您好 送达", {
+          ".text, .message-text, .text-content, .bubble-content": [body],
+          "span, div, em, i, b, small": [label],
+          ".message-fail, .send-fail, .retry":
+            kind === "failed" ? [element("发送失败")] : [],
+        }),
+      );
+    };
+    const result = await runPage(f.document, { mode: "message", text: "您好" });
+    assert.equal(result.reason, "send-unconfirmed", kind);
+    assert.equal(clicks, 1);
+    assert.equal(result.diagnostic.stage, "message-receipt");
+    assert.ok(!JSON.stringify(result.diagnostic).includes("您好"));
+  }
 });
 test("an unacknowledged or different new message is never confirmation", async () => {
   for (const outgoing of [row("您好", false), row("其他话术")]) {
@@ -966,13 +1112,27 @@ test("one new contact navigation can be confirmed by exact conversation readback
   }
 });
 test("an explicitly reconciled bulk contact resumes only pending messages without replaying the greeting", async () => {
-  const f = runnerFixture({ bulk: true, resolvedContact: true, journal: true, messageSuccess: true });
+  const f = runnerFixture({
+    bulk: true,
+    resolvedContact: true,
+    journal: true,
+    messageSuccess: true,
+  });
   await f.run();
   assert.equal(f.calls.filter((c) => c.mode === "contact").length, 1);
-  assert.equal(f.calls.find((c) => c.mode === "contact")?.expectedExisting, true);
+  assert.equal(
+    f.calls.find((c) => c.mode === "contact")?.expectedExisting,
+    true,
+  );
   assert.equal(f.calls.filter((c) => c.mode === "message").length, 2);
-  assert.equal(f.calls.some((c) => c.body?.actionId === "greeting"), false);
-  assert.equal(f.calls.find((c) => c.path?.endsWith("/result"))?.body.reason, undefined);
+  assert.equal(
+    f.calls.some((c) => c.body?.actionId === "greeting"),
+    false,
+  );
+  assert.equal(
+    f.calls.find((c) => c.path?.endsWith("/result"))?.body.reason,
+    undefined,
+  );
 });
 
 test("bulk applications skip previously contacted recruiters without navigation or messages", async () => {
@@ -1008,7 +1168,9 @@ test("the exact delivered label confirms a new matching outgoing message but fai
     f.button.click = () => {
       f.rows.push(
         element("您好", {
-          ".text, .message-text, .text-content": [element("您好")],
+          ".text, .message-text, .text-content, .bubble-content": [
+            element("您好"),
+          ],
           ".status, .message-status, .read-status": [element("送达")],
           ".message-fail, .send-fail, .retry": failed ? [element("重试")] : [],
         }),

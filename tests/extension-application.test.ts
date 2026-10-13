@@ -244,6 +244,7 @@ async function fixture(
   gates: Assessment["gates"] = [
     { field: "location", status: "pass", reason: "ok" },
   ],
+  extensionVersion = "0.3.4",
 ) {
   const dir = mkdtempSync(join(tmpdir(), "extension-apply-"));
   const attachmentsDir = join(dir, "attachments");
@@ -347,7 +348,7 @@ async function fixture(
   const extHeaders = {
     origin,
     authorization: `Bearer ${token}`,
-    "x-extension-version": "0.3.4",
+    "x-extension-version": extensionVersion,
   };
   await app.inject({
     method: "POST",
@@ -458,7 +459,10 @@ async function stageExistingContact(f: Awaited<ReturnType<typeof fixture>>) {
   return { identity, native, run, inspectionRunId };
 }
 
-async function stageUncertainMessage(f: Awaited<ReturnType<typeof fixture>>) {
+async function stageUncertainMessage(
+  f: Awaited<ReturnType<typeof fixture>>,
+  receiptDiagnostic?: Record<string, unknown>,
+) {
   const template = f.store.get<any>("template", null);
   f.store.set("template", {
     ...template,
@@ -493,7 +497,7 @@ async function stageUncertainMessage(f: Awaited<ReturnType<typeof fixture>>) {
     });
     assert.equal(response.statusCode, 200, response.body);
   }
-  const diagnostic = {
+  const diagnostic = receiptDiagnostic ?? {
     stage: "conversation",
     editorCount: 1,
     activeJobCardCount: 1,
@@ -524,6 +528,166 @@ async function stageUncertainMessage(f: Awaited<ReturnType<typeof fixture>>) {
   };
   return { identity, action, run, request, diagnostic };
 }
+
+test("bounded receipt diagnostics persist without confirming or disclosing messages", async () => {
+  const f = await fixture("eligible");
+  try {
+    const diagnostic = {
+      stage: "message-receipt",
+      beforeCount: 2,
+      afterCount: 3,
+      messageRowCount: 5,
+      matchingCount: 1,
+      newMatchingCount: 1,
+      acknowledgedCount: 0,
+      failedCount: 0,
+      editorEmpty: true,
+    };
+    const staged = await stageUncertainMessage(f, diagnostic);
+    const saved = f.store.application(staged.identity.applicationId)!;
+    assert.deepEqual(saved.pageDiagnostic, diagnostic);
+    assert.equal(saved.actions[1]!.state, "unknown");
+    assert.equal(saved.actions[2]!.state, "pending");
+    for (const invalid of [
+      { ...diagnostic, text: "private chat" },
+      { ...diagnostic, afterCount: 1001 },
+      { ...diagnostic, newMatchingCount: -1 },
+      { ...diagnostic, editorEmpty: "true" },
+    ]) {
+      const response = await f.extension("/extension/v1/application/result", {
+        ...staged.identity,
+        reason: "send-unconfirmed",
+        diagnostic: invalid,
+      });
+      assert.equal(response.statusCode, 400);
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+test("a paused bulk message can be reconciled without unpausing or resending it", async () => {
+  const f = await fixture("eligible", undefined, "0.4.4");
+  try {
+    const staged = await stageUncertainMessage(f);
+    const application = f.store.application(staged.identity.applicationId)!;
+    const runId = randomUUID();
+    application.bulkRunId = runId;
+    f.store.updateApplication(application);
+    f.store.set("bulk.current", {
+      id: runId,
+      state: "paused",
+      target: 2,
+      dailyLimit: 150,
+      intervalSeconds: 30,
+      configurationKey: f.store.get(
+        `extensionApplication.configuration:${application.id}`,
+        null,
+      ),
+      message: "等待核对",
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      counts: {
+        queued: 0,
+        running: 0,
+        completed: 0,
+        review: 1,
+        skipped: 0,
+        cancelled: 0,
+      },
+    });
+    const response = await f.workbench(
+      "/api/extension-application/confirm-message-and-resume",
+      staged.request,
+    );
+    assert.equal(response.statusCode, 200, response.body);
+    assert.equal(f.store.get<any>("bulk.current", null).state, "paused");
+    const saved = f.store.application(application.id)!;
+    assert.equal(saved.status, "queued");
+    assert.equal(saved.actions[1]!.state, "unknown");
+    assert.equal(saved.actions[1]!.resolution, "user-confirmed-sent");
+    assert.equal(
+      (await f.extension("/extension/v1/application/claim")).json().task,
+      null,
+    );
+    const resume = await f.workbench("/api/bulk-application/control", {
+      action: "resume",
+    });
+    assert.equal(resume.statusCode, 200, resume.body);
+    const task = (await f.extension("/extension/v1/application/claim")).json()
+      .task;
+    assert.ok(task);
+    assert.ok(
+      !task.application.actions.some(
+        (item: any) => item.id === staged.action.id,
+      ),
+    );
+    const identity = {
+      taskId: task.id,
+      leaseToken: task.leaseToken,
+      applicationId: application.id,
+    };
+    assert.equal(
+      (
+        await f.extension("/extension/v1/application/authorize", {
+          ...identity,
+          actionId: staged.action.id,
+        })
+      ).statusCode,
+      400,
+    );
+    assert.equal(
+      (
+        await f.extension("/extension/v1/application/action", {
+          ...identity,
+          actionId: saved.actions[2]!.id,
+          state: "started",
+          evidence: "before-action",
+        })
+      ).json().execute,
+      true,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("bulk reconciliation rejects ended, missing or replaced runs and global browser pauses", async () => {
+  for (const state of [
+    "completed",
+    "cancelled",
+    "missing",
+    "replaced",
+    "global-paused",
+  ]) {
+    const f = await fixture("eligible", undefined, "0.4.4");
+    try {
+      const staged = await stageUncertainMessage(f);
+      const application = f.store.application(staged.identity.applicationId)!;
+      application.bulkRunId = randomUUID();
+      f.store.updateApplication(application);
+      if (state !== "missing")
+        f.store.set("bulk.current", {
+          id: state === "replaced" ? randomUUID() : application.bulkRunId,
+          state: ["completed", "cancelled"].includes(state) ? state : "paused",
+        });
+      if (state === "global-paused") f.store.set("paused", true);
+      const before = f.store.tasks().length;
+      const response = await f.workbench(
+        "/api/extension-application/confirm-message-and-resume",
+        staged.request,
+      );
+      assert.equal(response.statusCode, 400, state + response.body);
+      assert.equal(f.store.tasks().length, before);
+      assert.equal(
+        f.store.application(application.id)!.actions[1]!.resolution,
+        undefined,
+      );
+    } finally {
+      await f.close();
+    }
+  }
+});
 
 test("authenticated manual message confirmation preserves uncertainty, audits it and resumes only pending work", async () => {
   const f = await fixture("eligible");

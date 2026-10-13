@@ -364,7 +364,13 @@ function App() {
         onConnect={() => setTab("浏览器")}
       />
     ) : tab === "批量投递" ? (
-      <BulkPanel onCollect={() => setTab("自动找岗位")} onJobs={() => setTab("岗位库")} onConnect={() => setTab("浏览器")} onRecords={() => setTab("投递记录")} onChanged={refresh} />
+      <BulkPanel
+        onCollect={() => setTab("自动找岗位")}
+        onJobs={() => setTab("岗位库")}
+        onConnect={() => setTab("浏览器")}
+        onRecords={() => setTab("投递记录")}
+        onChanged={refresh}
+      />
     ) : tab === "岗位库" ? (
       <Jobs s={state} mutate={mutate} onBulk={() => setTab("批量投递")} />
     ) : tab === "简历资料" ? (
@@ -1922,8 +1928,11 @@ function ConfirmSentMessage({
             {action.text}
           </blockquote>
           <p>
-            确认后记录为“人工核对已发送”，保留原始未知回执，并从下一步继续。该消息不会重发。
+            确认后记录为“人工核对已发送”，保留原始未知回执，只将未发送的后续步骤排队。该消息不会重发。
           </p>
+          {application.bulkRunId && (
+            <p>若批次已暂停，核对后请到“批量投递”页继续批次。</p>
+          )}
           {error && <p role="alert">{error}</p>}
           <button disabled={busy || paused} onClick={() => void resume()}>
             {busy ? "正在核对岗位并接续…" : "已在 BOSS 核对，继续后续步骤"}
@@ -2022,6 +2031,32 @@ function Records({
                 </p>
                 {a.stopReason && (
                   <p>{stopReasons[a.stopReason] ?? "投递需人工核对。"}</p>
+                )}
+                {a.pageDiagnostic?.stage === "message-receipt" && (
+                  <div>
+                    <p>
+                      {a.pageDiagnostic.newMatchingCount === 0
+                        ? "尚未识别到新增的完整本人消息，发送结果待核对。"
+                        : a.pageDiagnostic.failedCount > 0
+                          ? "消息旁出现失败或发送中提示，发送结果待核对。"
+                          : a.pageDiagnostic.acknowledgedCount === 0
+                            ? "已找到新增消息，但尚未识别到送达回执。"
+                            : "已看到消息与回执，但消息顺序或输入框状态仍需核对。"}
+                    </p>
+                    <details>
+                      <summary>查看回执诊断</summary>
+                      <p>
+                        本人气泡 {a.pageDiagnostic.beforeCount} →{" "}
+                        {a.pageDiagnostic.afterCount}， 消息节点{" "}
+                        {a.pageDiagnostic.messageRowCount}， 正文匹配{" "}
+                        {a.pageDiagnostic.matchingCount}， 新增匹配{" "}
+                        {a.pageDiagnostic.newMatchingCount}， 成功回执{" "}
+                        {a.pageDiagnostic.acknowledgedCount}， 失败或等待提示{" "}
+                        {a.pageDiagnostic.failedCount}， 输入框
+                        {a.pageDiagnostic.editorEmpty ? "已清空" : "仍有内容"}。
+                      </p>
+                    </details>
+                  </div>
                 )}
                 {a.pageDiagnostic?.stage === "conversation" && (
                   <div>

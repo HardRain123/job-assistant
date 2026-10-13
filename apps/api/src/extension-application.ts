@@ -7,6 +7,7 @@ import { CONVERSATION_PROBE_RESULTS } from "../../../packages/contracts/src/inde
 import type {
   Application,
   Assessment,
+  BulkRun,
   Job,
   MatchPolicy,
   Resume,
@@ -628,7 +629,20 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
         later.some((item) => item.state !== "pending" || item.resolution)
       )
         throw new Error("前序动作未核对，或后续动作已执行，无法安全接续");
-      requireBeginReady(application);
+      // Reconciliation only queues untouched work. A paused batch must be
+      // resolvable before it can resume; actual claims/actions still require a
+      // running batch. Never resurrect a cancelled, completed or replaced run.
+      requireConfig(application);
+      requireFrozenJob(application);
+      if (application.bulkRunId) {
+        const run = store.get<BulkRun | null>("bulk.current", null);
+        if (
+          !run ||
+          run.id !== application.bulkRunId ||
+          !["running", "paused"].includes(run.state)
+        )
+          throw new Error("原批量任务已结束或被替换，无法接续");
+      }
       requireExistingContactAudit(application);
       for (const item of earlier.filter(manuallyConfirmedMessage))
         requireMessageConfirmationAudit(application, item);
@@ -872,6 +886,19 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
       .extend({
         diagnostic: z
           .discriminatedUnion("stage", [
+            z
+              .object({
+                stage: z.literal("message-receipt"),
+                beforeCount: z.number().int().min(0).max(1000),
+                afterCount: z.number().int().min(0).max(1000),
+                messageRowCount: z.number().int().min(0).max(1000),
+                matchingCount: z.number().int().min(0).max(1000),
+                newMatchingCount: z.number().int().min(0).max(1000),
+                acknowledgedCount: z.number().int().min(0).max(1000),
+                failedCount: z.number().int().min(0).max(1000),
+                editorEmpty: z.boolean(),
+              })
+              .strict(),
             z
               .object({
                 stage: z.literal("detail-entry"),

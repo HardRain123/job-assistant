@@ -324,16 +324,11 @@ export async function applicationPageStep(request) {
       const salaryMatches = (salary) =>
         Number(salary[1]) * 1000 === job.salaryMin &&
         Number(salary[2]) * 1000 === job.salaryMax &&
-        (!salary[3] || job.salaryMonths == null || Number(salary[3]) === job.salaryMonths);
-      count(
-        "salaryMatchCount",
-        salaries.filter(salaryMatches).length,
-      );
-      if (
-        salaries.length !== 1 ||
-        !salaryMatches(salaries[0])
-      )
-        continue;
+        (!salary[3] ||
+          job.salaryMonths == null ||
+          Number(salary[3]) === job.salaryMonths);
+      count("salaryMatchCount", salaries.filter(salaryMatches).length);
+      if (salaries.length !== 1 || !salaryMatches(salaries[0])) continue;
       const links = [
         ...new Set([
           ...nodes(card, "a[href*='/job_detail/']"),
@@ -509,15 +504,86 @@ export async function applicationPageStep(request) {
     ...stop("recipient-mismatch"),
     diagnostic: conversationDiagnostic(),
   });
-  const outgoing = (root) => nodes(root, ".message-item.item-myself");
+  const outgoing = (root) => {
+    const known = nodes(root, ".message-item.item-myself");
+    const rows = nodes(root, ".message-item, .message-content").filter(
+      (node) => {
+        const classes = [node, node.parentElement].flatMap((part) =>
+          String(part?.getAttribute("class") || "").split(/\s+/),
+        );
+        // Require explicit sender classes; position alone cannot identify authors.
+        return (
+          classes.some((name) =>
+            [
+              "item-myself",
+              "myself",
+              "self",
+              "mine",
+              "from-me",
+              "message-right",
+              "item-right",
+            ].includes(name),
+          ) &&
+          !classes.some((name) =>
+            [
+              "item-friend",
+              "friend",
+              "other",
+              "receive",
+              "from-them",
+              "message-left",
+              "item-left",
+            ].includes(name),
+          )
+        );
+      },
+    );
+    const unique = [...new Set([...known, ...rows])];
+    return unique.filter(
+      (node) => !unique.some((other) => other !== node && other.contains(node)),
+    );
+  };
   const sent = (item) =>
     !nodes(item, ".message-fail, .send-fail, .retry").length &&
     nodes(item, ".status, .message-status, .read-status").some((node) =>
       /^(已读|未读|已发送|已送达|送达)$/.test(text(node)),
     );
-  const messageText = (item) => {
-    const bodies = nodes(item, ".text, .message-text, .text-content");
-    return bodies.length === 1 ? text(bodies[0]) : "";
+  const messageBody = (item) => {
+    const bodies = nodes(
+      item,
+      ".text, .message-text, .text-content, .bubble-content",
+    );
+    // Nested wrappers represent one body, not several independent messages.
+    const outer = bodies.filter(
+      (node) => !bodies.some((other) => other !== node && other.contains(node)),
+    );
+    return outer.length === 1 ? outer[0] : null;
+  };
+  const messageReceipt = (item) => {
+    const body = messageBody(item);
+    const outsideBody = (node) =>
+      body && node !== body && !body.contains(node) && !node.contains(body);
+    const labels = [
+      ...new Set([
+        ...nodes(item, ".status, .message-status, .read-status"),
+        ...nodes(item, "span, div, em, i, b, small").filter(
+          (node) => node.children.length === 0,
+        ),
+      ]),
+    ]
+      .filter(outsideBody)
+      .map(text);
+    const failed =
+      Boolean(nodes(item, ".message-fail, .send-fail, .retry").length) ||
+      labels.some((value) => /^(发送失败|发送中|未发送|重试)$/.test(value));
+    const acknowledged =
+      !failed &&
+      labels.some((value) =>
+        /^(已读|未读|已发送|已送达|送达|\[(?:已读|已送达|送达)\]|【(?:已读|已送达|送达)】)$/.test(
+          value,
+        ),
+      );
+    return { body: body ? text(body) : "", acknowledged, failed };
   };
   if (request.mode === "inspect") {
     const control = contactControl();
@@ -626,7 +692,11 @@ export async function applicationPageStep(request) {
         if (!(await authorize())) return stop("cancelled");
         const nextBlock = blocked();
         if (nextBlock) return stop(nextBlock);
-        if (contactControl() !== next || text(next) !== "继续沟通" || !fullJobMatches())
+        if (
+          contactControl() !== next ||
+          text(next) !== "继续沟通" ||
+          !fullJobMatches()
+        )
           return stop("recipient-mismatch");
         next.click();
         return { ok: true, clicked: true, existingContact, contactConfirmed };
@@ -646,7 +716,11 @@ export async function applicationPageStep(request) {
     if (text(current.editor)) return stop("page-unrecognized"); // never overwrite a user's draft
     const buttons = nodes(current.root, "button.btn-send, a.btn-send");
     if (buttons.length !== 1) return stop("page-unrecognized");
-    const before = outgoing(current.root).length;
+    const before = new Set(outgoing(current.root));
+    const expected = clean(request.text);
+    const previousMatches = [...before].filter(
+      (item) => messageReceipt(item).body === expected,
+    ).length;
     current.editor.focus();
     // Normal editable input only; no trusted-event hooks or security bypasses.
     current.editor.textContent = request.text;
@@ -667,6 +741,7 @@ export async function applicationPageStep(request) {
     )
       return stop("send-unconfirmed");
     buttons[0].click();
+    let diagnostic;
     for (let attempt = 0; attempt < 20; attempt++) {
       await sleep(400);
       const block = blocked();
@@ -674,14 +749,39 @@ export async function applicationPageStep(request) {
       if (conversation()?.editor !== current.editor)
         return stop("recipient-mismatch");
       const after = outgoing(current.root);
+      const matching = after.filter(
+        (item) => messageReceipt(item).body === expected,
+      );
+      const added = matching.filter((item) => !before.has(item));
+      const acknowledged = added.filter(
+        (item) => messageReceipt(item).acknowledged,
+      );
+      const bounded = (count) => Math.min(1000, count);
+      diagnostic = {
+        stage: "message-receipt",
+        beforeCount: bounded(before.size),
+        afterCount: bounded(after.length),
+        messageRowCount: bounded(
+          nodes(current.root, ".message-item, .message-content").length,
+        ),
+        matchingCount: bounded(matching.length),
+        newMatchingCount: bounded(added.length),
+        acknowledgedCount: bounded(acknowledged.length),
+        failedCount: bounded(
+          added.filter((item) => messageReceipt(item).failed).length,
+        ),
+        editorEmpty: !text(current.editor),
+      };
       if (
-        after.length === before + 1 &&
-        messageText(after[before]) === clean(request.text) &&
-        sent(after[before])
+        matching.length === previousMatches + 1 &&
+        added.length === 1 &&
+        acknowledged.length === 1 &&
+        after.at(-1) === added[0] &&
+        diagnostic.editorEmpty
       )
         return { ok: true, evidence: "new-message" };
     }
-    return stop("send-unconfirmed");
+    return { ...stop("send-unconfirmed"), diagnostic };
   }
   if (request.mode === "attachment") {
     const file = request.attachment;
