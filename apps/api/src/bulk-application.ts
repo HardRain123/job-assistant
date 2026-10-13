@@ -462,7 +462,16 @@ export function createBulkApplication(o: Options) {
         store.transaction(() => {
           for (const application of store
             .applications()
-            .filter((a) => a.bulkRunId === run.id && a.status === "queued")) {
+            .filter(
+              (a) =>
+                a.bulkRunId === run.id &&
+                (a.status === "queued" ||
+                  (["needs-review", "failed"].includes(a.status) &&
+                    store.reusableCancelledApplication({
+                      ...a,
+                      status: "cancelled",
+                    }))),
+            )) {
             application.status = "cancelled";
             store.updateApplication(application);
             store.db

@@ -546,6 +546,41 @@ test("Shanghai quota rollover and persisted historical single applications share
   }
 });
 
+test("cancelling a pre-action failed draft releases it for a new configuration without releasing attempted sends", async () => {
+  for (const began of [false, true]) {
+    const f = await fixture();
+    try {
+      f.addJob("配置变更示例公司");
+      await f.start();
+      const task = await f.claim();
+      if (began) await f.action(task, 0, "started", "before-action");
+      const result = await f.extension("/extension/v1/application/result", {
+        taskId: task.id,
+        leaseToken: task.leaseToken,
+        applicationId: task.application.id,
+        reason: "send-unconfirmed",
+      });
+      assert.equal(result.statusCode, 200, result.body);
+      const cancelled = await f.workbench("/api/bulk-application/control", {
+        action: "cancel",
+      });
+      assert.equal(cancelled.statusCode, 200, cancelled.body);
+      assert.equal(
+        f.store.application(task.application.id)?.status,
+        began ? "needs-review" : "cancelled",
+      );
+      assert.equal((await f.preview()).summary.selected, began ? 0 : 1);
+      assert.equal(
+        f.store.tasks().find((old) => old.id === task.id)?.status,
+        "needs-review",
+      );
+      assert.equal(f.store.dailyQuota().occupied, began ? 1 : 0);
+    } finally {
+      await f.close();
+    }
+  }
+});
+
 test("cancelled untouched jobs can enter a fresh preview while their frozen drafts and tasks remain audited", async () => {
   const f = await fixture();
   try {
@@ -580,7 +615,9 @@ test("a low-score excluded job remains excluded even when public fields also nee
     assert.equal(preview.summary.excluded, 1);
     assert.equal(preview.summary.review, 0);
     assert.equal(preview.applications.length, 0);
-  } finally { await f.close(); }
+  } finally {
+    await f.close();
+  }
 });
 
 test("reopening SQLite retains quota and queue, and expired in-flight work pauses the batch without replay", async () => {

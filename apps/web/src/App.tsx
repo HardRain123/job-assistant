@@ -2152,11 +2152,18 @@ function Records({
                   </div>
                 )}
                 {a.status === "needs-review" &&
-                  ["page-unrecognized", "recipient-mismatch"].includes(
-                    a.stopReason ?? "",
-                  ) &&
+                  [
+                    "page-unrecognized",
+                    "recipient-mismatch",
+                    "send-unconfirmed",
+                  ].includes(a.stopReason ?? "") &&
                   a.actions.length > 0 &&
-                  a.actions.every((action) => action.state === "pending") && (
+                  a.actions.every(
+                    (action) =>
+                      action.state === "pending" &&
+                      !action.evidence &&
+                      !action.resolution,
+                  ) && (
                     <button
                       className="quiet"
                       disabled={s.paused}

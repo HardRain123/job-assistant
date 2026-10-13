@@ -457,14 +457,37 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
         !application ||
         application.executor !== "extension" ||
         application.status !== "needs-review" ||
-        !["page-unrecognized", "recipient-mismatch"].includes(
-          application.stopReason ?? "",
-        ) ||
+        ![
+          "page-unrecognized",
+          "recipient-mismatch",
+          "send-unconfirmed",
+        ].includes(application.stopReason ?? "") ||
         !application.actions.length ||
-        application.actions.some((action) => action.state !== "pending")
+        application.actions.some(
+          (action) =>
+            action.state !== "pending" || action.evidence || action.resolution,
+        )
       )
-        throw new Error("只有所有动作尚未执行的页面识别失败任务可以重试");
-      requireBeginReady(application);
+        throw new Error("只有所有动作尚未执行的失败任务可以重试");
+      requireConfig(application);
+      requireFrozenJob(application);
+      if (application.bulkRunId) {
+        const run = store.get<(BulkRun & { configurationKey: string }) | null>(
+          "bulk.current",
+          null,
+        );
+        const assessment = o.assessment(application.job);
+        if (
+          !run ||
+          run.id !== application.bulkRunId ||
+          !["running", "paused"].includes(run.state) ||
+          run.configurationKey !== o.configurationKey() ||
+          assessment?.decision !== "eligible" ||
+          !assessment.gates.length ||
+          assessment.gates.some((gate) => gate.status !== "pass")
+        )
+          throw new Error("原批次或岗位资格已变化，无法重试");
+      }
       store.audit("extensionApplication.unsentRetry", {
         applicationId: application.id,
         reason: application.stopReason,

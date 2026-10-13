@@ -231,8 +231,53 @@ export async function createApp(o: AppOptions) {
       }
     }
   });
-  app.setErrorHandler((e, _req, reply) => {
+  app.setErrorHandler((e, req, reply) => {
     const err = e as Error & { statusCode?: number };
+    // Record only fixed server errors for the application protocol. Never store
+    // request bodies, credentials, provider failures or arbitrary error text.
+    const operation = req.routeOptions.url?.match(
+      /^\/extension\/v1\/application\/(action|authorize|heartbeat|attachment|result)$/,
+    )?.[1];
+    if (operation) {
+      const known = new Set([
+        "投递任务不匹配",
+        "投递记录不在运行中",
+        "动作尚未获准",
+        "动作不属于当前投递",
+        "动作开始前证据不匹配",
+        "动作不属于当前任务",
+        "任务租约无效，需要人工核对",
+        "动作与冻结批次不一致",
+        "不允许重复或倒退动作状态",
+        "前序话术尚未确认发送",
+        "任务已暂停或被接管",
+        "队列已暂停或浏览器状态不确定",
+        "简历、话术或策略已变化，请人工核对",
+        "简历附件已变化，请人工核对",
+        "岗位内容已变化，请人工核对",
+        "批量任务已暂停或结束",
+        "daily-limit",
+      ]);
+      const body = req.body as {
+        applicationId?: unknown;
+        taskId?: unknown;
+      } | null;
+      const id = (value: unknown) =>
+        typeof value === "string" && /^[a-f0-9-]{36}$/i.test(value)
+          ? value
+          : undefined;
+      o.store.audit("extensionApplication.requestRejected", {
+        operation,
+        applicationId: id(body?.applicationId),
+        taskId: id(body?.taskId),
+        code:
+          e instanceof z.ZodError
+            ? "invalid-request"
+            : known.has(err.message)
+              ? err.message
+              : "unclassified-error",
+      });
+    }
     const status =
       e instanceof z.ZodError
         ? 400

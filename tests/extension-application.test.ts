@@ -18,6 +18,99 @@ import {
 import { fingerprint } from "../packages/templates/src/index.ts";
 
 const origin = `chrome-extension://${"a".repeat(32)}`;
+test("a wholly unattempted generic failure can requeue inside its paused bulk, but never replay a begun action", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const f = await fixture("eligible", undefined, "0.4.5");
+  try {
+    const preview = (
+      await f.workbench("/api/bulk-application/preview", {
+        dailyLimit: 150,
+        target: 1,
+        intervalSeconds: 30,
+      })
+    ).json();
+    const started = await f.workbench("/api/bulk-application/start", {
+      previewId: preview.previewId,
+    });
+    assert.equal(started.statusCode, 200, started.body);
+    const task = (await f.extension("/extension/v1/application/claim")).json()
+      .task;
+    const identity = {
+      taskId: task.id,
+      leaseToken: task.leaseToken,
+      applicationId: task.application.id,
+    };
+    const result = await f.extension("/extension/v1/application/result", {
+      ...identity,
+      reason: "send-unconfirmed",
+    });
+    assert.equal(result.statusCode, 200, result.body);
+    const beforeTasks = f.store.tasks().length;
+    const retry = await f.workbench("/api/extension-application/retry", {
+      applicationId: identity.applicationId,
+    });
+    assert.equal(retry.statusCode, 200, retry.body);
+    assert.equal(f.store.tasks().length, beforeTasks + 1);
+    assert.equal(
+      f.store.tasks().find((t) => t.id === task.id)?.status,
+      "needs-review",
+    );
+    assert.equal(f.store.get<any>("bulk.current", null).state, "paused");
+    assert.equal(
+      (await f.extension("/extension/v1/application/claim")).json().task,
+      null,
+    );
+    const resumed = await f.workbench("/api/bulk-application/control", {
+      action: "resume",
+    });
+    assert.equal(resumed.statusCode, 200, resumed.body);
+    t.mock.timers.tick(31_000); // Respect the configured interval before another claim.
+    const next = (await f.extension("/extension/v1/application/claim")).json()
+      .task;
+    assert.ok(next);
+    const nextIdentity = {
+      taskId: next.id,
+      leaseToken: next.leaseToken,
+      applicationId: identity.applicationId,
+    };
+    const begun = await f.extension("/extension/v1/application/action", {
+      ...nextIdentity,
+      actionId: next.application.actions[0].id,
+      state: "started",
+      evidence: "before-action",
+    });
+    assert.equal(begun.statusCode, 200, begun.body);
+    await f.extension("/extension/v1/application/result", {
+      ...nextIdentity,
+      reason: "send-unconfirmed",
+    });
+    assert.equal(
+      (
+        await f.workbench("/api/extension-application/retry", {
+          applicationId: identity.applicationId,
+        })
+      ).statusCode,
+      400,
+    );
+    const rejected = await f.extension("/extension/v1/application/authorize", {
+      ...nextIdentity,
+      actionId: next.application.actions[0].id,
+    });
+    assert.equal(rejected.statusCode, 400);
+    const audit = f.store.db
+      .prepare(
+        "SELECT body FROM audit WHERE event='extensionApplication.requestRejected' ORDER BY id DESC LIMIT 1",
+      )
+      .get()!;
+    const body = JSON.parse(String(audit.body));
+    assert.equal(body.applicationId, identity.applicationId);
+    assert.equal(body.operation, "authorize");
+    assert.equal(body.code, "任务租约无效，需要人工核对");
+    assert.equal(String(audit.body).includes(next.leaseToken), false);
+  } finally {
+    await f.close();
+  }
+});
 test("only an entirely unsent layout failure can retry, retaining the original task receipt", async () => {
   const f = await fixture("eligible");
   try {
