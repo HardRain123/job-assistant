@@ -108,18 +108,22 @@ export async function applicationPageStep(request) {
     .map(normCompany)
     .filter(Boolean);
   const locationMatches = (value) => {
-    const expected = clean(job.location), actual = clean(value);
+    const expected = clean(job.location),
+      actual = clean(value);
     if (!expected || !actual) return false;
     if (actual === expected) return true;
     // A chat job bar can omit district/area segments from a structured address.
     // Only accept whole leading segments, never substring or cross-city matches.
     const split = (address) => address.split(/[·•・]/).map(clean);
-    const parts = split(expected), shown = split(actual);
+    const parts = split(expected),
+      shown = split(actual);
     return (
-      parts.length >= 2 && parts.length <= 3 &&
+      parts.length >= 2 &&
+      parts.length <= 3 &&
       parts.every((part) => /^[\p{Script=Han}]{2,20}$/u.test(part)) &&
       /[区县市]$/.test(parts[1]) &&
-      shown.length >= 1 && shown.length <= parts.length &&
+      shown.length >= 1 &&
+      shown.length <= parts.length &&
       shown.every((part, index) => part === parts[index])
     );
   };
@@ -555,6 +559,44 @@ export async function applicationPageStep(request) {
     ...stop("recipient-mismatch"),
     diagnostic: conversationDiagnostic(),
   });
+  // A rendered recipient header is not evidence that the chat client is ready.
+  // Only inspect visible UI state; do not access its sockets or internal stores.
+  const chatReadiness = (current, allowDraft = false) => {
+    if (globalThis.navigator?.onLine === false) return "offline";
+    if (document.visibilityState === "hidden") return "background";
+    if (document.readyState && document.readyState !== "complete")
+      return "loading";
+    if (
+      !enabled(current.editor) ||
+      current.editor.getAttribute("aria-readonly") === "true"
+    )
+      return "editor-unavailable";
+    if (!allowDraft && text(current.editor)) return "draft";
+    if (current.editor.closest("[aria-busy='true']")) return "loading";
+    const notices = nodes(
+      document,
+      ".dialog-wrap, .dialog-box, .toast, .toast-text, .chat-tip, .chat-notice, .chat-warning, .connect-tip, [role='alert'], [role='status']",
+    ).filter(outsideChatHistory);
+    for (const notice of notices) {
+      const value = text(notice);
+      if (!value || value.length > 500) continue;
+      if (
+        /网络.{0,15}(?:异常|断开|不可用)|连接.{0,15}(?:断开|失败)|已断线|已离线/.test(
+          value,
+        )
+      )
+        return "offline";
+      if (/正在连接|连接中|正在重连|重新连接中|加载中|正在加载/.test(value))
+        return "connecting";
+      if (
+        /无法发送|不能发送|暂不支持发送|对方回复后.{0,15}(?:发送|沟通)|(?:发送|沟通).{0,15}(?:受限|限制)|(?:账号|帐号).{0,15}(?:其他|其它|别处).{0,10}登录/.test(
+          value,
+        )
+      )
+        return "restricted";
+    }
+    return "ready";
+  };
   const outgoing = (root) => {
     const known = nodes(root, ".message-item.item-myself");
     const rows = nodes(root, ".message-item, .message-content").filter(
@@ -628,11 +670,25 @@ export async function applicationPageStep(request) {
     ].filter(
       (node) => node !== body && (explicit.has(node) || outsideBody(node)),
     );
-    const labels = labelNodes.map(text);
+    const labels = labelNodes.flatMap((node) => [
+      text(node),
+      ...(outsideBody(node)
+        ? [
+            clean(node.getAttribute("title")),
+            clean(node.getAttribute("aria-label")),
+          ]
+        : []),
+    ]);
     const failed =
       Boolean(nodes(item, ".message-fail, .send-fail, .retry").length) ||
-      labels.some((value) => /^(发送失败|发送中|未发送|重试)$/.test(value));
-    const successLabels = labels.filter((value) =>
+      labels.some((value) =>
+        /^(?:消息)?(?:发送失败|发送中|未发送|重试|重新发送)(?:[，,：:]?请(?:点击)?重试)?$/.test(
+          value,
+        ),
+      );
+    // Positive delivery still requires visible text, never an attribute alone.
+    const visibleLabels = labelNodes.map(text);
+    const successLabels = visibleLabels.filter((value) =>
       /^(已读|未读|已发送|已送达|送达|\[(?:已读|已送达|送达)\]|【(?:已读|已送达|送达)】)$/.test(
         value,
       ),
@@ -791,6 +847,38 @@ export async function applicationPageStep(request) {
   }
   const current = conversation();
   if (!current) return unknownConversation();
+  if (request.mode === "ready") {
+    let stable = 0;
+    let code = "loading";
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const block = blocked();
+      if (block) return stop(block);
+      const live = conversation();
+      if (
+        !live ||
+        live.editor !== current.editor ||
+        live.binding !== current.binding
+      )
+        return unknownConversation();
+      code = chatReadiness(live);
+      if (
+        ["offline", "restricted", "draft", "editor-unavailable"].includes(code)
+      )
+        break;
+      stable = code === "ready" ? stable + 1 : 0;
+      // Five seconds of the same ready, foreground conversation before typing.
+      if (stable >= 11) return { ok: true };
+      await sleep(500);
+    }
+    return {
+      ...stop("page-unrecognized"),
+      diagnostic: {
+        stage: "chat-ready",
+        code: code === "ready" ? "unstable" : code,
+        stableChecks: stable,
+      },
+    };
+  }
   if (request.mode === "message") {
     if (
       typeof request.text !== "string" ||
@@ -799,6 +887,12 @@ export async function applicationPageStep(request) {
     )
       return stop("page-unrecognized");
     if (text(current.editor)) return stop("page-unrecognized"); // never overwrite a user's draft
+    const readiness = chatReadiness(current);
+    if (readiness !== "ready")
+      return {
+        ...stop("page-unrecognized"),
+        diagnostic: { stage: "chat-ready", code: readiness, stableChecks: 0 },
+      };
     const buttons = nodes(current.root, "button.btn-send, a.btn-send");
     if (buttons.length !== 1) return stop("page-unrecognized");
     const before = new Set(outgoing(current.root));
@@ -821,13 +915,15 @@ export async function applicationPageStep(request) {
     if (
       blocked() ||
       conversation()?.editor !== current.editor ||
+      // Our exact draft is now present; all other readiness checks still apply.
+      chatReadiness(current, true) !== "ready" ||
       text(current.editor) !== clean(request.text) ||
       !enabled(buttons[0])
     )
       return stop("send-unconfirmed");
     buttons[0].click();
     let diagnostic;
-    for (let attempt = 0; attempt < 20; attempt++) {
+    for (let attempt = 0; attempt < 75; attempt++) {
       await sleep(400);
       const block = blocked();
       if (block) return stop(block);

@@ -659,6 +659,36 @@ test("bounded receipt diagnostics persist without confirming or disclosing messa
   }
 });
 
+test("chat readiness diagnostics accept only fixed codes and bounded counts", async () => {
+  const f = await fixture("eligible");
+  try {
+    const diagnostic = {
+      stage: "chat-ready",
+      code: "connecting",
+      stableChecks: 0,
+    };
+    const staged = await stageUncertainMessage(f, diagnostic);
+    assert.deepEqual(
+      f.store.application(staged.identity.applicationId)!.pageDiagnostic,
+      diagnostic,
+    );
+    for (const invalid of [
+      { ...diagnostic, code: "private page text" },
+      { ...diagnostic, stableChecks: 21 },
+      { ...diagnostic, html: "private DOM" },
+    ]) {
+      const response = await f.extension("/extension/v1/application/result", {
+        ...staged.identity,
+        reason: "send-unconfirmed",
+        diagnostic: invalid,
+      });
+      assert.equal(response.statusCode, 400);
+    }
+  } finally {
+    await f.close();
+  }
+});
+
 test("a paused bulk message can be reconciled without unpausing or resending it", async () => {
   const f = await fixture("eligible", undefined, "0.4.4");
   try {

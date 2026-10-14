@@ -299,28 +299,62 @@ test("button job bar requires verified navigation and all visible identity field
 test("chat city may omit whole district and area segments from the verified job location", async () => {
   const f = semanticChatFixture();
   const request = {
-    mode: "inspect", conversationOrigin: job.url,
+    mode: "inspect",
+    conversationOrigin: job.url,
     job: { ...job, location: "上海·青浦区·金泽" },
   };
-  for (const city of ["上海", "上海·青浦区", "上海·青浦区·金泽", "上海 • 青浦区"] ) {
+  for (const city of [
+    "上海",
+    "上海·青浦区",
+    "上海·青浦区·金泽",
+    "上海 • 青浦区",
+  ]) {
     f.city.innerText = city;
-    assert.equal((await runPage(f.document, request)).page, "conversation", city);
+    assert.equal(
+      (await runPage(f.document, request)).page,
+      "conversation",
+      city,
+    );
   }
-  for (const city of ["北京", "上海·闵行区", "上海·青浦区·朱家角", "上", "青浦区", "上海/北京", "上海·", "上海周边"]) {
+  for (const city of [
+    "北京",
+    "上海·闵行区",
+    "上海·青浦区·朱家角",
+    "上",
+    "青浦区",
+    "上海/北京",
+    "上海·",
+    "上海周边",
+  ]) {
     f.city.innerText = city;
     assert.equal((await runPage(f.document, request)).ok, false, city);
   }
   f.city.innerText = "上海";
-  assert.equal((await runPage(f.document, { ...request, conversationOrigin: undefined })).ok, false);
-  for (const location of ["上海/北京", "上海 北京", "上海·", "上海·北京", "上海·青浦区·金泽·其他"]) {
-    assert.equal((await runPage(f.document, { ...request, job: { ...job, location } })).ok, false, location);
+  assert.equal(
+    (await runPage(f.document, { ...request, conversationOrigin: undefined }))
+      .ok,
+    false,
+  );
+  for (const location of [
+    "上海/北京",
+    "上海 北京",
+    "上海·",
+    "上海·北京",
+    "上海·青浦区·金泽·其他",
+  ]) {
+    assert.equal(
+      (await runPage(f.document, { ...request, job: { ...job, location } })).ok,
+      false,
+      location,
+    );
   }
 });
 
 test("abbreviated chat city still requires a unique visible field and rejects a changed city before sending", async () => {
   const f = semanticChatFixture();
   const request = {
-    mode: "inspect", conversationOrigin: job.url,
+    mode: "inspect",
+    conversationOrigin: job.url,
     job: { ...job, location: "上海·青浦区·金泽" },
   };
   const binding = (await runPage(f.document, request)).conversationBinding;
@@ -328,21 +362,36 @@ test("abbreviated chat city still requires a unique visible field and rejects a 
   f.city.getClientRects = () => [];
   assert.equal((await runPage(f.document, request)).ok, false);
   f.city.getClientRects = () => [{}];
-  const fields = f.card.querySelectorAll("a, button, span, div, p, strong, em, h1, h2, h3, b, label");
+  const fields = f.card.querySelectorAll(
+    "a, button, span, div, p, strong, em, h1, h2, h3, b, label",
+  );
   fields.push(element("上海·青浦区"));
   assert.equal((await runPage(f.document, request)).ok, false);
   fields.pop();
-  let clicks = 0, authorizations = 0;
+  let clicks = 0,
+    authorizations = 0;
   f.button.click = () => clicks++;
-  const result = await runPage(f.document, {
-    ...request, mode: "message", text: "测试话术", conversationBinding: binding,
-  }, "/web/geek/chat", {
-    chrome: { runtime: { sendMessage: async () => {
-      authorizations++;
-      f.city.innerText = "上海·闵行区";
-      return { allowed: true, expiresAt: Date.now() + 1500 };
-    } } },
-  });
+  const result = await runPage(
+    f.document,
+    {
+      ...request,
+      mode: "message",
+      text: "测试话术",
+      conversationBinding: binding,
+    },
+    "/web/geek/chat",
+    {
+      chrome: {
+        runtime: {
+          sendMessage: async () => {
+            authorizations++;
+            f.city.innerText = "上海·闵行区";
+            return { allowed: true, expiresAt: Date.now() + 1500 };
+          },
+        },
+      },
+    },
+  );
   assert.equal(result.ok, false);
   assert.equal(authorizations, 1);
   assert.equal(clicks, 0);
@@ -1011,6 +1060,7 @@ function runnerFixture(
     wrongConversation?: boolean;
     bulk?: boolean;
     messageSuccess?: boolean;
+    chatNotReady?: boolean;
   } = {},
 ) {
   const calls: any[] = [];
@@ -1155,6 +1205,22 @@ function runnerFixture(
             },
           ];
         }
+        if (args[0].mode === "ready")
+          return [
+            {
+              result: options.chatNotReady
+                ? {
+                    ok: false,
+                    reason: "page-unrecognized",
+                    diagnostic: {
+                      stage: "chat-ready",
+                      code: "connecting",
+                      stableChecks: 0,
+                    },
+                  }
+                : { ok: true },
+            },
+          ];
         if (args[0].mode === "message" && options.messageSuccess)
           return [{ result: { ok: true, evidence: "new-message" } }];
         return [{ result: { ok: false, reason: "send-unconfirmed" } }];
@@ -1169,7 +1235,7 @@ function runnerFixture(
     URL,
     crypto: webcrypto,
     setTimeout: (callback: () => void, ms: number) => {
-      if (ms === 15000) {
+      if (ms === 15000 || ms === 40000) {
         scriptTimers.push(callback);
         return scriptTimers.length;
       }
@@ -1548,6 +1614,180 @@ test("semantic diagnostics pinpoint the failed gate without returning visible te
   assert.equal(result.diagnostic.probes[0].viewTextCount, 20);
   assert.equal(result.diagnostic.probes[0].viewControlCount, 20);
 });
+test("chat readiness waits for one stable foreground conversation without typing or sending", async () => {
+  const f = chatFixture();
+  let waited = 0,
+    clicks = 0;
+  f.document.readyState = "complete";
+  f.document.visibilityState = "visible";
+  f.button.click = () => clicks++;
+  const result = await runPage(f.document, { mode: "ready" }, undefined, {
+    navigator: { onLine: true },
+    setTimeout: (callback: () => void, ms: number) => {
+      waited += ms;
+      callback();
+      return 1;
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(waited, 5000);
+  assert.equal(clicks, 0);
+  assert.equal(f.editor.innerText, "");
+});
+
+test("readiness refuses offline, loading, background, disabled editors and user drafts", async () => {
+  for (const code of [
+    "offline",
+    "loading",
+    "background",
+    "editor-unavailable",
+    "draft",
+  ]) {
+    const f = chatFixture();
+    if (code === "loading") f.document.readyState = "loading";
+    if (code === "background") f.document.visibilityState = "hidden";
+    if (code === "editor-unavailable") f.editor.disabled = true;
+    if (code === "draft") f.editor.innerText = "用户草稿";
+    const result = await runPage(f.document, { mode: "ready" }, undefined, {
+      navigator: { onLine: code !== "offline" },
+    });
+    assert.equal(result.ok, false, code);
+    assert.equal(result.diagnostic.code, code);
+    assert.equal(f.editor.innerText, code === "draft" ? "用户草稿" : "");
+  }
+});
+
+test("readiness uses visible platform notices, excludes messages, and rechecks recipient while waiting", async () => {
+  for (const [label, code] of [
+    ["正在连接", "connecting"],
+    ["网络异常", "offline"],
+    ["对方回复后才能发送", "restricted"],
+  ]) {
+    const f = chatFixture();
+    const notice = element(label);
+    const original = f.document.querySelectorAll;
+    f.document.querySelectorAll = (selector: string) =>
+      selector.includes(".chat-notice") ? [notice] : original(selector);
+    const result = await runPage(f.document, { mode: "ready" });
+    assert.equal(result.diagnostic.code, code);
+    notice.closest = () => element("message-item");
+    assert.equal((await runPage(f.document, { mode: "ready" })).ok, true);
+  }
+  const f = chatFixture();
+  const result = await runPage(f.document, { mode: "ready" }, undefined, {
+    setTimeout: (callback: () => void) => {
+      f.header.innerText = "其他公司";
+      callback();
+      return 1;
+    },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "recipient-mismatch");
+});
+
+test("a connection failure after authorization cannot click send even with our draft present", async () => {
+  const f = chatFixture();
+  let clicks = 0;
+  const network = { onLine: true };
+  f.button.click = () => clicks++;
+  const result = await runPage(
+    f.document,
+    { mode: "message", text: "您好" },
+    undefined,
+    {
+      navigator: network,
+      chrome: {
+        runtime: {
+          sendMessage: async () => {
+            network.onLine = false;
+            return { allowed: true, expiresAt: Date.now() + 1500 };
+          },
+        },
+      },
+    },
+  );
+  assert.equal(result.ok, false);
+  assert.equal(clicks, 0);
+});
+
+test("delivery may arrive after eight seconds; a disappearing optimistic bubble is never success", async () => {
+  for (const delivered of [true, false]) {
+    const f = chatFixture();
+    let ticks = 0,
+      clicks = 0;
+    f.button.click = () => {
+      clicks++;
+      f.rows.push(row("您好", false));
+      f.editor.innerText = "";
+    };
+    const result = await runPage(
+      f.document,
+      { mode: "message", text: "您好" },
+      undefined,
+      {
+        setTimeout: (callback: () => void, ms: number) => {
+          if (ms === 400 && ++ticks === 25)
+            f.rows.splice(0, 1, ...(delivered ? [row("您好")] : []));
+          callback();
+          return 1;
+        },
+      },
+    );
+    assert.equal(result.ok, delivered);
+    assert.equal(clicks, 1);
+    assert.equal(ticks, delivered ? 25 : 75);
+  }
+});
+
+test("accessible failure labels veto delivery; accessible success labels alone cannot confirm it", async () => {
+  for (const label of ["发送失败，请重试", "重新发送", "送达"]) {
+    const f = chatFixture();
+    const icon = element();
+    icon.getAttribute = (name: string) => (name === "title" ? label : null);
+    const own = row("您好", label !== "送达");
+    const original = own.querySelectorAll;
+    own.querySelectorAll = (selector: string) =>
+      selector === "span, div, em, i, b, small" ? [icon] : original(selector);
+    f.button.click = () => {
+      f.rows.push(own);
+      f.editor.innerText = "";
+    };
+    const result = await runPage(f.document, { mode: "message", text: "您好" });
+    assert.equal(result.ok, false, label);
+    assert.equal(result.diagnostic.failedCount, label === "送达" ? 0 : 1);
+  }
+});
+
+test("runner checks chat readiness before starting each message and leaves unready actions pending", async () => {
+  const stopped = runnerFixture({
+    bulk: true,
+    resolvedContact: true,
+    chatNotReady: true,
+  });
+  await stopped.run();
+  assert.equal(
+    stopped.calls.some(
+      (call) => call.mode === "message" || call.body?.state === "started",
+    ),
+    false,
+  );
+  assert.equal(
+    stopped.calls.find((call) => call.path?.endsWith("/result")).body.diagnostic
+      .code,
+    "connecting",
+  );
+  const ready = runnerFixture({
+    bulk: true,
+    resolvedContact: true,
+    messageSuccess: true,
+  });
+  await ready.run();
+  const steps = ready.calls
+    .filter((call) => ["ready", "message"].includes(call.mode))
+    .map((call) => call.mode);
+  assert.deepEqual(steps, ["ready", "message", "ready", "message"]);
+});
+
 test("runner refuses duplicate begin permission and stops after an uncertain message before attachment", async () => {
   const denied = runnerFixture({ execute: false });
   await denied.run();

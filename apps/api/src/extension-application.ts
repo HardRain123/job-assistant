@@ -1022,6 +1022,22 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
           .discriminatedUnion("stage", [
             z
               .object({
+                stage: z.literal("chat-ready"),
+                code: z.enum([
+                  "offline",
+                  "background",
+                  "loading",
+                  "editor-unavailable",
+                  "draft",
+                  "connecting",
+                  "restricted",
+                  "unstable",
+                ]),
+                stableChecks: z.number().int().min(0).max(20),
+              })
+              .strict(),
+            z
+              .object({
                 stage: z.literal("message-receipt"),
                 beforeCount: z.number().int().min(0).max(1000),
                 afterCount: z.number().int().min(0).max(1000),

@@ -239,6 +239,7 @@ export async function runExtensionApplication(api, token) {
             },
           ],
         }),
+        request.mode === "message" ? 40_000 : 15_000,
       );
       if (result?.result?.diagnostic) pageDiagnostic = result.result.diagnostic;
       return result?.result || { ok: false, reason: "page-unrecognized" };
@@ -385,6 +386,10 @@ export async function runExtensionApplication(api, token) {
         const view = await page({ mode: "inspect" });
         if (!view.ok || view.page !== "conversation")
           throw new Error(view.reason || "recipient-mismatch");
+        if (action.kind === "message") {
+          const ready = await page({ mode: "ready" });
+          if (!ready.ok) throw new Error(ready.reason || "page-unrecognized");
+        }
       }
       const permission = await progress(action, "started", "before-action");
       if (permission.execute !== true) throw new Error("send-unconfirmed");

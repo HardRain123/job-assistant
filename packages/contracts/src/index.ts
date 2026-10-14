@@ -162,6 +162,19 @@ export interface Application {
   stopReason?: string;
   pageDiagnostic?:
     | {
+        stage: "chat-ready";
+        code:
+          | "offline"
+          | "background"
+          | "loading"
+          | "editor-unavailable"
+          | "draft"
+          | "connecting"
+          | "restricted"
+          | "unstable";
+        stableChecks: number;
+      }
+    | {
         stage: "message-receipt";
         beforeCount: number;
         afterCount: number;

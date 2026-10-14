@@ -2096,6 +2096,24 @@ function Records({
                 {a.stopReason && (
                   <p>{stopReasons[a.stopReason] ?? "投递需人工核对。"}</p>
                 )}
+                {a.pageDiagnostic?.stage === "chat-ready" && (
+                  <p>
+                    聊天页面检查：
+                    {
+                      {
+                        offline: "浏览器离线或页面提示连接异常。",
+                        background: "聊天页未保持在前台。",
+                        loading: "聊天页面仍在加载。",
+                        "editor-unavailable": "输入框暂时不可用。",
+                        draft: "输入框有草稿，已保留原内容。",
+                        connecting: "页面提示正在连接或加载。",
+                        restricted: "页面提示发送受限或账号连接变化。",
+                        unstable: "聊天页面尚未稳定。",
+                      }[a.pageDiagnostic.code]
+                    }
+                    请结合下方各步记录核对，程序不会自动重发。
+                  </p>
+                )}
                 {a.pageDiagnostic?.stage === "message-receipt" && (
                   <div>
                     <p>
@@ -2104,7 +2122,7 @@ function Records({
                         : a.pageDiagnostic.failedCount > 0
                           ? "消息旁出现失败或发送中提示，发送结果待核对。"
                           : a.pageDiagnostic.acknowledgedCount === 0
-                            ? "已找到新增消息，但尚未识别到送达回执。"
+                            ? "页面曾显示消息气泡，但未确认送达；刷新后可能消失，不计为投递成功。"
                             : "已看到消息与回执，但消息顺序或输入框状态仍需核对。"}
                     </p>
                     <details>
