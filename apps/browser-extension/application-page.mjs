@@ -355,10 +355,45 @@ export async function applicationPageStep(request) {
       const employer = header.filter((node) =>
         companies.includes(normCompany(text(node))),
       );
-      // The screenshot-backed fallback requires an explicit recruiter name,
-      // not an online/activity/role label. Other naming layouts stay unsupported.
-      const recruiters = header.filter((node) =>
-        /^[\p{Script=Han}·]{1,8}(先生|女士)$/u.test(text(node)),
+      // A plain name needs the full Name / exact Employer / recruiting Role row.
+      // Do not accept arbitrary header text or online/activity labels as names.
+      const roles = header.filter((node) =>
+        /^(HR|HRBP|招聘者|人事|招聘专员|招聘经理|招聘负责人)$/i.test(
+          text(node),
+        ),
+      );
+      const plainNameInRecruiterRow = (node) => {
+        const value = text(node);
+        if (
+          employer.length !== 1 ||
+          roles.length !== 1 ||
+          node === employer[0] ||
+          node === roles[0] ||
+          !/^[\p{Script=Han}]{2,4}$/u.test(value) ||
+          /在线|离线|活跃|沟通|招聘|职位|详情|更多|客服|人事|反馈|举报|收藏|返回|投递|未读|已读|送达|状态/.test(
+            value,
+          )
+        )
+          return false;
+        const nameBox = node.getBoundingClientRect();
+        const companyBox = employer[0].getBoundingClientRect();
+        const roleBox = roles[0].getBoundingClientRect();
+        const sameRow = (box) =>
+          Math.abs(
+            (box.top + box.bottom) / 2 -
+              (companyBox.top + companyBox.bottom) / 2,
+          ) <= 12;
+        return (
+          nameBox.right <= companyBox.left + 4 &&
+          roleBox.left >= companyBox.right - 4 &&
+          sameRow(nameBox) &&
+          sameRow(roleBox)
+        );
+      };
+      const recruiters = header.filter(
+        (node) =>
+          /^[\p{Script=Han}·]{1,8}(先生|女士)$/u.test(text(node)) ||
+          plainNameInRecruiterRow(node),
       );
       count("employerMatchCount", employer.length);
       count("recruiterCount", recruiters.length);

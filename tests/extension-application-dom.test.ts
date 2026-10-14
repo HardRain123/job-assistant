@@ -435,6 +435,100 @@ test("semantic header rejects conflicting links outside the job card and changed
   );
 });
 
+test("plain recruiter names require an aligned exact employer and explicit recruiting role and stay bound across sends", async () => {
+  for (const label of ["hr", "HRBP", "招聘者", "人事"]) {
+    const f = semanticChatFixture();
+    f.recruiter.innerText = "周颖";
+    const role = element(label);
+    role.parentElement = f.root;
+    role.getBoundingClientRect = () => ({
+      left: 630,
+      right: 690,
+      top: 140,
+      bottom: 170,
+    });
+    f.allFields.push(role);
+    const request = { mode: "inspect", conversationOrigin: job.url };
+    const result = await runPage(f.document, request);
+    assert.equal(result.page, "conversation", label);
+    assert.ok(result.conversationBinding);
+    f.recruiter.innerText = "林悦";
+    assert.equal(
+      (
+        await runPage(f.document, {
+          ...request,
+          conversationBinding: result.conversationBinding,
+        })
+      ).ok,
+      false,
+    );
+  }
+});
+
+test("plain names reject missing or ambiguous roles, status text, wrong positions, hidden nodes and multiple names", async () => {
+  for (const scenario of [
+    "no-role",
+    "role-only",
+    "status",
+    "wrong-row",
+    "wrong-order",
+    "hidden-role",
+    "duplicate-role",
+    "duplicate-name",
+    "other-company",
+  ]) {
+    const f = semanticChatFixture();
+    f.recruiter.innerText = "周颖";
+    const role = element("HR");
+    role.parentElement = f.root;
+    role.getBoundingClientRect = () => ({
+      left: 630,
+      right: 690,
+      top: 140,
+      bottom: 170,
+    });
+    if (scenario !== "no-role") f.allFields.push(role);
+    if (scenario === "role-only") f.recruiter.innerText = "招聘者";
+    if (scenario === "status") f.recruiter.innerText = "今日活跃";
+    if (scenario === "wrong-row")
+      role.getBoundingClientRect = () => ({
+        left: 630,
+        right: 690,
+        top: 90,
+        bottom: 115,
+      });
+    if (scenario === "wrong-order")
+      role.getBoundingClientRect = () => ({
+        left: 400,
+        right: 430,
+        top: 140,
+        bottom: 170,
+      });
+    if (scenario === "hidden-role") role.getClientRects = () => [];
+    if (scenario === "duplicate-role") {
+      const extra = element("HRBP");
+      extra.getBoundingClientRect = role.getBoundingClientRect;
+      f.allFields.push(extra);
+    }
+    if (scenario === "duplicate-name") {
+      const extra = element("林悦");
+      extra.getBoundingClientRect = f.recruiter.getBoundingClientRect;
+      f.allFields.push(extra);
+    }
+    if (scenario === "other-company") f.employer.innerText = "其他公司";
+    assert.equal(
+      (
+        await runPage(f.document, {
+          mode: "inspect",
+          conversationOrigin: job.url,
+        })
+      ).ok,
+      false,
+      scenario,
+    );
+  }
+});
+
 test("semantic header cannot bind a company and status label without a recruiter name", async () => {
   const f = semanticChatFixture();
   for (const label of ["在线", "活跃", "已沟通", "招聘者", ""]) {
