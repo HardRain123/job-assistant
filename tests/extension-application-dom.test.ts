@@ -296,6 +296,58 @@ test("button job bar requires verified navigation and all visible identity field
   assert.equal((await runPage(f.document, request)).ok, false);
 });
 
+test("chat city may omit whole district and area segments from the verified job location", async () => {
+  const f = semanticChatFixture();
+  const request = {
+    mode: "inspect", conversationOrigin: job.url,
+    job: { ...job, location: "上海·青浦区·金泽" },
+  };
+  for (const city of ["上海", "上海·青浦区", "上海·青浦区·金泽", "上海 • 青浦区"] ) {
+    f.city.innerText = city;
+    assert.equal((await runPage(f.document, request)).page, "conversation", city);
+  }
+  for (const city of ["北京", "上海·闵行区", "上海·青浦区·朱家角", "上", "青浦区", "上海/北京", "上海·", "上海周边"]) {
+    f.city.innerText = city;
+    assert.equal((await runPage(f.document, request)).ok, false, city);
+  }
+  f.city.innerText = "上海";
+  assert.equal((await runPage(f.document, { ...request, conversationOrigin: undefined })).ok, false);
+  for (const location of ["上海/北京", "上海 北京", "上海·", "上海·北京", "上海·青浦区·金泽·其他"]) {
+    assert.equal((await runPage(f.document, { ...request, job: { ...job, location } })).ok, false, location);
+  }
+});
+
+test("abbreviated chat city still requires a unique visible field and rejects a changed city before sending", async () => {
+  const f = semanticChatFixture();
+  const request = {
+    mode: "inspect", conversationOrigin: job.url,
+    job: { ...job, location: "上海·青浦区·金泽" },
+  };
+  const binding = (await runPage(f.document, request)).conversationBinding;
+  assert.equal(typeof binding, "string");
+  f.city.getClientRects = () => [];
+  assert.equal((await runPage(f.document, request)).ok, false);
+  f.city.getClientRects = () => [{}];
+  const fields = f.card.querySelectorAll("a, button, span, div, p, strong, em, h1, h2, h3, b, label");
+  fields.push(element("上海·青浦区"));
+  assert.equal((await runPage(f.document, request)).ok, false);
+  fields.pop();
+  let clicks = 0, authorizations = 0;
+  f.button.click = () => clicks++;
+  const result = await runPage(f.document, {
+    ...request, mode: "message", text: "测试话术", conversationBinding: binding,
+  }, "/web/geek/chat", {
+    chrome: { runtime: { sendMessage: async () => {
+      authorizations++;
+      f.city.innerText = "上海·闵行区";
+      return { allowed: true, expiresAt: Date.now() + 1500 };
+    } } },
+  });
+  assert.equal(result.ok, false);
+  assert.equal(authorizations, 1);
+  assert.equal(clicks, 0);
+});
+
 test("chat salary accepts the actual 23-29K·13薪 format but rejects different amounts or stated months", async () => {
   const f = semanticChatFixture();
   const request = {

@@ -107,6 +107,22 @@ export async function applicationPageStep(request) {
   const companies = [job.company, ...(job.companyAliases || [])]
     .map(normCompany)
     .filter(Boolean);
+  const locationMatches = (value) => {
+    const expected = clean(job.location), actual = clean(value);
+    if (!expected || !actual) return false;
+    if (actual === expected) return true;
+    // A chat job bar can omit district/area segments from a structured address.
+    // Only accept whole leading segments, never substring or cross-city matches.
+    const split = (address) => address.split(/[·•・]/).map(clean);
+    const parts = split(expected), shown = split(actual);
+    return (
+      parts.length >= 2 && parts.length <= 3 &&
+      parts.every((part) => /^[\p{Script=Han}]{2,20}$/u.test(part)) &&
+      /[区县市]$/.test(parts[1]) &&
+      shown.length >= 1 && shown.length <= parts.length &&
+      shown.every((part, index) => part === parts[index])
+    );
+  };
   const readJob = request.readerKey ? globalThis[request.readerKey] : null;
   if (request.readerKey) delete globalThis[request.readerKey];
   const fullJobMatches = () => {
@@ -306,11 +322,11 @@ export async function applicationPageStep(request) {
       );
       count(
         "cityMatchCount",
-        fields.filter((node) => text(node) === clean(job.location)).length,
+        fields.filter((node) => locationMatches(text(node))).length,
       );
       if (
         fields.filter((node) => text(node) === clean(job.title)).length !== 1 ||
-        fields.filter((node) => text(node) === clean(job.location)).length !== 1
+        fields.filter((node) => locationMatches(text(node))).length !== 1
       )
         continue;
       progress("salary");
