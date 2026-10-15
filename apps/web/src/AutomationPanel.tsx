@@ -20,6 +20,7 @@ type Run = {
   scored: number;
   failed: number;
   unreadableJobs?: { url: string; reason: string }[];
+  unreadableSearches?: { url: string; reason: string }[];
   fieldReadings?: { url: string; message: string; evidence?: {
     title: string; company: string; descriptionPresent: boolean; clientLabelSeen: boolean;
     clientNames: string[]; headerLines: string[];
@@ -118,7 +119,7 @@ export function AutomationPanel({ mutate, onPolicy, onConnect }: { mutate: Mutat
       setBusy(false);
     }
   };
-  const control = async (action: "pause" | "resume" | "cancel") => {
+  const control = async (action: "pause" | "resume" | "cancel" | "finish-collection") => {
     setBusy(true);
     setError("");
     try {
@@ -160,6 +161,7 @@ export function AutomationPanel({ mutate, onPolicy, onConnect }: { mutate: Mutat
       <p>已发现 {run.discovered} 个，已浏览 {run.visited} 个，已导入 {run.imported} / {run.config.maxJobs} 个；评分已处理 {run.scored + run.failed} / {run.imported} 个（成功 {run.scored} 个）。符合门槛 {run.eligible} 个，待复核 {run.review} 个，跳过 {run.skipped} 个。</p>
       {run.failed > 0 && <p className="muted">有 {run.failed} 个岗位未能处理，系统已继续处理其余岗位。</p>}
       {!!run.unreadableJobs?.length && <details><summary>{run.unreadableJobs.length} 个岗位信息不完整，未导入</summary><ul>{run.unreadableJobs.map((item) => <li key={item.url}><a href={item.url} target="_blank" rel="noreferrer">查看原岗位</a>：{item.reason}</li>)}</ul></details>}
+      {!!run.unreadableSearches?.length && <details><summary>{run.unreadableSearches.length} 个搜索页面未能读取</summary><ul>{run.unreadableSearches.map((item, index) => <li key={`${item.url}:${index}`}><a href={item.url} target="_blank" rel="noreferrer">查看搜索页面</a>：{item.reason}</li>)}</ul></details>}
       {!!run.fieldReadings?.length && <details><summary>字段读取情况（{run.fieldReadings.length} 条）</summary><ul>{run.fieldReadings.map((item) => <li key={item.url}>
         <a href={item.url} target="_blank" rel="noreferrer">查看原岗位</a>：{item.message}
         {item.evidence && <details><summary>页面字段证据</summary>
@@ -175,6 +177,7 @@ export function AutomationPanel({ mutate, onPolicy, onConnect }: { mutate: Mutat
       </li>)}</ul></details>}
       <p className="muted">暂停或取消会阻止后续操作；当前正在读取的一个岗位可能会先完成。</p>
       <div className="button-row">
+        {run.phase === "collecting" && run.imported > 0 && run.config.autoAssess && !canConfigure && <button className="quiet" disabled={busy} onClick={() => void control("finish-collection")}>结束采集，评分已有岗位</button>}
         {run.state === "running" && <><button className="quiet" disabled={busy} onClick={() => void control("pause")}>暂停</button><button className="danger" disabled={busy} onClick={() => void control("cancel")}>取消</button></>}
         {(run.state === "paused" || run.state === "blocked") && <><button disabled={busy || !paired || !supportsAutomation(data?.extension.version)} onClick={() => void control("resume")}>继续</button><button className="danger" disabled={busy} onClick={() => void control("cancel")}>取消</button></>}
       </div>

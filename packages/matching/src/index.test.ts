@@ -6,7 +6,7 @@ import {
   type ProviderConfig,
   type Resume,
 } from "../../contracts/src/index.ts";
-import { assessJob } from "./index.ts";
+import { assessJob, evaluateGates } from "./index.ts";
 
 const job: Job = {
   id: "job",
@@ -61,6 +61,21 @@ const dimensions = Object.fromEntries(
     "preferences",
   ].map((key) => [key, { score: 90, evidence: "TypeScript services" }]),
 );
+
+test("现有保险排除覆盖软件公司的明确保险项目，福利和过往经验不作为项目证据", () => {
+  const policy = { ...DEFAULT_POLICY, excludedIndustries: ["保险"] };
+  const status = (description: string, title = "Java开发工程师") => evaluateGates({ ...job, title, description, industry: "计算机软件" }, resume, policy).find((g) => g.field === "industry");
+  for (const text of ["AgentScope 保险全栈-智能体Agent开发工程师", "项目行业：保险，负责Java开发", "负责保险业务系统的开发和维护", "驻场保险公司开发智能体", "负责保险项目开发以及非保险平台维护"]) {
+    assert.equal(status(text)?.status, "fail", text);
+    assert.match(status(text)!.reason, /已有保险排除/);
+  }
+  assert.equal(status("负责Java微服务研发", "保险Java后端开发工程师")?.status, "fail");
+  for (const text of ["福利：五险一金、商业保险、年度体检", "有保险项目经验者优先，负责通用平台开发", "有参与保险项目开发经验者优先，负责通用平台开发", "参与过保险项目者优先", "不涉及保险项目，负责Java平台开发", "项目：非保险全栈，负责Java开发", "不负责保险业务开发，负责通用平台研发", "具备Java、RAG经验，负责快递客服赔付和仲裁功能"]) {
+    assert.equal(status(text)?.status, "pass", text);
+  }
+  const unchanged = evaluateGates({ ...job, description: "负责保险项目开发" }, resume, { ...DEFAULT_POLICY, excludedIndustries: [] });
+  assert.equal(unchanged.find((g) => g.field === "industry")?.status, "pass");
+});
 
 test("hard gate failure skips without making a model request", async () => {
   const result = await assessJob(

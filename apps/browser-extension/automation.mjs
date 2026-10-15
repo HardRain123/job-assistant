@@ -3,7 +3,7 @@ import { inspectSplitSearch, clickAndReadSplitDetail } from "./split-page.mjs";
 import { runExtensionApplication } from "./application.mjs";
 
 const API_BASE = "http://127.0.0.1:3000";
-const VERSION = "0.4.8";
+const VERSION = "0.4.9";
 const STATE_KEY = "jobAssistantAutomationTabs";
 const DIAGNOSTIC_KEY = "jobAssistantAutomationDiagnostic";
 const ALARM = "job-assistant-automation-poll";
@@ -473,7 +473,9 @@ export async function execute(command, tokenValue) {
     }
     let page = await inspect(tabId);
     let currentUrl = await actualUrl(tabId);
-    if (!isSearchUrl(currentUrl)) return report(tokenValue, command, { outcome: "error", url: currentUrl || command.url, reason: "navigation-failed" });
+    if (!matchesIntendedUrl(currentUrl, command.url, "search") ||
+      (page?.pageUrl && !matchesIntendedUrl(page.pageUrl, command.url, "search")))
+      return report(tokenValue, command, { outcome: "error", url: currentUrl || command.url, reason: "navigation-failed", diagnostic: { code: "url-mismatch" } });
     if (!page) return report(tokenValue, command, { outcome: "error", url: currentUrl || command.url, reason: "page-unrecognized" });
     if (page.login || page.challenge) return report(tokenValue, command, { outcome: "blocked", url: currentUrl || command.url, reason: page.login ? "login-required" : "verification-required" });
     if (!page.recognized) return report(tokenValue, command, { outcome: "error", url: currentUrl || command.url, reason: "page-unrecognized" });
@@ -495,12 +497,20 @@ export async function execute(command, tokenValue) {
         page = await inspect(tabId);
         currentUrl = await actualUrl(tabId);
         if (page?.login || page?.challenge) return report(tokenValue, command, { outcome: "blocked", url: currentUrl || command.url, reason: page.login ? "login-required" : "verification-required" });
+        if (!matchesIntendedUrl(currentUrl, command.url, "search") ||
+          (page?.pageUrl && !matchesIntendedUrl(page.pageUrl, command.url, "search")))
+          return report(tokenValue, command, { outcome: "error", url: currentUrl || command.url, reason: "navigation-failed", diagnostic: { code: "url-mismatch" } });
         if (page?.recognized && (page.links.length > 0 || page.empty) && listSignature(page.links) !== oldSignature) { changed = page; break; }
       }
       if (!changed) return report(tokenValue, command, { outcome: "error", url: currentUrl || command.url, reason: "page-repeated" });
       page = changed;
     }
     currentUrl = await actualUrl(tabId);
+    // A successful DOM read can race a user/site navigation. Keep every page
+    // bound to this task's query and city before reporting links as collected.
+    if (!matchesIntendedUrl(currentUrl, command.url, "search") ||
+      (page?.pageUrl && !matchesIntendedUrl(page.pageUrl, command.url, "search")))
+      return report(tokenValue, command, { outcome: "error", url: currentUrl || command.url, reason: "navigation-failed", diagnostic: { code: "url-mismatch" } });
     await mark("reporting");
     const response = await report(tokenValue, command, { outcome: "ok", url: currentUrl, links: page.links, hasNext: page.hasNext, signature: listSignature(page.links) });
     await mark("idle", "idle");

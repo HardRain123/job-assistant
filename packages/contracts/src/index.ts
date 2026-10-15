@@ -224,6 +224,9 @@ export interface BulkRun {
   target: number;
   dailyLimit: number;
   intervalSeconds: number;
+  continueOnJobFailure?: boolean;
+  consecutiveJobFailures?: number;
+  isolatedReviewCount?: number;
   message: string;
   createdAt: string;
   updatedAt: string;

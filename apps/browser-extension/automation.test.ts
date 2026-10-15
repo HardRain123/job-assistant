@@ -322,6 +322,59 @@ test("next never advances when paused, missing, or changed away from the command
   } finally { globalThis.fetch = originalFetch; }
 });
 
+test("pagination accepts new links only from the same search, retaining login and verification stops", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalTimeout = globalThis.setTimeout;
+  const browser = (globalThis as Record<string, any>).chrome;
+  const originalScript = browser.scripting.executeScript;
+  const reports: Array<Record<string, any>> = [];
+  const url = "https://www.zhipin.com/web/geek/jobs?query=Java&city=101020100";
+  const otherQuery = url.replace("query=Java", "query=Python");
+  const otherCity = url.replace("city=101020100", "city=101010100");
+  const oldLink = "https://www.zhipin.com/job_detail/a.html";
+  const newLink = "https://www.zhipin.com/job_detail/b.html";
+  try {
+    globalThis.setTimeout = ((fn: () => void) => { queueMicrotask(fn); return 1 as unknown as ReturnType<typeof setTimeout>; }) as typeof setTimeout;
+    globalThis.fetch = (async (path: string, options: RequestInit) => {
+      if (path.endsWith("/result")) { reports.push(JSON.parse(String(options.body))); return response({ ok: true }); }
+      return response({ run: { id: "r", state: "running" } });
+    }) as typeof fetch;
+    for (const scenario of ["same-search", "query", "city", "document-query", "login", "challenge"]) {
+      reports.length = 0;
+      let advanced = false;
+      store.jobAssistantAutomationTabs = { runId: "r", searchTabId: 7 };
+      tab = { ...tab, url, status: "complete" };
+      browser.scripting.executeScript = async (options: { func: { name: string } }) => {
+        if (options.func.name === "advanceSearch") {
+          advanced = true;
+          if (scenario === "query") tab = { ...tab, url: otherQuery };
+          if (scenario === "city") tab = { ...tab, url: otherCity };
+          if (scenario === "login") tab = { ...tab, url: "https://www.zhipin.com/web/user/" };
+          return [{ result: { clicked: true } }];
+        }
+        return [{ result: { recognized: true, links: [advanced ? newLink : oldLink], pageUrl: advanced && scenario === "document-query" ? otherQuery : tab.url,
+          login: advanced && scenario === "login", challenge: advanced && scenario === "challenge" } }];
+      };
+      await worker.execute({ ...command, url, previousSignature: oldLink }, "token");
+      assert.equal(advanced, true);
+      assert.equal(reports.length, 1);
+      if (scenario === "same-search") {
+        assert.equal(reports[0].outcome, "ok");
+        assert.deepEqual(reports[0].links, [newLink]);
+      } else {
+        assert.equal(reports[0].links, undefined);
+        if (scenario === "login" || scenario === "challenge") {
+          assert.equal(reports[0].outcome, "blocked");
+          assert.equal(reports[0].reason, scenario === "login" ? "login-required" : "verification-required");
+        } else {
+          assert.equal(reports[0].outcome, "error");
+          assert.equal(reports[0].diagnostic.code, "url-mismatch");
+        }
+      }
+    }
+  } finally { globalThis.fetch = originalFetch; globalThis.setTimeout = originalTimeout; browser.scripting.executeScript = originalScript; }
+});
+
 test("a rejected initial status check is a POST and is reported with a fixed failure", async () => {
   const originalFetch = globalThis.fetch;
   const methods: string[] = [];

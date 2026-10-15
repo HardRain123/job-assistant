@@ -16,6 +16,7 @@ import {
 import { fingerprint } from "../packages/templates/src/index.ts";
 
 const config = { dailyLimit: 150, target: 150, intervalSeconds: 30 };
+type BulkConfig = typeof config & { continueOnJobFailure?: boolean };
 async function fixture() {
   const dir = mkdtempSync(join(tmpdir(), "bulk-apply-"));
   const store = new Store(join(dir, "db.sqlite"));
@@ -138,12 +139,12 @@ async function fixture() {
       payload,
     });
   await extension("/extension/v1/status");
-  const preview = async (custom = config) => {
+  const preview = async (custom: BulkConfig = config) => {
     const result = await workbench("/api/bulk-application/preview", custom);
     assert.equal(result.statusCode, 200, result.body);
     return result.json();
   };
-  const start = async (custom = config) => {
+  const start = async (custom: BulkConfig = config) => {
     const p = await preview(custom);
     const result = await workbench("/api/bulk-application/start", {
       previewId: p.previewId,
@@ -620,6 +621,29 @@ test("a low-score excluded job remains excluded even when public fields also nee
   }
 });
 
+test("an existing eligible assessment cannot bypass an explicitly excluded insurance project", async () => {
+  const f = await fixture();
+  try {
+    const job = f.addJob("软件公司", "eligible", {
+      industry: "计算机软件",
+      description: "AgentScope 保险全栈-智能体Agent开发工程师",
+    });
+    const state = (await f.workbench("/api/state")).json();
+    const assessed = state.jobs.find(
+      (current: any) => current.id === job.id,
+    ).assessment;
+    assert.equal(assessed.decision, "skip");
+    assert.ok(
+      assessed.gates.some(
+        (gate: any) => gate.field === "industry" && gate.status === "fail",
+      ),
+    );
+    assert.equal((await f.preview()).summary.selected, 0);
+  } finally {
+    await f.close();
+  }
+});
+
 test("reopening SQLite retains quota and queue, and expired in-flight work pauses the batch without replay", async () => {
   const f = await fixture();
   let reopened: Store | undefined;
@@ -673,6 +697,300 @@ test("reopening SQLite retains quota and queue, and expired in-flight work pause
   } finally {
     await secondApp?.close();
     reopened?.close();
+    await f.close();
+  }
+});
+
+const removeInterval = (store: Store) => {
+  const run = store.get<any>("bulk.current", null);
+  run.nextRunAt = new Date(0).toISOString();
+  store.set("bulk.current", run);
+};
+
+test("opt-in local failure isolation retains unknown actions, quota and deduplication while advancing untouched jobs", async () => {
+  const f = await fixture();
+  try {
+    f.addJob("隔离甲公司");
+    f.addJob("隔离乙公司");
+    await f.start({ ...config, continueOnJobFailure: true });
+    const first = await f.claim();
+    await f.action(first, 0, "started", "before-action");
+    await f.action(first, 0, "unknown", "send-unconfirmed");
+    const result = await f.result(first, "send-unconfirmed");
+    assert.equal(result.statusCode, 200, result.body);
+    const state = (await f.workbench("/api/bulk-application")).json();
+    assert.equal(state.run.state, "running");
+    assert.equal(state.run.continueOnJobFailure, true);
+    assert.equal(state.run.consecutiveJobFailures, 1);
+    assert.equal(state.run.isolatedReviewCount, 1);
+    assert.equal(state.run.counts.review, 1);
+    assert.equal(state.today.occupied, 1);
+    assert.equal(state.today.uncertain, 1);
+    assert.equal("isolatedReviewIds" in state.run, false);
+    assert.equal("processedResults" in state.run, false);
+    assert.equal(await f.claim(), null, "serial interval remains in force");
+    removeInterval(f.store);
+    const second = await f.claim();
+    assert.notEqual(second.application.id, first.application.id);
+    assert.ok(
+      second.application.actions.every((a: any) => a.state === "pending"),
+    );
+    const retained = f.store.application(first.application.id)!;
+    assert.equal(retained.status, "needs-review");
+    assert.equal(retained.actions[0]!.state, "unknown");
+    assert.ok(retained.actions.slice(1).every((a) => a.state === "pending"));
+    assert.equal((await f.preview()).summary.selected, 0);
+    const repeated = await f.result(first, "send-unconfirmed");
+    assert.equal(repeated.body, result.body);
+    assert.equal(
+      (await f.workbench("/api/bulk-application")).json().run
+        .consecutiveJobFailures,
+      1,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("three consecutive isolated job failures pause the entire batch and explicit resume resets the streak", async () => {
+  const f = await fixture();
+  try {
+    for (let i = 0; i < 4; i++) f.addJob(`连续失败公司${i}`);
+    await f.start({ ...config, continueOnJobFailure: true });
+    for (let i = 0; i < 3; i++) {
+      const task = await f.claim();
+      assert.ok(task);
+      await f.action(task, 0, "started", "before-action");
+      await f.action(task, 0, "unknown", "send-unconfirmed");
+      await f.result(task, "send-unconfirmed");
+      await f.result(task, "send-unconfirmed");
+      const run = (await f.workbench("/api/bulk-application")).json().run;
+      assert.equal(run.consecutiveJobFailures, i + 1);
+      assert.equal(run.state, i === 2 ? "paused" : "running");
+      removeInterval(f.store);
+    }
+    const state = (await f.workbench("/api/bulk-application")).json();
+    assert.equal(state.run.counts.queued, 1);
+    assert.equal(state.run.counts.review, 3);
+    assert.equal(state.today.occupied, 3);
+    assert.match(state.run.message, /连续 3 个岗位/);
+    assert.equal(await f.claim(), null);
+    const resumed = await f.workbench("/api/bulk-application/control", {
+      action: "resume",
+    });
+    assert.equal(resumed.statusCode, 200, resumed.body);
+    assert.equal(resumed.json().run.consecutiveJobFailures, 0);
+    assert.ok(
+      (await f.claim()).application.actions.every(
+        (a: any) => a.state === "pending",
+      ),
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+test("a confirmed complete application resets local failure streak without hiding prior reviews", async () => {
+  const f = await fixture();
+  try {
+    for (let i = 0; i < 4; i++) f.addJob(`成功重置公司${i}`);
+    await f.start({ ...config, continueOnJobFailure: true });
+    const first = await f.claim();
+    await f.result(first, "recipient-mismatch");
+    removeInterval(f.store);
+    const second = await f.claim();
+    for (let i = 0; i < 3; i++) {
+      await f.action(second, i, "started", "before-action");
+      await f.action(
+        second,
+        i,
+        "confirmed",
+        i === 0 ? "new-conversation" : "new-message",
+      );
+    }
+    await f.result(second);
+    assert.equal(
+      (await f.workbench("/api/bulk-application")).json().run
+        .consecutiveJobFailures,
+      0,
+    );
+    removeInterval(f.store);
+    const third = await f.claim();
+    await f.result(third, "page-unrecognized");
+    // A replayed older success cannot reset a more recent failure streak.
+    await f.result(second);
+    const run = (await f.workbench("/api/bulk-application")).json().run;
+    assert.equal(run.state, "running");
+    assert.equal(run.consecutiveJobFailures, 1);
+    assert.equal(run.counts.review, 2);
+    assert.equal(run.counts.completed, 1);
+  } finally {
+    await f.close();
+  }
+});
+
+test("account-wide and ambiguous errors still pause an opted-in batch", async () => {
+  for (const reason of [
+    "login-required",
+    "verification-required",
+    "platform-limit",
+    "daily-limit",
+    "cancelled",
+    undefined,
+  ]) {
+    const f = await fixture();
+    try {
+      f.addJob("全局错误甲");
+      f.addJob("全局错误乙");
+      await f.start({ ...config, continueOnJobFailure: true });
+      const task = await f.claim();
+      await f.action(task, 0, "started", "before-action");
+      const result = await f.result(task, reason);
+      assert.equal(result.statusCode, 200, result.body);
+      const run = (await f.workbench("/api/bulk-application")).json().run;
+      assert.equal(run.state, "paused", reason);
+      assert.equal(run.isolatedReviewCount, 0);
+      assert.equal(
+        f.store.application(task.application.id)!.actions[0]!.state,
+        "unknown",
+      );
+      assert.equal(await f.claim(), null);
+    } finally {
+      await f.close();
+    }
+  }
+});
+
+test("local-looking errors cannot bypass changed configuration, eligibility or global browser ownership", async () => {
+  for (const blocked of [
+    "config",
+    "eligibility",
+    "paused",
+    "takeover",
+    "browserUncertain",
+  ]) {
+    const f = await fixture();
+    try {
+      f.addJob("资格变化甲");
+      f.addJob("资格变化乙");
+      await f.start({ ...config, continueOnJobFailure: true });
+      const task = await f.claim();
+      if (blocked === "config") {
+        const template = f.store.get<any>("template", null);
+        template.version++;
+        f.store.set("template", template);
+      } else if (blocked === "eligibility") {
+        f.store.db
+          .prepare("DELETE FROM settings WHERE key LIKE 'assessment:%'")
+          .run();
+      } else f.store.set(blocked, true);
+      const result = await f.result(task, "page-unrecognized");
+      assert.equal(result.statusCode, 200, result.body);
+      const run = (await f.workbench("/api/bulk-application")).json().run;
+      assert.equal(run.state, "paused", blocked);
+      assert.equal(run.isolatedReviewCount, 0);
+      assert.equal(await f.claim(), null);
+    } finally {
+      await f.close();
+    }
+  }
+});
+
+test("persisted isolated reviews survive restart, but an unexplained expired lease still pauses the batch", async () => {
+  const f = await fixture();
+  let reopened: Store | undefined;
+  let secondApp: Awaited<ReturnType<typeof createApp>> | undefined;
+  try {
+    for (let i = 0; i < 3; i++) f.addJob(`隔离重启公司${i}`);
+    const run = await f.start({ ...config, continueOnJobFailure: true });
+    const first = await f.claim();
+    await f.action(first, 0, "started", "before-action");
+    await f.result(first, "send-unconfirmed");
+    removeInterval(f.store);
+    await f.closeServices();
+    reopened = new Store(join(f.dir, "db.sqlite"));
+    secondApp = await createApp({
+      store: reopened,
+      password: "password",
+      key: "key",
+      internalToken: "internal",
+      dataDir: f.dir,
+      attachmentsDir: join(f.dir, "attachments"),
+    });
+    const login = await secondApp.inject({
+      method: "POST",
+      url: "/api/login",
+      payload: { password: "password" },
+    });
+    const cookie = String(login.headers["set-cookie"]).split(";")[0];
+    const state = async () =>
+      (
+        await secondApp!.inject({
+          method: "GET",
+          url: "/api/bulk-application",
+          headers: { cookie },
+        })
+      ).json();
+    assert.equal((await state()).run.id, run.id);
+    assert.equal((await state()).run.state, "running");
+    assert.equal((await state()).run.consecutiveJobFailures, 1);
+    assert.equal((await state()).run.isolatedReviewCount, 1);
+    assert.equal(
+      reopened.application(first.application.id)!.actions[0]!.state,
+      "unknown",
+    );
+    const next = reopened.claim("extension")!;
+    const nextApplication = reopened.application(
+      (next.payload as Application).id,
+    )!;
+    assert.notEqual(nextApplication.id, first.application.id);
+    nextApplication.actions[0]!.state = "started";
+    reopened.updateApplication(nextApplication);
+    reopened.db
+      .prepare("UPDATE tasks SET lease_until=? WHERE id=?")
+      .run(new Date(0).toISOString(), next.id);
+    const expired = await state();
+    assert.equal(expired.run.state, "paused");
+    assert.equal(expired.run.counts.review, 2);
+    assert.equal(expired.run.isolatedReviewCount, 1);
+    assert.equal(expired.run.consecutiveJobFailures, 1);
+    assert.equal(
+      reopened.application(nextApplication.id)!.actions[0]!.state,
+      "unknown",
+    );
+  } finally {
+    await secondApp?.close();
+    reopened?.close();
+    await f.close();
+  }
+});
+
+test("an earlier isolation never authorizes a changed outcome on the same application", async () => {
+  const f = await fixture();
+  try {
+    f.addJob("隔离后接续甲");
+    f.addJob("隔离后接续乙");
+    await f.start({ ...config, continueOnJobFailure: true });
+    const task = await f.claim();
+    await f.result(task, "page-unrecognized");
+    assert.equal(
+      (await f.workbench("/api/bulk-application")).json().run.state,
+      "running",
+    );
+    // A later manually resumed execution can expire without a new result callback.
+    // Its unknown outcome must be reviewed even though this application was isolated before.
+    const changed = f.store.application(task.application.id)!;
+    delete changed.stopReason;
+    changed.actions[0]!.state = "unknown";
+    changed.actions[0]!.updatedAt = new Date().toISOString();
+    f.store.updateApplication(changed);
+    const state = (await f.workbench("/api/bulk-application")).json();
+    assert.equal(state.run.state, "paused");
+    assert.equal(state.run.isolatedReviewCount, 0);
+    assert.equal(state.run.counts.review, 1);
+    assert.equal(state.run.counts.queued, 1);
+    assert.equal(await f.claim(), null);
+  } finally {
     await f.close();
   }
 });

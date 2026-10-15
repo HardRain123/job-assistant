@@ -43,6 +43,7 @@ interface Run {
   scored: number;
   failed: number;
   unreadableJobs?: { url: string; reason: string }[];
+  unreadableSearches?: { url: string; reason: string }[];
   fieldReadings?: { url: string; reading: z.infer<typeof fieldReadingSchema>; message: string; evidence?: z.infer<typeof pageEvidenceSchema> }[];
   consecutiveUnreadable?: number;
   eligible: number;
@@ -65,6 +66,7 @@ interface Run {
   jobIds: string[];
   scoredIds: string[];
   receipts: string[];
+  searchReadFailures?: number;
   lease: { command: Command; expiresAt: number } | null;
 }
 interface Options {
@@ -229,6 +231,7 @@ export function createAutomation(o: Options) {
       scored: r.scored,
       failed: r.failed,
       unreadableJobs: r.unreadableJobs ?? [],
+      unreadableSearches: r.unreadableSearches ?? [],
       fieldReadings: r.fieldReadings ?? [],
       eligible: r.eligible,
       review: r.review,
@@ -265,11 +268,15 @@ export function createAutomation(o: Options) {
     r.currentUrl = null;
     if (r.config.autoAssess && r.jobIds.length) {
       r.phase = "scoring";
-      r.message = "采集结束，正在自动筛选和评分。";
+      r.message = r.unreadableSearches?.length
+        ? `有 ${r.unreadableSearches.length} 个搜索页面未能读取，正在评分已采集的岗位。`
+        : "采集结束，正在自动筛选和评分。";
     } else {
       r.phase = "done";
       r.state = "completed";
-      r.message = r.imported
+      r.message = r.unreadableSearches?.length
+        ? `采集结束，有 ${r.unreadableSearches.length} 个搜索页面未能读取；已入库 ${r.imported} 个岗位。`
+        : r.imported
         ? "采集完成，岗位已进入岗位库。"
         : "搜索结束，没有采集到完整岗位。";
     }
@@ -353,6 +360,41 @@ export function createAutomation(o: Options) {
       throw new Error("页面字段证据必须绑定成功的岗位详情诊断");
     if (b.outcome !== "ok") {
       const message = reasons[b.reason ?? "page-unrecognized"]!;
+      if (cmd.kind !== "detail" && b.outcome === "error" &&
+          b.reason === "page-unrecognized" && b.diagnostic?.code === "dom-unrecognized") {
+        const actual = new URL(b.url);
+        const expected = new URL(cmd.url);
+        if (actual.origin !== "https://www.zhipin.com" || actual.username || actual.password ||
+            !/^\/web\/geek\/jobs?\/?$/.test(actual.pathname) ||
+            actual.searchParams.get("query") !== expected.searchParams.get("query") ||
+            actual.searchParams.get("city") !== expected.searchParams.get("city"))
+          throw new Error("无法识别的搜索页面不属于当前任务");
+        o.store.transaction(() => {
+          r.receipts.push(cmd.id);
+          r.lease = null;
+          if (cmd.kind === "search" && !r.searchReadFailures) {
+            r.searchReadFailures = 1;
+            r.message = "搜索页面暂未识别，将重新打开同一搜索一次；不会发送消息。";
+          } else {
+            (r.unreadableSearches ??= []).push({
+              url: cmd.url,
+              reason: cmd.kind === "next"
+                ? "翻页后的列表未识别，未再次点击翻页；已保留前面采集的岗位。"
+                : "重新打开后仍无法识别列表，已跳过该搜索词；不代表没有岗位。",
+            });
+            r.keywordIndex++;
+            r.page = 0;
+            r.signature = "";
+            r.hasNext = false;
+            r.searchUrl = null;
+            r.searchReadFailures = 0;
+            r.message = "已记录未读取的搜索页面，继续其他搜索词。";
+          }
+          save(r);
+          if (r.keywordIndex >= r.config.keywords.length) finishCollection(r);
+        });
+        return { ok: true };
+      }
       if (cmd.kind === "detail" && b.outcome === "error" && b.reason === "page-unrecognized" &&
           b.diagnostic?.code === "card-incomplete" && (r.consecutiveUnreadable ?? 0) < 2) {
         const actual = new URL(b.url);
@@ -438,6 +480,7 @@ export function createAutomation(o: Options) {
           return;
         }
         r.pendingUrls.push(...links.filter((url) => !r.seenUrls.includes(url)));
+        r.searchReadFailures = 0;
         r.seenUrls = [...new Set([...r.seenUrls, ...links])];
         r.discovered = r.seenUrls.length;
         r.page = cmd.kind === "search" ? 1 : r.page + 1;
@@ -462,6 +505,8 @@ export function createAutomation(o: Options) {
       r.phase = "done";
       r.message = r.failed
         ? `采集和评分流程结束，${r.failed} 个岗位评分失败，可在岗位库重试。`
+        : r.unreadableSearches?.length
+          ? `已采集岗位评分完成；有 ${r.unreadableSearches.length} 个搜索页面未能读取，请查看记录。`
         : "采集与评分完成，请在岗位库查看匹配结果。";
       save(r);
       return;
@@ -506,13 +551,8 @@ export function createAutomation(o: Options) {
     });
     return pumping;
   }
-  function register(app: FastifyInstance) {
-    app.get("/api/automation", () => ({
-      run: publicRun(reconcile()),
-      extension: o.extensionStatus(),
-    }));
-    app.post("/api/automation/start", (req) => {
-      const request = z.union([configSchema, z.object({ inspectJobId: z.string().uuid() }).strict()]).parse(req.body);
+  function start(body: unknown) {
+      const request = z.union([configSchema, z.object({ inspectJobId: z.string().uuid() }).strict()]).parse(body);
       const inspectJob = "inspectJobId" in request ? o.store.job(request.inspectJobId) : null;
       if ("inspectJobId" in request && (!inspectJob || inspectJob.source !== "boss")) throw new Error("只读核对岗位不存在或不是 BOSS 岗位");
       const inspectionUrl = inspectJob ? canonicalJobUrl(inspectJob.url) : null;
@@ -567,17 +607,27 @@ export function createAutomation(o: Options) {
       save(r);
       o.store.audit("automation.started", { id: r.id, config });
       return { run: publicRun(r) };
-    });
-    app.post("/api/automation/control", (req) => {
+  }
+  function control(body: unknown) {
       const { action } = z
-        .object({ action: z.enum(["pause", "resume", "cancel"]) })
+        .object({ action: z.enum(["pause", "resume", "cancel", "finish-collection"]) })
         .strict()
-        .parse(req.body);
+        .parse(body);
       const r = reconcile();
       if (!r || ["completed", "cancelled"].includes(r.state))
         throw new Error("没有可操作的进行中任务");
-      scoring?.abort();
-      r.lease = null;
+      if (action === "finish-collection") {
+        if (r.phase !== "collecting" || !r.imported || !r.config.autoAssess)
+          throw new Error("当前没有可评分的已采集岗位");
+        if (r.configurationKey !== o.configurationKey())
+          throw new Error("任务配置已变化，请停止并重新开始");
+        o.ensureReady(true);
+        scoring?.abort();
+        r.state = "running";
+        finishCollection(r);
+        o.store.audit("automation.collection-finished", { id: r.id, imported: r.imported });
+        return { run: publicRun(r) };
+      }
       if (action === "resume") {
         if (r.configurationKey !== o.configurationKey())
           throw new Error("任务配置已变化，请停止并重新开始");
@@ -585,16 +635,21 @@ export function createAutomation(o: Options) {
         if (!supportsAutomation(o.extensionStatus().version))
           throw new Error("请先刷新升级到 0.2.4 或更新的扩展");
         o.ensureReady(r.config.autoAssess);
+        scoring?.abort();
+        r.lease = null;
         // Restart this keyword if the search tab was lost; seen URLs keep
         // previously imported jobs from being revisited.
         if (r.phase === "collecting") {
           r.page = 0;
           r.signature = "";
           r.hasNext = false;
+          r.searchReadFailures = 0;
         }
         r.state = "running";
         r.message = "任务继续，等待扩展接收。";
       } else {
+        scoring?.abort();
+        r.lease = null;
         r.state = action === "pause" ? "paused" : "cancelled";
         r.message =
           action === "pause"
@@ -603,7 +658,19 @@ export function createAutomation(o: Options) {
       }
       save(r);
       return { run: publicRun(r) };
-    });
+  }
+  function register(app: FastifyInstance) {
+    app.get("/api/automation", () => ({
+      run: publicRun(reconcile()),
+      extension: o.extensionStatus(),
+    }));
+    const requireStandalone = () => {
+      const workflow = o.store.get<{ state: string } | null>("bulkWorkflow.current", null);
+      if (workflow && ["running", "paused"].includes(workflow.state))
+        throw new Error("自动补充批次正在管理任务，请使用该批次的暂停、继续或结束操作");
+    };
+    app.post("/api/automation/start", (req) => { requireStandalone(); return start(req.body); });
+    app.post("/api/automation/control", (req) => { requireStandalone(); return control(req.body); });
     app.post("/extension/v1/claim", claim);
     app.post("/extension/v1/result", (req) => result(req.body));
     // No personal data, provider credentials or write commands are returned.
@@ -621,5 +688,5 @@ export function createAutomation(o: Options) {
       await pumping;
     });
   }
-  return { register, pump };
+  return { register, pump, start, control, state: () => publicRun(reconcile()) };
 }

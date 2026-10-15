@@ -24,6 +24,28 @@ const norm = (value: string) =>
 const includesAny = (value: string, entries: string[]) =>
   entries.some((entry) => norm(entry) && norm(value).includes(norm(entry)));
 
+// A software company can recruit for an explicitly named insurance assignment.
+// Benefits and optional past experience do not establish that assignment.
+function excludedInsuranceAssignment(job: Job, policy: MatchPolicy) {
+  if (!policy.excludedIndustries.some((value) => /^(?:保险|保险行业)$/.test(norm(value))))
+    return false;
+  const withoutNegatedInsurance = (text: string) => text.replace(
+    /(?:非|不涉及|不属于|不做|无需|不包含|排除|不负责|不参与)\s*(?:保险|寿险|财险)(?:项目|业务|平台|系统|全栈)?/g,
+    "无关事项",
+  );
+  const title = withoutNegatedInsurance(job.title.normalize("NFKC"));
+  if (/(?:保险|寿险|财险)/.test(title) &&
+      /开发|工程师|全栈|后端|前端|架构|智能体/.test(title)) return true;
+  const evidence = /(?:保险|寿险|财险)全栈|(?:项目(?:行业|方向|名称)?|业务方向|客户行业|服务行业)\s*[:：=为]\s*(?:保险|寿险|财险)|(?:负责|参与|承接|开发|建设|维护|驻场|对接)[^。；;\n，,]{0,16}(?:保险(?:业务|项目|系统|平台|公司)|寿险(?:业务|项目|系统)|财险(?:业务|项目|系统))/g;
+  return job.description.normalize("NFKC").split(/[。；;\n，,]|以及|并且|但是/).some((raw) => {
+    const clause = withoutNegatedInsurance(raw);
+    return [...clause.matchAll(evidence)].some((match) => {
+      const tail = clause.slice(match.index + match[0].length);
+      return !/^[^。；;\n，,]{0,12}(?:经验|经历|背景|者优先|者加分)/.test(tail);
+    });
+  });
+}
+
 export function evaluateGates(
   job: Job,
   resume: Resume,
@@ -82,15 +104,20 @@ export function evaluateGates(
           : "pass",
     reason: /某(?:大型|中型|小型|知名|头部|集团|公司|企业)|公司(?:名称)?(?:保密|未披露)|保密公司|匿名公司/.test(job.company) ? "匿名客户公司需核验真实名称及排除规则" : "公司排除规则",
   });
+  const insuranceAssignment = excludedInsuranceAssignment(job, policy);
   gates.push({
     field: "industry",
     status:
-      job.industry == null && policy.excludedIndustries.length
+      insuranceAssignment
+        ? "fail"
+        : job.industry == null && policy.excludedIndustries.length
         ? "unknown"
         : includesAny(job.industry ?? "", policy.excludedIndustries)
           ? "fail"
           : "pass",
-    reason: job.industry ?? "行业未知",
+    reason: insuranceAssignment
+      ? "岗位标题或职责明确属于保险项目，命中已有保险排除范围"
+      : job.industry ?? "行业未知",
   });
 
   if (!policy.requiredSkills.length)

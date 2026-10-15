@@ -43,6 +43,113 @@ test("只读复核只打开已入库的一个 BOSS 岗位，不搜索、不评�
   } finally { await f.close(); }
 });
 
+test("采集被阻塞时可结束本轮并评分已有岗位，旧租约失效且重启保留评分进度", async () => {
+  let scored = 0;
+  const f = await fixture(async () => { scored++; return { decision: "eligible" } as Assessment; });
+  try {
+    await f.start({ autoAssess: true });
+    const search = await f.claim();
+    await f.result(search, { links: [url("partial-a"), url("partial-b")], hasNext: true });
+    await f.result(await f.claim(), { jobs: [job("partial-a")] });
+    const blockedDetail = await f.claim();
+    await f.result(blockedDetail, { outcome: "error", reason: "page-unrecognized" });
+    assert.equal((await f.state()).state, "blocked");
+    const response = await f.control("finish-collection");
+    assert.equal(response.statusCode, 200, response.body);
+    assert.equal(response.json().run.phase, "scoring");
+    assert.equal(response.json().run.imported, 1);
+    assert.equal(await f.claim(), null);
+    assert.equal((await f.result(blockedDetail, { jobs: [job("partial-b")] })).statusCode, 400);
+    await f.restart();
+    await f.pump(); await f.pump();
+    const run = await f.state();
+    assert.equal(run.state, "completed");
+    assert.equal(run.scored, 1); assert.equal(run.eligible, 1); assert.equal(scored, 1);
+    assert.equal(f.store.jobs().length, 1);
+    assert.equal(f.store.applications().length, 0);
+    assert.equal((await f.control("finish-collection")).statusCode, 400);
+  } finally { await f.close(); }
+});
+
+test("评分已有岗位拒绝空结果、未启用自动评分及配置变化，不清除仍有效的采集命令", async () => {
+  const f = await fixture();
+  try {
+    await f.start({ autoAssess: true });
+    const emptySearch = await f.claim();
+    assert.equal((await f.control("finish-collection")).statusCode, 400);
+    assert.equal((await f.result(emptySearch, { links: [url("a")], hasNext: false })).statusCode, 200);
+    await f.result(await f.claim(), { jobs: [job("a")] });
+    f.drift();
+    assert.equal((await f.control("finish-collection")).statusCode, 400);
+    assert.equal((await f.state()).phase, "collecting");
+    await f.control("cancel");
+    await f.start({ autoAssess: false });
+    await f.result(await f.claim(), { links: [url("b")], hasNext: false });
+    await f.result(await f.claim(), { jobs: [job("b")] });
+    const next = await f.claim();
+    assert.equal((await f.control("finish-collection")).statusCode, 400);
+    assert.equal((await f.result(next, { links: [], hasNext: false })).statusCode, 200);
+    assert.equal((await f.state()).scored, 0);
+  } finally { await f.close(); }
+});
+
+test("最后一个搜索页未识别时只重开一次，记录缺口并自动评分已有岗位", async () => {
+  const f = await fixture();
+  const failure = { outcome: "error", reason: "page-unrecognized", diagnostic: { stage: "waiting-page", code: "dom-unrecognized", tabState: "complete" } };
+  try {
+    await f.start({ autoAssess: true });
+    await f.result(await f.claim(), { links: [url("a")], hasNext: false });
+    await f.result(await f.claim(), { jobs: [job("a")] });
+    const failedSearch = await f.claim();
+    assert.equal(new URL(failedSearch.url).searchParams.get("query"), "后端");
+    assert.equal((await f.result(failedSearch, failure)).statusCode, 200);
+    assert.equal((await f.result(failedSearch, failure)).statusCode, 200);
+    assert.equal((await f.state()).state, "running");
+    assert.equal((await f.state()).unreadableSearches.length, 0);
+    await f.restart();
+    const retry = await f.claim();
+    assert.equal(retry.url, failedSearch.url);
+    assert.notEqual(retry.id, failedSearch.id);
+    await f.result(retry, failure);
+    assert.equal((await f.state()).phase, "scoring");
+    assert.equal((await f.state()).unreadableSearches.length, 1);
+    assert.equal(await f.claim(), null);
+    await f.pump(); await f.pump();
+    const run = await f.state();
+    assert.equal(run.state, "completed"); assert.equal(run.scored, 1);
+    assert.match(run.message, /搜索页面未能读取/);
+    assert.match(run.unreadableSearches[0].reason, /不代表没有岗位/);
+    assert.equal(f.store.applications().length, 0);
+  } finally { await f.close(); }
+});
+
+test("翻页后无法识别不再次点击翻页，跳过该词保留岗位，登录和验证仍阻塞", async () => {
+  const f = await fixture();
+  const failure = { outcome: "error", reason: "page-unrecognized", diagnostic: { stage: "reading-page", code: "dom-unrecognized" } };
+  try {
+    await f.start();
+    const search = await f.claim();
+    await f.result(search, { links: [url("a")], hasNext: true });
+    await f.result(await f.claim(), { jobs: [job("a")] });
+    const next = await f.claim(); assert.equal(next.kind, "next");
+    for (const actualUrl of ["https://evil.example/web/geek/jobs", next.url.replace("101020100", "100010000"), next.url.replace("query=", "query=changed")]) {
+      assert.equal((await f.result(next, { ...failure, url: actualUrl })).statusCode, 400);
+    }
+    await f.result(next, failure);
+    const second = await f.claim();
+    assert.equal(second.kind, "search");
+    assert.equal(new URL(second.url).searchParams.get("query"), "后端");
+    assert.equal((await f.state()).imported, 1);
+    await f.result(second, { ...failure, outcome: "blocked", reason: "verification-required" });
+    assert.equal((await f.state()).state, "blocked");
+    assert.equal((await f.state()).unreadableSearches.length, 1);
+    await f.control("resume");
+    await f.result(await f.claim(), { outcome: "blocked", reason: "login-required" });
+    assert.equal((await f.state()).state, "blocked");
+    assert.match((await f.state()).message, /登录已失效/);
+  } finally { await f.close(); }
+});
+
 async function fixture(scoreJob: (id: string, signal: AbortSignal) => Promise<Assessment> = async () => ({ decision: "eligible" }) as Assessment) {
   const store = new Store(":memory:");
   let time = Date.UTC(2026, 0, 1), fingerprint = "private-resume-provider-key";

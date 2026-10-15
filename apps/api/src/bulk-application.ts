@@ -18,6 +18,7 @@ const configSchema = z
     dailyLimit: z.number().int().min(1).max(150),
     target: z.number().int().min(1).max(150),
     intervalSeconds: z.number().int().min(15).max(300),
+    continueOnJobFailure: z.boolean().default(false),
   })
   .strict();
 interface Options {
@@ -31,6 +32,7 @@ interface Options {
   policy: () => MatchPolicy;
   resume: () => Resume | null;
   configurationKey: () => string;
+  workflowAllows?: (application: Application) => boolean;
   status: () => {
     paired: boolean;
     version: string | null;
@@ -40,6 +42,9 @@ interface Options {
 type SavedRun = BulkRun & {
   configurationKey: string;
   acknowledgedReviewIds?: string[];
+  isolatedReviewIds?: string[];
+  isolatedResultKeys?: Record<string, string>;
+  processedResults?: Record<string, string>;
 };
 type Preview = {
   config: z.infer<typeof configSchema>;
@@ -70,6 +75,24 @@ const blankCounts = () => ({
   skipped: 0,
   cancelled: 0,
 });
+const outcomeKey = (
+  application: Application,
+  reason = application.stopReason,
+) =>
+  JSON.stringify({
+    status: application.status,
+    reason: reason ?? null,
+    actions: application.actions.map((action) => ({
+      id: action.id,
+      state: action.state,
+      evidence: action.evidence,
+      updatedAt: action.updatedAt,
+      resolution: action.resolution,
+    })),
+  });
+const isolated = (run: SavedRun, application: Application) =>
+  run.isolatedReviewIds?.includes(application.id) &&
+  run.isolatedResultKeys?.[application.id] === outcomeKey(application);
 
 export function createBulkApplication(o: Options) {
   const { store } = o;
@@ -82,6 +105,9 @@ export function createBulkApplication(o: Options) {
     const {
       configurationKey: _private,
       acknowledgedReviewIds: _ack,
+      isolatedReviewIds: _isolated,
+      isolatedResultKeys: _isolatedResults,
+      processedResults: _results,
       ...result
     } = run;
     return result;
@@ -130,12 +156,16 @@ export function createBulkApplication(o: Options) {
       else if (a.status === "completed") run.counts.completed++;
       else if (a.status === "cancelled") run.counts.cancelled++;
     }
+    run.isolatedReviewCount = applications.filter(
+      (a) => ["needs-review", "failed"].includes(a.status) && isolated(run, a),
+    ).length;
     if (
       run.state === "running" &&
       applications.some(
         (a) =>
           ["needs-review", "failed"].includes(a.status) &&
-          !run.acknowledgedReviewIds?.includes(a.id),
+          !run.acknowledgedReviewIds?.includes(a.id) &&
+          !isolated(run, a),
       )
     ) {
       run.state = "paused";
@@ -246,6 +276,7 @@ export function createBulkApplication(o: Options) {
     return { summary, jobs: selected };
   };
   const canClaim = (application: Application) => {
+    if (o.workflowAllows && !o.workflowAllows(application)) return false;
     if (!application.bulkRunId) return true;
     const run = reconcile();
     if (!run || run.id !== application.bulkRunId || run.state !== "running")
@@ -271,6 +302,7 @@ export function createBulkApplication(o: Options) {
     return true;
   };
   const allowedDuringAction = (application: Application) => {
+    if (o.workflowAllows && !o.workflowAllows(application)) return false;
     if (!application.bulkRunId) return true;
     const run = store.get<SavedRun | null>(key, null);
     try {
@@ -305,33 +337,82 @@ export function createBulkApplication(o: Options) {
     if (!application.bulkRunId) return;
     const run = store.get<SavedRun | null>(key, null);
     if (!run || run.id !== application.bulkRunId) return;
+    const stopReason = reason ?? application.stopReason;
+    const resultIdentity = outcomeKey(application, stopReason);
+    // Result callbacks and read-side reconciliation may repeat after a restart.
+    // Never advance the failure streak or move the serial interval twice.
+    if (run.processedResults?.[application.id] === resultIdentity) {
+      reconcile();
+      return;
+    }
+    run.processedResults ??= {};
+    run.processedResults[application.id] = resultIdentity;
     run.nextRunAt = new Date(
       Date.now() + run.intervalSeconds * 1000,
     ).toISOString();
+    if (application.status === "completed") run.consecutiveJobFailures = 0;
     if (
       run.state === "running" &&
       application.status !== "completed" &&
-      reason !== "existing-contact"
+      stopReason !== "existing-contact"
     ) {
-      run.state = "paused";
-      run.message =
-        reason === "platform-limit"
-          ? "平台提示沟通次数限制，批量已暂停。"
-          : reason === "daily-limit"
-            ? "今日配置名额已用完，批量已暂停。"
-            : "当前岗位需要核对，批量已暂停；不会重发已尝试动作。";
+      const localReason = [
+        "recipient-mismatch",
+        "page-unrecognized",
+        "send-unconfirmed",
+        "attachment-pending",
+      ].includes(stopReason ?? "");
+      let globallyReady = false;
+      try {
+        idle();
+        globallyReady = run.configurationKey === o.configurationKey();
+      } catch {
+        // Global pause, takeover or uncertain browser ownership stops the batch.
+      }
+      if (
+        run.continueOnJobFailure &&
+        localReason &&
+        globallyReady &&
+        currentlyEligible(application)
+      ) {
+        const alreadyIsolated = run.isolatedReviewIds?.includes(application.id);
+        run.isolatedReviewIds = [
+          ...new Set([...(run.isolatedReviewIds ?? []), application.id]),
+        ];
+        run.isolatedResultKeys ??= {};
+        run.isolatedResultKeys[application.id] = resultIdentity;
+        if (!alreadyIsolated) {
+          run.consecutiveJobFailures = (run.consecutiveJobFailures ?? 0) + 1;
+          store.audit("bulk.job-isolated", {
+            id: run.id,
+            applicationId: application.id,
+            reason: stopReason,
+            consecutiveJobFailures: run.consecutiveJobFailures,
+          });
+        }
+        if ((run.consecutiveJobFailures ?? 0) >= 3) {
+          run.state = "paused";
+          run.message =
+            "连续 3 个岗位需要核对，批量已暂停，请检查浏览器与发送状态；不会重发已尝试动作。";
+        } else {
+          run.message =
+            "当前岗位保留为待核对，继续尚未执行的岗位；不会重发已尝试动作。";
+        }
+      } else {
+        run.state = "paused";
+        run.message =
+          stopReason === "platform-limit"
+            ? "平台提示沟通次数限制，批量已暂停。"
+            : stopReason === "daily-limit"
+              ? "今日配置名额已用完，批量已暂停。"
+              : "当前岗位需要核对，批量已暂停；不会重发已尝试动作。";
+      }
     }
     save(run);
     reconcile();
   };
-  const register = (app: FastifyInstance) => {
-    app.get("/api/bulk-application", () => ({
-      run: publicRun(reconcile()),
-      today: store.dailyQuota(),
-      extension: o.status(),
-    }));
-    app.post("/api/bulk-application/preview", (req) => {
-      const config = configSchema.parse(req.body);
+  const preview = (body: unknown) => {
+      const config = configSchema.parse(body);
       const { summary, jobs } = selection(config);
       const applications = jobs.length
         ? o.draft(
@@ -349,15 +430,15 @@ export function createBulkApplication(o: Options) {
         expiresAt,
       } satisfies Preview);
       return { previewId, expiresAt, applications, summary };
-    });
-    app.post("/api/bulk-application/start", (req) => {
+  };
+  const start = (body: unknown, insideTransaction = false) => {
       const { previewId } = z
         .object({ previewId: z.string().uuid() })
         .strict()
-        .parse(req.body);
+        .parse(body);
       connection();
       idle();
-      return store.transaction(() => {
+      const create = () => {
         const current = store.get<SavedRun | null>(key, null);
         if (current && ["running", "paused"].includes(current.state))
           throw new Error("已有批量任务，请先继续或结束它");
@@ -425,14 +506,15 @@ export function createBulkApplication(o: Options) {
           selected: preview.applications.length,
           dailyLimit: run.dailyLimit,
         });
-        return { run: publicRun(run) };
-      });
-    });
-    app.post("/api/bulk-application/control", (req) => {
+        return { run: publicRun(run)! };
+      };
+      return insideTransaction ? create() : store.transaction(create);
+  };
+  const control = (body: unknown, insideTransaction = false) => {
       const { action } = z
         .object({ action: z.enum(["pause", "resume", "cancel"]) })
         .strict()
-        .parse(req.body);
+        .parse(body);
       const run = reconcile();
       if (!run || ["completed", "cancelled"].includes(run.state))
         throw new Error("没有可控制的批量任务");
@@ -452,6 +534,7 @@ export function createBulkApplication(o: Options) {
           )
           .map((a) => a.id);
         run.state = "running";
+        run.consecutiveJobFailures = 0;
         run.message = "继续尚未执行的岗位；待核对岗位保留，不会重发。";
       } else if (action === "pause") {
         run.state = "paused";
@@ -459,19 +542,17 @@ export function createBulkApplication(o: Options) {
       } else {
         run.state = "cancelled";
         run.message = "批量已结束，已执行动作和待核对记录保留。";
-        store.transaction(() => {
-          for (const application of store
-            .applications()
-            .filter(
-              (a) =>
-                a.bulkRunId === run.id &&
-                (a.status === "queued" ||
-                  (["needs-review", "failed"].includes(a.status) &&
-                    store.reusableCancelledApplication({
-                      ...a,
-                      status: "cancelled",
-                    }))),
-            )) {
+        const cancelQueued = () => {
+          for (const application of store.applications().filter(
+            (a) =>
+              a.bulkRunId === run.id &&
+              (a.status === "queued" ||
+                (["needs-review", "failed"].includes(a.status) &&
+                  store.reusableCancelledApplication({
+                    ...a,
+                    status: "cancelled",
+                  }))),
+          )) {
             application.status = "cancelled";
             store.updateApplication(application);
             store.db
@@ -480,13 +561,27 @@ export function createBulkApplication(o: Options) {
               )
               .run(application.id);
           }
-        });
+        };
+        if (insideTransaction) cancelQueued();
+        else store.transaction(cancelQueued);
       }
       save(run);
       store.audit(`bulk.${action}`, { id: run.id });
-      return { run: publicRun(reconcile()) };
-    });
+      return { run: publicRun(reconcile())! };
   };
-  return { register, canClaim, allowedDuringAction, afterResult, pause };
+  const register = (app: FastifyInstance) => {
+    app.get("/api/bulk-application", () => ({
+      run: publicRun(reconcile()), today: store.dailyQuota(), extension: o.status(),
+    }));
+    const requireStandalone = () => {
+      const workflow = store.get<{ state: string } | null>("bulkWorkflow.current", null);
+      if (workflow && ["running", "paused"].includes(workflow.state))
+        throw new Error("自动补充批次正在管理任务，请使用该批次的暂停、继续或结束操作");
+    };
+    app.post("/api/bulk-application/preview", (req) => preview(req.body));
+    app.post("/api/bulk-application/start", (req) => { requireStandalone(); return start(req.body); });
+    app.post("/api/bulk-application/control", (req) => { requireStandalone(); return control(req.body); });
+  };
+  return { register, canClaim, allowedDuringAction, afterResult, pause, preview, start, control, state: () => publicRun(reconcile()) };
 }
 export type BulkApplication = ReturnType<typeof createBulkApplication>;

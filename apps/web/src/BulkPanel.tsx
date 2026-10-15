@@ -3,6 +3,7 @@ import type {
   Application,
   BulkRun,
 } from "../../../packages/contracts/src/index";
+import { BulkWorkflowPanel } from "./BulkWorkflowPanel";
 
 type BulkState = {
   run: BulkRun | null;
@@ -75,10 +76,12 @@ export function BulkPanel({
   onChanged: () => Promise<void>;
 }) {
   const [data, setData] = useState<BulkState | null>(null);
+  const [workflowActive, setWorkflowActive] = useState(false);
   const [config, setConfig] = useState({
     dailyLimit: 150,
     target: 150,
     intervalSeconds: 30,
+    continueOnJobFailure: true,
   });
   const [preview, setPreview] = useState<Preview | null>(null);
   const [accepted, setAccepted] = useState(false);
@@ -117,6 +120,7 @@ export function BulkPanel({
               dailyLimit: state.today.limit,
               target: state.run?.target ?? 150,
               intervalSeconds: state.run?.intervalSeconds ?? 30,
+              continueOnJobFailure: state.run?.continueOnJobFailure ?? true,
             });
           }
         }
@@ -208,7 +212,7 @@ export function BulkPanel({
       await onChanged();
     });
   const run = data?.run;
-  const active = run?.state === "running" || run?.state === "paused";
+  const active = workflowActive || run?.state === "running" || run?.state === "paused";
   const version = (data?.extension.version ?? "").split(".").map(Number);
   const connected = Boolean(
     data?.extension.paired &&
@@ -219,6 +223,7 @@ export function BulkPanel({
   const fresh = Boolean(preview && Date.parse(preview.expiresAt) > Date.now());
   return (
     <div className="grid bulk-panel">
+      <BulkWorkflowPanel onActiveChange={setWorkflowActive} onChanged={onChanged} />
       <section className="card">
         <div className="card-title">
           <h2>批量发送求职话术</h2>
@@ -236,7 +241,7 @@ export function BulkPanel({
         {!connected && (
           <div className="notice">
           {data && !data.extension.paired ? "配对已失效或尚未连接，请重新生成配对码并连接扩展。" : ""}
-            请保持 BOSS 已登录，并将普通浏览器扩展刷新到 0.4.8。当前上报版本：
+            请保持 BOSS 已登录，扩展至少为 0.4.8；当前推荐 0.4.9。当前上报版本：
             {data?.extension.version ?? "未连接"}。{" "}
             <button className="link" onClick={onConnect}>
               查看连接
@@ -285,6 +290,7 @@ export function BulkPanel({
             <span>本批目标 {run.target} 个</span>
           </div>
           <p role="status">{run.message}</p>
+          <p className="muted">{run.continueOnJobFailure ? "单岗位异常保留待核验并继续其他岗位；连续三次异常、登录或验证码及平台额度限制会暂停整批。" : "遇到需要核验的岗位时暂停整批。"} 结果未知的消息不会重发。</p>
           <p>
             排队 {run.counts.queued} · 执行中 {run.counts.running} · 话术完成{" "}
             {run.counts.completed} · 待核验 {run.counts.review} · 已沟通跳过{" "}
@@ -297,7 +303,7 @@ export function BulkPanel({
               ；实际开始还取决于浏览器连接。
             </p>
           )}
-          {active && (
+          {active && !workflowActive && (
             <div className="toolbar">
               {run.state === "running" ? (
                 <button
@@ -422,6 +428,13 @@ export function BulkPanel({
             />
           </label>
           <button disabled={busy || active}>生成批量预览</button>
+          <label className="check">
+            <input type="checkbox" checked={config.continueOnJobFailure} disabled={busy || active} onChange={(e) => {
+              setConfig({ ...config, continueOnJobFailure: e.target.checked });
+              setPreview(null); setAccepted(false);
+            }} />
+            单岗位异常时保留待核验，继续其他岗位
+          </label>
         </form>
       </section>
       {preview && (

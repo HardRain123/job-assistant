@@ -34,7 +34,7 @@ import {
   ProviderChainError,
   safeProviderChainMessage,
 } from "../../../packages/providers/src/index.ts";
-import { assessJob } from "../../../packages/matching/src/index.ts";
+import { assessJob, evaluateGates } from "../../../packages/matching/src/index.ts";
 import { decrypt, encrypt, equal } from "./security.ts";
 import { createExtensionAccess } from "./extension.ts";
 import { createAutomation } from "./automation.ts";
@@ -43,6 +43,7 @@ import {
   registerExtensionApplication,
 } from "./extension-application.ts";
 import { createBulkApplication } from "./bulk-application.ts";
+import { createBulkWorkflow } from "./bulk-workflow.ts";
 import {
   policySchema,
   providerSchema,
@@ -117,9 +118,23 @@ export async function createApp(o: AppOptions) {
   }
   function assessment(j: Job): Assessment | null {
     const r = resume();
-    return r
-      ? o.store.get("assessment:" + cacheKey(j, r, policy()), null)
-      : null;
+    if (!r) return null;
+    const saved = o.store.get<Assessment | null>("assessment:" + cacheKey(j, r, policy()), null);
+    if (!saved) return null;
+    // Refresh can only tighten an old assessment, never erase a stored failure
+    // or turn a missing/unknown assessment gate into permission to send.
+    const gates = [...saved.gates];
+    const severity = { pass: 0, unknown: 1, fail: 2 };
+    for (const current of evaluateGates(j, r, policy()).filter((gate) => gate.status !== "pass")) {
+      const index = gates.findIndex((gate) => gate.field === current.field);
+      if (index < 0) gates.push(current);
+      else if (severity[current.status] > severity[gates[index]!.status]) gates[index] = current;
+    }
+    const rejected = gates.filter((gate) => gate.status === "fail");
+    if (rejected.length) return { ...saved, gates, decision: "skip", reasons: rejected.map((gate) => gate.reason) };
+    if (saved.decision === "eligible" && gates.some((gate) => gate.status === "unknown"))
+      return { ...saved, gates, decision: "review", reasons: gates.filter((gate) => gate.status === "unknown").map((gate) => gate.reason) };
+    return { ...saved, gates };
   }
   async function scoreJob(id: string, signal?: AbortSignal) {
     const r = resume();
@@ -133,7 +148,7 @@ export async function createApp(o: AppOptions) {
       result = await assessJob(j, r, p, runtimeProviders(), { signal });
       if (!signal?.aborted) o.store.set("assessment:" + key, result);
     }
-    return result;
+    return assessment(j) ?? result;
   }
   const automation = createAutomation({
     store: o.store,
@@ -742,8 +757,29 @@ export async function createApp(o: AppOptions) {
     resume,
     configurationKey,
     status: extension.status,
+    workflowAllows: (application: Application): boolean => bulkWorkflow.permitsApplication(application),
   });
   bulk.register(app);
+  const bulkWorkflow = createBulkWorkflow({
+    store: o.store,
+    configurationKey: () => fingerprint({ application: configurationKey(), providers: getProviders(), embedding: getEmbedding() }),
+    messageTemplates: () => template().segments,
+    applications: () => o.store.applications(),
+    status: extension.status,
+    quota: (limit) => o.store.dailyQuota(new Date(), limit),
+    bulk: {
+      state: bulk.state,
+      preview: bulk.preview,
+      start: (previewId, insideTransaction) => bulk.start({ previewId }, insideTransaction),
+      control: (action, insideTransaction) => bulk.control({ action }, insideTransaction),
+    },
+    automation: {
+      state: automation.state,
+      start: (config) => ({ run: automation.start(config).run! }),
+      control: (body) => ({ run: automation.control(body).run! }),
+    },
+  });
+  bulkWorkflow.register(app);
   registerExtensionApplication(app, {
     store: o.store,
     attachmentsDir: o.attachmentsDir,
