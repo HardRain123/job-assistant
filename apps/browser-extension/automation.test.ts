@@ -224,6 +224,22 @@ test("同页缺字段时核验独立详情，保留完整雇主记录，拒绝�
     assert.equal(conflict.jobs[0].salaryText, "");
     assert.equal(conflict.jobs[0].industry, "");
     assert.equal(conflict.fieldReading.merge, "conflict");
+    for (const [inlineLocation, detailLocation, expected] of [
+      ["上海·闵行区", "上海", "上海·闵行区"],
+      ["上海", "上海·闵行区·虹桥", "上海·闵行区·虹桥"],
+      ["上海·闵行区·虹桥", "上海·闵行区", "上海·闵行区·虹桥"],
+      ["上海 · 闵行区", "上海", "上海 · 闵行区"],
+      ["上海·闵行区", "杭州", ""],
+      ["上海·闵行区", "上海·徐汇区", ""],
+      ["上海·杭州市", "上海", ""],
+      ["上海·闵行区·虹桥", "上海·闵行区·七宝", ""],
+      ["上海·闵行区", "上", ""],
+    ]) {
+      const locationResult = await run({ ...base, location: inlineLocation }, { ...detail, location: detailLocation });
+      assert.equal(locationResult.jobs[0].location, expected, `${inlineLocation} / ${detailLocation}`);
+      assert.equal(locationResult.fieldReading.finalLocation, Boolean(expected));
+      assert.equal(locationResult.fieldReading.merge, expected ? "merged" : "conflict");
+    }
     const wrongCompany = await run(base, { ...detail, company: "另一公司" });
     assert.equal(wrongCompany.outcome, "ok");
     assert.deepEqual(wrongCompany.jobs, [{ ...detail, company: "另一公司" }]);

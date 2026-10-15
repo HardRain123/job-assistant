@@ -3,7 +3,7 @@ import { inspectSplitSearch, clickAndReadSplitDetail } from "./split-page.mjs";
 import { runExtensionApplication } from "./application.mjs";
 
 const API_BASE = "http://127.0.0.1:3000";
-const VERSION = "0.4.9";
+const VERSION = "0.4.10";
 const STATE_KEY = "jobAssistantAutomationTabs";
 const DIAGNOSTIC_KEY = "jobAssistantAutomationDiagnostic";
 const ALARM = "job-assistant-automation-poll";
@@ -217,6 +217,22 @@ function strictImportPayload(jobs) {
     if (Array.isArray(job.companyAliases)) item.companyAliases = [...new Set(job.companyAliases.filter((name) => typeof name === "string" && name.trim() && name.trim().length <= 160).map((name) => name.trim()))].slice(0, 5);
     return item;
   }).filter((item) => item.url && item.title && item.company && item.description);
+}
+
+function mergeJobLocation(before, after) {
+  if (!before || !after || before === after) return before || after;
+  const parts = (value) => String(value).split(/[·•・]/).map((part) => part.trim());
+  const left = parts(before), right = parts(after);
+  const longer = left.length >= right.length ? left : right;
+  const shorter = left.length >= right.length ? right : left;
+  // The same bound job may show a city in its banner and city/district/area
+  // on the search card. Preserve the more precise address only for whole
+  // leading segments; different cities or districts remain a conflict.
+  if (longer.length < 2 || longer.length > 3 ||
+      !longer.every((part) => /^[\p{Script=Han}]{2,20}$/u.test(part)) ||
+      !/[区县]$/.test(longer[1]) ||
+      !shorter.every((part, index) => part === longer[index])) return "";
+  return left.length >= right.length ? before : after;
 }
 
 // These functions run in the page's isolated world. They only inspect rendered DOM
@@ -460,8 +476,9 @@ export async function execute(command, tokenValue) {
         for (const field of ["salaryText", "location", "industry", "experienceText", "education"]) {
           const before = base[field] || "";
           const after = detail[field] || "";
-          merged[field] = before && after && before !== after ? "" : before || after;
-          if (before && after && before !== after) fieldReading.merge = "conflict";
+          merged[field] = field === "location" ? mergeJobLocation(before, after)
+            : before && after && before !== after ? "" : before || after;
+          if (before && after && !merged[field]) fieldReading.merge = "conflict";
         }
         inlineFallback.job = merged;
         return reportInline();
