@@ -770,7 +770,7 @@ export async function createApp(o: AppOptions) {
     bulk: {
       state: bulk.state,
       preview: bulk.preview,
-      start: (previewId, insideTransaction) => bulk.start({ previewId }, insideTransaction),
+      start: (previewId, insideTransaction, inheritedJobFailures) => bulk.start({ previewId }, insideTransaction, inheritedJobFailures),
       control: (action, insideTransaction) => bulk.control({ action }, insideTransaction),
     },
     automation: {

@@ -31,7 +31,7 @@ async function waitFor<T>(read: () => Promise<T>, matches: (value: T) => boolean
 
 async function fixture() {
   const dir = mkdtempSync(join(tmpdir(), "bulk-workflow-real-"));
-  const store = new Store(join(dir, "db.sqlite"));
+  let store = new Store(join(dir, "db.sqlite"));
   const resume: Resume = { id: randomUUID(), name: "测试候选人", text: "Java Spring 后端开发及企业AI平台研发", skills: ["Java"], years: 7, attachmentName: null, createdAt: new Date().toISOString() };
   const policy = { ...DEFAULT_POLICY, cities: ["上海"], salaryMin: 16000, excludedCompanies: ["暖哇"], excludedIndustries: ["保险"] };
   // No request reaches this provider: the collection test seeds the exact
@@ -53,9 +53,9 @@ async function fixture() {
     seedScore(job);
     return job;
   };
-  const app = await createApp({ store, password: "password", key: "key", internalToken: "internal", dataDir: dir, attachmentsDir: join(dir, "attachments") });
+  let app = await createApp({ store, password: "password", key: "key", internalToken: "internal", dataDir: dir, attachmentsDir: join(dir, "attachments") });
   const login = await app.inject({ method: "POST", url: "/api/login", payload: { password: "password" } });
-  const cookie = String(login.headers["set-cookie"]).split(";")[0];
+  let cookie = String(login.headers["set-cookie"]).split(";")[0];
   const workbench = (url: string, payload?: Record<string, unknown>) => app.inject({ method: payload === undefined ? "GET" : "POST", url, headers: { cookie }, ...(payload === undefined ? {} : { payload }) });
   const code = (await workbench("/api/extension/pair-code", {})).json().code;
   const origin = `chrome-extension://${"a".repeat(32)}`;
@@ -87,12 +87,22 @@ async function fixture() {
     assert.equal(response.statusCode, 200, response.body);
     assert.equal(response.json().allowed, true);
   };
-  const result = async (task: any) => {
-    const response = await extension("/extension/v1/application/result", { taskId: task.id, leaseToken: task.leaseToken, applicationId: task.application.id });
+  const result = async (task: any, reason?: string) => {
+    const response = await extension("/extension/v1/application/result", { taskId: task.id, leaseToken: task.leaseToken, applicationId: task.application.id, ...(reason ? { reason } : {}) });
     assert.equal(response.statusCode, 200, response.body);
     return response;
   };
-  return { app, store, addJob, seedScore, workbench, extension, start, state, claim, action, authorize, result,
+  return { get app() { return app; }, get store() { return store; }, addJob, seedScore, workbench, extension, start, state, claim, action, authorize, result,
+    restart: async () => {
+      await app.close();
+      store.close();
+      store = new Store(join(dir, "db.sqlite"));
+      app = await createApp({ store, password: "password", key: "key", internalToken: "internal", dataDir: dir, attachmentsDir: join(dir, "attachments") });
+      const loggedIn = await app.inject({ method: "POST", url: "/api/login", payload: { password: "password" } });
+      cookie = String(loggedIn.headers["set-cookie"]).split(";")[0];
+      const status = await extension("/extension/v1/status");
+      assert.equal(status.statusCode, 200, status.body);
+    },
     close: async () => { await app.close(); store.close(); rmSync(dir, { recursive: true, force: true }); } };
 }
 
@@ -251,5 +261,101 @@ test("零候选真实采集回执入库，自动评分缓存后启动投递子�
     assert.equal(completed.counts.completed, 1);
     assert.equal(completed.budgetUsed, 1);
     assert.equal(f.store.applications().length, 1);
+  } finally { await f.close(); }
+});
+
+test("同一工作流跨三个单岗位子批次累计失败，SQLite 重启保留，人工继续才重置", async () => {
+  const f = await fixture();
+  const child = async () => (await f.workbench("/api/bulk-application")).json().run;
+  try {
+    f.addJob("跨批失败第一公司");
+    await f.start({ target: 4 });
+    for (let index = 0; index < 3; index++) {
+      const current = await child();
+      assert.equal(current.consecutiveJobFailures, index);
+      assert.equal(current.counts.queued, 1);
+      if (index === 1) {
+        // Simulate the deployed pre-inheritance schema: archived child 1 has
+        // one failure, while the newly created active child still starts at 0.
+        const legacyWorkflow = f.store.get<any>("bulkWorkflow.current", null);
+        delete legacyWorkflow.consecutiveJobFailures;
+        f.store.set("bulkWorkflow.current", legacyWorkflow);
+        const legacyChild = f.store.get<any>("bulk.current", null);
+        f.store.set("bulk.current", { ...legacyChild, consecutiveJobFailures: 0 });
+        await f.restart();
+        if (f.store.get<any>("bulkWorkflow.current", null).consecutiveJobFailures === undefined)
+          assert.equal(await f.claim(), null, "旧父批次迁移前不允许领取发送");
+        await waitFor(async () => f.store.get<any>("bulkWorkflow.current", null), (run) => run.consecutiveJobFailures === 1, "从旧归档恢复失败计数");
+        assert.equal((await child()).id, current.id);
+        assert.equal((await child()).consecutiveJobFailures, 1);
+        assert.equal(f.store.get<any>("bulkWorkflow.current", null).consecutiveJobFailures, 1);
+      }
+      const task = await f.claim();
+      assert.ok(task);
+      await f.action(task, 0, "started", "before-action");
+      await f.authorize(task, 0);
+      await f.action(task, 0, "unknown", "send-unconfirmed");
+      f.addJob(`跨批失败下一公司${index}`);
+      await f.result(task, "send-unconfirmed");
+      await f.result(task, "send-unconfirmed");
+      if (index < 2) {
+        await waitFor(f.state, (run) => run.counts.planned === index + 2, "下一单岗位子批次启动");
+        assert.notEqual((await child()).id, current.id);
+      }
+    }
+    const paused = await waitFor(f.state, (run) => run.state === "paused", "第三次连续失败暂停工作流");
+    assert.equal(paused.counts.planned, 3);
+    assert.equal(paused.counts.review, 3);
+    assert.equal((await child()).consecutiveJobFailures, 3);
+    assert.match((await child()).message, /连续 3 个岗位/);
+    assert.equal(f.store.get<any>("bulkWorkflow.current", null).consecutiveJobFailures, 3);
+    assert.equal(await f.claim(), null);
+    assert.equal(f.store.applications().length, 3);
+    assert.equal(f.store.dailyQuota().occupied, 3);
+    assert.ok(f.store.applications().every((application) =>
+      application.status === "needs-review" &&
+      application.actions[0].state === "unknown" &&
+      application.actions.slice(1).every((action) => action.state === "pending")));
+
+    const continued = await f.workbench("/api/bulk-workflow/control", { action: "resume" });
+    assert.equal(continued.statusCode, 200, continued.body);
+    await waitFor(f.state, (run) => run.counts.planned === 4, "人工继续后启动第四个岗位");
+    assert.equal((await child()).consecutiveJobFailures, 0);
+    const fourth = await f.claim();
+    await f.result(fourth, "page-unrecognized");
+    const completed = await waitFor(f.state, (run) => run.state === "completed", "第四个岗位单次失败保留核验并收尾");
+    assert.equal((await child()).consecutiveJobFailures, 1);
+    assert.equal(completed.counts.review, 4);
+  } finally { await f.close(); }
+});
+
+test("跨子批次失败期间有完整成功，后续连续失败从零重新累计", async () => {
+  const f = await fixture();
+  const child = async () => (await f.workbench("/api/bulk-application")).json().run;
+  try {
+    f.addJob("跨批成功重置第一公司");
+    await f.start({ target: 4 });
+    for (let index = 0; index < 4; index++) {
+      const task = await f.claim();
+      assert.ok(task);
+      if (index < 3) f.addJob(`跨批成功重置下一公司${index}`);
+      if (index === 1) {
+        assert.equal((await child()).consecutiveJobFailures, 1);
+        for (const actionIndex of [0, 1, 2]) {
+          await f.action(task, actionIndex, "started", "before-action");
+          await f.authorize(task, actionIndex);
+          await f.action(task, actionIndex, "confirmed", actionIndex === 0 ? "new-conversation" : "new-message");
+        }
+        await f.result(task);
+      } else await f.result(task, "recipient-mismatch");
+      if (index < 3) {
+        await waitFor(f.state, (run) => run.counts.planned === index + 2, "下一子批次继承更新的失败计数");
+        assert.equal((await child()).consecutiveJobFailures, index === 1 ? 0 : 1);
+      }
+    }
+    const completed = await waitFor(f.state, (run) => run.state === "completed", "中途成功后其余两次失败不触发三连败");
+    assert.equal(completed.counts.completed, 1);
+    assert.equal(completed.counts.review, 3);
+    assert.equal((await child()).consecutiveJobFailures, 2);
   } finally { await f.close(); }
 });

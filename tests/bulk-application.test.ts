@@ -235,6 +235,14 @@ test("bulk preview selects only eligible fresh gates, deduplicates companies and
       target: 151,
     });
     assert.equal(oversized.statusCode, 400);
+    const spoofedPreview = await f.workbench("/api/bulk-application/preview", {
+      ...config, consecutiveJobFailures: 2,
+    });
+    assert.equal(spoofedPreview.statusCode, 400);
+    const spoofedStart = await f.workbench("/api/bulk-application/start", {
+      previewId: p.previewId, inheritedJobFailures: 2,
+    });
+    assert.equal(spoofedStart.statusCode, 400);
   } finally {
     await f.close();
   }
@@ -268,6 +276,7 @@ test("bulk start freezes configuration and job content and enqueues atomically o
     assert.equal(f.store.applications().length, 0);
     const run = await f.start();
     assert.equal(run.counts.queued, 1);
+    assert.equal(run.consecutiveJobFailures, 0);
     assert.equal(
       (
         await f.workbench("/api/bulk-application/start", {

@@ -431,11 +431,13 @@ export function createBulkApplication(o: Options) {
       } satisfies Preview);
       return { previewId, expiresAt, applications, summary };
   };
-  const start = (body: unknown, insideTransaction = false) => {
+  const start = (body: unknown, insideTransaction = false, inheritedJobFailures = 0) => {
       const { previewId } = z
         .object({ previewId: z.string().uuid() })
         .strict()
         .parse(body);
+      // Internal workflow state only; the strict HTTP body cannot supply this.
+      const consecutiveJobFailures = z.number().int().min(0).max(2).parse(inheritedJobFailures);
       connection();
       idle();
       const create = () => {
@@ -475,6 +477,7 @@ export function createBulkApplication(o: Options) {
           id: randomUUID(),
           state: "running",
           ...preview.config,
+          consecutiveJobFailures,
           configurationKey: preview.configurationKey,
           message: "批量已创建，等待扩展依次发送话术。",
           createdAt: stamp,

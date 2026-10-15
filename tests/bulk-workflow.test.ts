@@ -18,7 +18,7 @@ const baseConfig = {
 };
 
 async function fixture(
-  options: { candidates?: number; maxRounds?: number } = {},
+  options: { candidates?: number; maxRounds?: number; applications?: Application[] } = {},
 ) {
   const store = new Store(":memory:");
   store.set("paused", false);
@@ -36,6 +36,7 @@ async function fixture(
   const starts = { bulk: 0, automation: 0 };
   const controls: string[] = [];
   const keywordStarts: string[] = [];
+  const failureSeeds: number[] = [];
   const mount = async () => {
     app = Fastify();
     app.setErrorHandler((error, _req, reply) => {
@@ -56,6 +57,7 @@ async function fixture(
         "您好，我对{{title}}感兴趣。",
         "我有相关经验，期待沟通。",
       ],
+      ...(options.applications ? { applications: () => options.applications! } : {}),
       status: () => ({
         paired: true,
         version: "1.0.0",
@@ -79,10 +81,11 @@ async function fixture(
             summary: { selected: previewCount },
           };
         },
-        start: (_previewId, insideTransaction) => {
+        start: (_previewId, insideTransaction, inheritedJobFailures = 0) => {
           assert.equal(insideTransaction, true);
           assert.equal(bulkCurrent?.state === "running", false);
           starts.bulk++;
+          failureSeeds.push(inheritedJobFailures);
           candidateCount = Math.max(0, candidateCount - previewCount);
           bulkCurrent = {
             id: `bulk-${starts.bulk}`,
@@ -90,6 +93,7 @@ async function fixture(
             target: previewCount,
             dailyLimit: 150,
             intervalSeconds: 30,
+            consecutiveJobFailures: inheritedJobFailures,
             message: "running",
             createdAt: new Date(now).toISOString(),
             updatedAt: new Date(now).toISOString(),
@@ -110,6 +114,7 @@ async function fixture(
           controls.push(`bulk:${action}:${bulkCurrent.id}`);
           bulkCurrent = {
             ...bulkCurrent,
+            consecutiveJobFailures: action === "resume" ? 0 : bulkCurrent.consecutiveJobFailures,
             state:
               action === "cancel"
                 ? "cancelled"
@@ -188,12 +193,13 @@ async function fixture(
     starts,
     controls,
     keywordStarts,
+    failureSeeds,
     pump: () => workflow.pump(),
     restart: async () => {
       await app.close();
       await mount();
     },
-    finishBulk: (counts: Partial<BulkRun["counts"]> = {}) => {
+    finishBulk: (counts: Partial<BulkRun["counts"]> = {}, consecutiveJobFailures = 0) => {
       assert.ok(bulkCurrent);
       const planned =
         bulkCurrent!.counts.queued +
@@ -202,6 +208,7 @@ async function fixture(
       bulkCurrent = {
         ...bulkCurrent!,
         state: "completed",
+        consecutiveJobFailures,
         counts: {
           ...bulkCurrent!.counts,
           queued: 0,
@@ -459,4 +466,93 @@ test("子批次刚刚完成时取消工作流，不再调用已完成子批次�
     assert.equal(result.json().run.state, "cancelled");
     assert.deepEqual(f.controls, []);
   } finally { await f.close(); }
+});
+
+test("人工继续恰好已完成的失败子批次，其旧计数不会覆盖工作流的显式重置", async () => {
+  const f = await fixture({ candidates: 1 });
+  try {
+    await f.start({ target: 3 });
+    f.finishBulk({ completed: 0, review: 1 }, 1);
+    const paused = await f.request("/api/bulk-workflow/control", { action: "pause" });
+    assert.equal(paused.statusCode, 200, paused.body);
+    const resumed = await f.request("/api/bulk-workflow/control", { action: "resume" });
+    assert.equal(resumed.statusCode, 200, resumed.body);
+    await f.pump();
+    assert.equal((await f.state()).phase, "collecting");
+    assert.equal(f.store.get<any>("bulkWorkflow.current", null).consecutiveJobFailures, 0);
+    f.finishAutomation(1, 1);
+    await f.pump();
+    assert.deepEqual(f.failureSeeds, [0, 0]);
+    assert.equal(f.starts.bulk, 2);
+  } finally { await f.close(); }
+});
+
+test("旧父批次在补采期间从已完成子批次归档恢复失败次数，成功归档会重置", async () => {
+  for (const hadSuccess of [false, true]) {
+    const f = await fixture();
+    try {
+      await f.start({ target: 3 });
+      const run = f.store.get<any>("bulkWorkflow.current", null);
+      delete run.consecutiveJobFailures;
+      run.childTotals = [{ bulkId: "legacy-child", planned: 1, completed: hadSuccess ? 1 : 0, review: hadSuccess ? 0 : 1, skipped: 0 }];
+      run.counts.planned = 1;
+      f.store.set("bulkWorkflow.current", run);
+      f.store.set("bulk.history:legacy-child", {
+        id: "legacy-child", state: "completed", consecutiveJobFailures: hadSuccess ? 0 : 1,
+        counts: { completed: hadSuccess ? 1 : 0, review: hadSuccess ? 0 : 1 },
+      });
+      await f.restart();
+      await f.pump();
+      assert.equal(f.store.get<any>("bulkWorkflow.current", null).consecutiveJobFailures, hadSuccess ? 0 : 1);
+      f.finishAutomation(1, 1);
+      await f.pump();
+      assert.deepEqual(f.failureSeeds, [hadSuccess ? 0 : 1]);
+    } finally { await f.close(); }
+  }
+});
+
+test("旧父批次合并三个独立失败归档后立即暂停，不会新建第四个发送子批次", async () => {
+  const f = await fixture();
+  try {
+    await f.start({ target: 5 });
+    const run = f.store.get<any>("bulkWorkflow.current", null);
+    delete run.consecutiveJobFailures;
+    run.childTotals = Array.from({ length: 3 }, (_, index) => ({ bulkId: `legacy-failed-${index}`, planned: 1, completed: 0, review: 1, skipped: 0 }));
+    run.counts.planned = 3;
+    for (const child of run.childTotals) f.store.set(`bulk.history:${child.bulkId}`, {
+      id: child.bulkId, state: "completed", consecutiveJobFailures: 1,
+      counts: { completed: 0, review: 1 },
+    });
+    f.store.set("bulkWorkflow.current", run);
+    await f.pump();
+    assert.equal((await f.state()).state, "paused");
+    assert.equal(f.store.get<any>("bulkWorkflow.current", null).consecutiveJobFailures, 3);
+    assert.equal(f.starts.bulk, 0);
+    assert.match((await f.state()).message, /连续 3 个岗位/);
+  } finally { await f.close(); }
+});
+
+test("缺少旧归档时按持久化应用动作恢复；缺少结果先后证据则暂停而非猜零", async () => {
+  for (const ambiguous of [false, true]) {
+    const applications = [{ id: "legacy-app-failed", bulkRunId: "legacy-child", status: "needs-review", stopReason: "send-unconfirmed", actions: ambiguous ? [] : [{ id: "native", state: "unknown", updatedAt: "2026-10-15T01:00:00Z" }] }] as Application[];
+    if (ambiguous) applications.push({ id: "legacy-app-success", bulkRunId: "legacy-child", status: "completed", actions: [] } as unknown as Application);
+    const f = await fixture({ applications });
+    try {
+      await f.start({ target: 3 });
+      const run = f.store.get<any>("bulkWorkflow.current", null);
+      delete run.consecutiveJobFailures;
+      run.childTotals = [{ bulkId: "legacy-child", planned: ambiguous ? 2 : 1, completed: ambiguous ? 1 : 0, review: 1, skipped: 0 }];
+      run.counts.planned = ambiguous ? 2 : 1;
+      f.store.set("bulkWorkflow.current", run);
+      await f.pump();
+      if (ambiguous) {
+        assert.equal((await f.state()).state, "paused");
+        assert.match((await f.state()).message, /无法完整还原/);
+        assert.equal(f.store.get<any>("bulkWorkflow.current", null).consecutiveJobFailures, undefined);
+      } else {
+        assert.equal((await f.state()).state, "running");
+        assert.equal(f.store.get<any>("bulkWorkflow.current", null).consecutiveJobFailures, 1);
+      }
+    } finally { await f.close(); }
+  }
 });

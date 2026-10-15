@@ -56,7 +56,7 @@ export interface BulkWorkflowPorts {
       intervalSeconds: number;
       continueOnJobFailure: boolean;
     }) => BulkPreview;
-    start: (previewId: string, insideTransaction?: boolean) => { run: BulkRun };
+    start: (previewId: string, insideTransaction?: boolean, inheritedJobFailures?: number) => { run: BulkRun };
     control: (
       action: "pause" | "resume" | "cancel",
       insideTransaction?: boolean,
@@ -97,6 +97,8 @@ type InternalRun = {
   updatedAt: string;
   rounds: number;
   noGrowthRounds: number;
+  consecutiveJobFailures?: number;
+  resetFailureStreakChildId?: string;
   budgetUsed: number;
   counts: {
     planned: number;
@@ -193,6 +195,54 @@ export function createBulkWorkflow(o: BulkWorkflowPorts) {
       save(run);
     });
   };
+  const restoreLegacyFailureStreak = (run: InternalRun): boolean => {
+    if (run.consecutiveJobFailures !== undefined) {
+      if (Number.isInteger(run.consecutiveJobFailures) && run.consecutiveJobFailures >= 0) return true;
+      pause(run, "批次的连续失败计数需要核对，已暂停；请检查后手动继续。");
+      return false;
+    }
+    type LegacyChild = BulkRun & { acknowledgedReviewIds?: string[]; isolatedReviewIds?: string[] };
+    try {
+      let streak = 0;
+      const current = o.store.get<LegacyChild | null>("bulk.current", null);
+      if (run.childTotals.some((child) => !child.bulkId && child.planned > 0)) throw new Error("missing-child-identity");
+      const ids = [...new Set([...run.childTotals.map((child) => child.bulkId), run.childBulkId].filter((id): id is string => Boolean(id)))];
+      for (const id of ids) {
+        const child = current?.id === id ? current : o.store.get<LegacyChild | null>(`bulk.history:${id}`, null);
+        if (child && Number.isInteger(child.consecutiveJobFailures) && child.consecutiveJobFailures! >= 0) {
+          const localFailures = child.isolatedReviewIds?.length ?? child.counts.review;
+          const reset = child.counts.completed > 0 || child.acknowledgedReviewIds !== undefined || child.consecutiveJobFailures! < localFailures;
+          streak = reset ? child.consecutiveJobFailures! : streak + child.consecutiveJobFailures!;
+          continue;
+        }
+        // Older archives may lack the counter. Uniform persisted outcomes are
+        // unambiguous; mixed success/failure order needs manual review.
+        const applications = o.applications?.().filter((application) => application.bulkRunId === id) ?? [];
+        if (!applications.length) throw new Error("missing-child-history");
+        const outcomes = applications.filter((application) =>
+          application.status === "completed" || ["needs-review", "failed"].includes(application.status));
+        const hasSuccess = outcomes.some((application) => application.status === "completed");
+        const hasFailure = outcomes.some((application) => application.status !== "completed");
+        if (hasSuccess && hasFailure) throw new Error("ambiguous-outcome-order");
+        for (const application of outcomes) {
+          if (application.status === "completed") streak = 0;
+          else if (["recipient-mismatch", "page-unrecognized", "send-unconfirmed", "attachment-pending"].includes(application.stopReason ?? "")) streak++;
+          else throw new Error("unclassified-legacy-outcome");
+        }
+      }
+      o.store.transaction(() => {
+        run.consecutiveJobFailures = streak;
+        if (run.childBulkId && current?.id === run.childBulkId)
+          o.store.set("bulk.current", { ...current, consecutiveJobFailures: streak });
+        save(run);
+        o.store.audit("bulkWorkflow.failure-streak-restored", { id: run.id, consecutiveJobFailures: streak });
+      });
+      return true;
+    } catch {
+      pause(run, "旧批次的连续失败记录无法完整还原，已暂停；请核对历史结果后手动继续，未知发送不会重试。");
+      return false;
+    }
+  };
   const globalBlock = (dailyLimit: number, currentBulk = false): string | null => {
     if (o.store.get("paused", false))
       return "工作台队列已暂停，请恢复队列后继续。";
@@ -247,12 +297,13 @@ export function createBulkWorkflow(o: BulkWorkflowPorts) {
       const latest = load();
       if (!latest || latest.id !== run.id || latest.state !== "running")
         throw new Error("批次已暂停或结束");
-      const started = o.bulk.start(preview.previewId, true).run;
+      const started = o.bulk.start(preview.previewId, true, latest.consecutiveJobFailures ?? 0).run;
       latest.childBulkId = started.id;
       latest.childAutomationId = null;
       latest.currentPreviewId = null;
       latest.phase = "sending";
       latest.noGrowthRounds = 0;
+      delete latest.resetFailureStreakChildId;
       latest.counts.planned += started.counts.queued + started.counts.running;
       latest.counts.queued = started.counts.queued + started.counts.running;
       latest.message =
@@ -303,6 +354,10 @@ export function createBulkWorkflow(o: BulkWorkflowPorts) {
     });
   };
   const refreshCounts = (run: InternalRun, bulk: BulkRun) => {
+    // Each child starts with this workflow's streak, so its persisted value is
+    // authoritative unless the user reset it after that child had finished.
+    run.consecutiveJobFailures = run.resetFailureStreakChildId === bulk.id
+      ? 0 : bulk.consecutiveJobFailures ?? 0;
     const old = run.childTotals.reduce(
       (a, b) => ({
         planned: a.planned + b.planned,
@@ -323,6 +378,11 @@ export function createBulkWorkflow(o: BulkWorkflowPorts) {
   function pumpOne() {
     const run = load();
     if (!run || run.state !== "running") return;
+    if (!restoreLegacyFailureStreak(run)) return;
+    if ((run.consecutiveJobFailures ?? 0) >= 3) {
+      pause(run, "连续 3 个岗位需要核对，工作流已暂停；请检查后手动继续，未知发送不会重试。");
+      return;
+    }
     if (!guard(run)) return;
     if (!childOwned(run)) {
       pause(run, "当前子任务已被替换或接管；为避免控制无关任务，批次已暂停。");
@@ -570,6 +630,7 @@ export function createBulkWorkflow(o: BulkWorkflowPorts) {
         updatedAt: stamp(now),
         rounds: 0,
         noGrowthRounds: 0,
+        consecutiveJobFailures: 0,
         budgetUsed: 0,
         counts: { planned: 0, completed: 0, review: 0, skipped: 0, queued: 0 },
         configurationKey: preview.configurationKey,
@@ -662,11 +723,13 @@ export function createBulkWorkflow(o: BulkWorkflowPorts) {
         o.store.transaction(() => {
           run.manualPaused = false;
           run.state = "running";
+          run.consecutiveJobFailures = 0;
           if (run.childBulkId) {
             const child = o.bulk.state();
             if (child?.id !== run.childBulkId)
               throw new Error("投递子任务已被替换，不能继续");
-            if (child.state === "paused") o.bulk.control("resume", true);
+            if (["running", "paused"].includes(child.state)) o.bulk.control("resume", true);
+            else if (child.state === "completed") run.resetFailureStreakChildId = child.id;
           }
           if (run.childAutomationId) {
             const child = o.automation.state();
@@ -700,6 +763,7 @@ export function createBulkWorkflow(o: BulkWorkflowPorts) {
     if (!run.childBulkId || run.childBulkId !== application.bulkRunId)
       return !["running", "paused"].includes(run.state);
     return run.state === "running" && !run.manualPaused &&
+      run.consecutiveJobFailures !== undefined && run.consecutiveJobFailures < 3 &&
       run.configurationKey === o.configurationKey() &&
       run.shanghaiDay === o.quota(run.config.dailyLimit).date &&
       !globalBlock(run.config.dailyLimit, true);
