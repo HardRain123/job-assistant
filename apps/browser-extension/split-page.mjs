@@ -1,4 +1,110 @@
 // Standalone functions for chrome.scripting.executeScript: each carries its helpers.
+// Read-only, bounded structural evidence. Until an actual search page identifies
+// its continuation mechanism, never guess which element should be scrolled.
+export function inspectSearchContinuation(expectedUrl) {
+  try {
+    const actual = new URL(location.href);
+    const expected = new URL(expectedUrl);
+    if ([actual, expected].some((url) => url.origin !== "https://www.zhipin.com" || url.username || url.password || !/^\/web\/geek\/jobs?\/?$/.test(url.pathname)) ||
+      !expected.searchParams.get("query") || !expected.searchParams.get("city") ||
+      actual.searchParams.get("query") !== expected.searchParams.get("query") ||
+      actual.searchParams.get("city") !== expected.searchParams.get("city")) return null;
+  } catch { return null; }
+  const visible = (node) => {
+    if (!node?.isConnected || !node.getClientRects().length) return false;
+    for (let part = node, depth = 0; part?.nodeType === 1; part = part.parentElement) {
+      if (++depth > 64) return false;
+      const style = getComputedStyle(part);
+      if (style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse") return false;
+    }
+    return true;
+  };
+  const blocked = [".login-dialog form", ".login-box form", "[class*='login-dialog'] form", "form:has(input[type='password'])",
+    "iframe[src*='captcha']", "iframe[src*='verify']", ".geetest_panel", ".verify-dialog", "[class*='captcha-dialog']", "[class*='verify-dialog']"];
+  if (blocked.some((selector) => [...document.querySelectorAll(selector)].slice(0, 100).some(visible))) return null;
+  let truncated = false;
+  const bounded = (selector, root = document, limit = 100) => {
+    const found = root.querySelectorAll(selector);
+    if (found.length > limit) truncated = true;
+    return [...found].slice(0, limit);
+  };
+  const count = (value) => { if (value > 100) truncated = true; return Math.min(value, 100); };
+  const integer = (value) => {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return 0;
+    if (number > 10_000_000) truncated = true;
+    return Math.max(0, Math.min(10_000_000, Math.round(number)));
+  };
+  const canonical = (href) => {
+    try {
+      const url = new URL(href, location.href);
+      return url.origin === "https://www.zhipin.com" && !url.username && !url.password && /^\/job_detail\/[\w-]+\.html$/.test(url.pathname) ? url.origin + url.pathname : "";
+    } catch { return ""; }
+  };
+  const links = new Set();
+  for (const link of bounded("a[href*='/job_detail/']")) {
+    const rendered = visible(link) || (link?.isConnected && getComputedStyle(link).display === "contents" && bounded("*", link, 10).some(visible));
+    if (rendered && canonical(link.href)) links.add(canonical(link.href));
+  }
+  const controls = new Map();
+  const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
+  for (const node of bounded("button, a", document, 250)) {
+    if (/^(下一页|下页|Next)$/i.test(clean(node.innerText || node.getAttribute("aria-label") || node.title))) controls.set(node, node);
+  }
+  for (const icon of bounded(".ui-icon-arrow-right")) {
+    const control = icon.closest("a, button, li") || icon.parentElement;
+    if (control && !controls.has(control)) controls.set(control, icon);
+  }
+  const disabled = (node) => {
+    for (let part = node, depth = 0; part?.nodeType === 1 && depth <= 12; part = part.parentElement, depth++) {
+      if (part.disabled || part.getAttribute("aria-disabled") === "true" || part.classList.contains("disabled")) return true;
+    }
+    return false;
+  };
+  const shown = [...controls].filter(([control, source]) => visible(control) && visible(source));
+  const available = shown.filter(([control, source]) => !disabled(control) && !disabled(source));
+  const paginationTruncated = controls.size > 100 || document.querySelectorAll("button, a").length > 250 || document.querySelectorAll(".ui-icon-arrow-right").length > 100;
+  const listNodes = bounded(".job-list-container, .job-list-box");
+  const visibleLists = listNodes.filter(visible);
+  const containers = [];
+  const measured = new Set();
+  const addContainer = (node, kind, depth) => {
+    if (!node || measured.has(node)) return;
+    measured.add(node);
+    if (containers.length >= 6) { truncated = true; return; }
+    const clientHeight = integer(node.clientHeight), scrollHeight = integer(node.scrollHeight), scrollTop = integer(node.scrollTop);
+    const remaining = integer(Math.max(0, scrollHeight - clientHeight - scrollTop));
+    const overflow = getComputedStyle(node).overflowY;
+    containers.push({ kind, depth, clientHeight, scrollHeight, scrollTop, remaining,
+      canScroll: clientHeight > 0 && scrollHeight > clientHeight + 2 && (kind === "document" || /^(auto|scroll)$/.test(overflow)),
+      atEnd: remaining <= 2 });
+  };
+  for (const list of visibleLists) {
+    // Only inspect ancestors of the known list containing recognizable cards.
+    const cards = bounded(".job-card-box, .job-card-wrap", list, 60);
+    const bound = cards.some((card) => visible(card) && bounded("a[href*='/job_detail/']", card, 5).some((link) => {
+      // display:contents anchors have no box but can own a rendered title.
+      return canonical(link.href) && (visible(link) || (getComputedStyle(link).display === "contents" && bounded("*", link, 10).some(visible)));
+    }));
+    if (!bound) continue;
+    addContainer(list, "list", 0);
+    let part = list.parentElement;
+    for (let depth = 1; part && depth <= 12; part = part.parentElement, depth++) {
+      if (part === document.scrollingElement) break;
+      if (visible(part) && /^(auto|scroll|hidden|clip)$/.test(getComputedStyle(part).overflowY)) addContainer(part, "ancestor", depth);
+      if (depth === 12 && part.parentElement && part.parentElement !== document.scrollingElement) truncated = true;
+    }
+    if (visible(document.scrollingElement)) addContainer(document.scrollingElement, "document", 0);
+  }
+  return {
+    version: 1, linkCount: count(links.size),
+    pagination: { matched: count(controls.size), visible: count(shown.length), enabled: count(available.length),
+      disabled: count(shown.length - available.length), ambiguous: available.length > 1, truncated: paginationTruncated },
+    lists: { matched: count(listNodes.length), visible: count(visibleLists.length), truncated: document.querySelectorAll(".job-list-container, .job-list-box").length > 100 },
+    scrollContainers: containers, truncated,
+  };
+}
+
 export function inspectSplitSearch() {
   if (new URL(location.href).origin !== "https://www.zhipin.com" || !/^\/web\/geek\/jobs?\/?$/.test(location.pathname))
     return { recognized: false, links: [], signature: "", hasNext: false, empty: false, readyState: document.readyState, pageUrl: location.href };

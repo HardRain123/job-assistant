@@ -201,6 +201,7 @@ export async function applicationPageStep(request) {
       ".message-item, .chat-message, .chat-message-list, .message-list, .chat-record, .user-list, .chat-user-list, .friend-list",
     );
   const semanticProbes = [];
+  const diagnosticHeaders = new Map();
   const bindConversation = (root, editor, header, probe) => {
     // This bounded, visible header stays in the extension worker's memory only.
     // A changed recruiter/header invalidates all subsequent actions.
@@ -260,7 +261,7 @@ export async function applicationPageStep(request) {
       probe[key] = Math.min(20, Math.max(probe[key], value));
     };
     if (
-      canonical(request.conversationOrigin) !== canonical(job.url) ||
+      (request.mode !== "diagnose" && canonical(request.conversationOrigin) !== canonical(job.url)) ||
       !clean(job.location) ||
       !Number.isFinite(job.salaryMin) ||
       !Number.isFinite(job.salaryMax)
@@ -375,6 +376,33 @@ export async function applicationPageStep(request) {
       const employer = header.filter((node) =>
         companies.includes(normCompany(text(node))),
       );
+      if (request.mode === "diagnose") {
+        // A separate read-only task can explain a header without claiming that
+        // navigation or a send was verified. Read only the four-field-matched
+        // editor pane's public Name / Employer / Role row, never chat history.
+        if (employer.length !== 1) continue;
+        const companyBox = employer[0].getBoundingClientRect();
+        const candidates = nodes(root, headerFields).filter((node) => {
+          const value = text(node);
+          if (!outsideChatHistory(node) || !value || value.length > 48 ||
+              /[\p{Cc}\p{Cf}<>]/u.test(value) || node === employer[0] ||
+              companies.includes(normCompany(value))) return false;
+          const box = node.getBoundingClientRect();
+          return box.left >= rr.left && box.right <= rr.right &&
+            box.top >= cr.top - 100 && box.bottom <= cr.top + 4 &&
+            Math.abs((box.top + box.bottom - companyBox.top - companyBox.bottom) / 2) <= 12;
+        });
+        const innermost = candidates.filter((node) => !candidates.some((other) =>
+          node !== other && node.contains(other) && text(node) === text(other)));
+        const labels = (side) => [...new Set(innermost.filter((node) => {
+          const box = node.getBoundingClientRect();
+          return side === "name" ? box.right <= companyBox.left + 4
+            : box.left >= companyBox.right - 4;
+        }).map(text))].slice(0, 3);
+        const evidence = { names: labels("name"), roles: labels("role") };
+        diagnosticHeaders.set(JSON.stringify(evidence), evidence);
+        continue;
+      }
       // A plain name needs the full Name / exact Employer / recruiting Role row.
       // Do not accept arbitrary header text or online/activity labels as names.
       const roles = header.filter((node) =>
@@ -453,6 +481,7 @@ export async function applicationPageStep(request) {
         break;
       const semantic = semanticHeader(root, editor, depth);
       if (semantic) return semantic;
+      if (request.mode === "diagnose") continue;
       const outsideHistory = (node) =>
         !node.closest(
           ".message-item, .user-list, .chat-user-list, .friend-list",
@@ -726,6 +755,13 @@ export async function applicationPageStep(request) {
       failed,
     };
   };
+  if (request.mode === "diagnose") {
+    conversation();
+    const headers = [...diagnosticHeaders.values()];
+    return headers.length === 1
+      ? { outcome: "observed", headerEvidence: headers[0] }
+      : { outcome: headers.length > 1 ? "ambiguous" : "not-found" };
+  }
   if (request.mode === "inspect") {
     const control = contactControl();
     if (control)

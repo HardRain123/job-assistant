@@ -12,6 +12,61 @@ const url = (id: string) => `https://www.zhipin.com/job_detail/${id}.html`;
 const job = (id: string) => ({ url: url(id), title: "工程师", company: "公司", description: "完整岗位要求", detail: true });
 const config = { keywords: ["前端", "后端"], city: "上海", maxJobs: 10, maxPages: 2, autoAssess: false, intervalSeconds: 3 };
 
+const searchDiagnostic = {
+  version: 1, linkCount: 15,
+  pagination: { matched: 1, visible: 1, enabled: 0, disabled: 1, ambiguous: false, truncated: false },
+  lists: { matched: 1, visible: 1, truncated: false },
+  scrollContainers: [{ kind: "list", depth: 0, clientHeight: 800, scrollHeight: 2400, scrollTop: 0, remaining: 1600, canScroll: true, atEnd: false }],
+  truncated: false,
+};
+test("首屏没有翻页入口时保留有界列表诊断，重复和重启不丢失且不改变岗位事实", async () => {
+  const f = await fixture();
+  try {
+    await f.start();
+    const search = await f.claim();
+    const payload = { links: [url("diagnostic-job")], hasNext: false, searchDiagnostic };
+    assert.equal((await f.result(search, payload)).statusCode, 200);
+    assert.equal((await f.result(search, payload)).statusCode, 200);
+    await f.restart();
+    const run = await f.state();
+    assert.equal(run.searchReadings.length, 1);
+    assert.equal(run.searchReadings[0].page, 1);
+    assert.deepEqual(run.searchReadings[0].diagnostic, searchDiagnostic);
+    assert.equal(run.discovered, 1);
+    assert.equal(f.store.applications().length, 0);
+    const detail = await f.claim();
+    assert.equal((await f.result(detail, { jobs: [job("diagnostic-job")], searchDiagnostic })).statusCode, 400);
+    assert.equal((await f.result(detail, { jobs: [job("diagnostic-job")] })).statusCode, 200);
+    assert.equal(JSON.stringify(f.store.jobs()).includes("scrollContainers"), false);
+  } finally { await f.close(); }
+});
+test("列表诊断拒绝越界、任意内容、错误来源和验证页，不消耗有效命令", async () => {
+  const f = await fixture();
+  try {
+    await f.start();
+    const search = await f.claim();
+    for (const invalid of [
+      { ...searchDiagnostic, html: "private" },
+      { ...searchDiagnostic, linkCount: 101 },
+      { ...searchDiagnostic, pagination: { ...searchDiagnostic.pagination, label: "private" } },
+      { ...searchDiagnostic, scrollContainers: Array(7).fill(searchDiagnostic.scrollContainers[0]) },
+      { ...searchDiagnostic, scrollContainers: [{ ...searchDiagnostic.scrollContainers[0], scrollTop: -1 }] },
+      { ...searchDiagnostic, scrollContainers: [{ ...searchDiagnostic.scrollContainers[0], scrollHeight: 10000001 }] },
+      { ...searchDiagnostic, scrollContainers: [{ ...searchDiagnostic.scrollContainers[0], kind: "private" }] },
+    ]) assert.equal((await f.result(search, { links: [], hasNext: false, searchDiagnostic: invalid })).statusCode, 400);
+    for (const wrongUrl of [search.url.replace("city=101020100", "city=101010100"), "https://evil.example/web/geek/jobs"]) {
+      assert.equal((await f.result(search, { links: [], hasNext: false, searchDiagnostic, url: wrongUrl })).statusCode, 400);
+    }
+    assert.equal((await f.result(search, { outcome: "blocked", reason: "verification-required", searchDiagnostic })).statusCode, 400);
+    assert.equal((await f.state()).searchReadings.length, 0);
+    const accepted = await f.result(search, { outcome: "error", reason: "page-unrecognized", diagnostic: { stage: "reading-page", code: "dom-unrecognized" }, searchDiagnostic });
+    assert.equal(accepted.statusCode, 200, accepted.body);
+    assert.equal((await f.state()).searchReadings.length, 1);
+    assert.equal(f.store.jobs().length, 0);
+    assert.equal(f.store.applications().length, 0);
+  } finally { await f.close(); }
+});
+
 test("批量候选可采集至300个，超界请求被拒绝且不启动投递", async () => {
   const f = await fixture();
   try {

@@ -201,6 +201,54 @@ function row(value: string, sent = true) {
     ".status, .message-status, .read-status": sent ? [element("已发送")] : [],
   });
 }
+
+test("read-only chat diagnosis explains an unmatched name only inside the exact job header without sending", async () => {
+  const f = semanticChatFixture();
+  f.recruiter.innerText = "Alex（招聘）";
+  f.recruiter.children = [element()];
+  const role = element("技术负责人");
+  role.parentElement = f.root;
+  role.getBoundingClientRect = () => ({ left: 630, right: 730, top: 140, bottom: 170 });
+  f.allFields.push(role);
+  let effects = 0;
+  f.button.click = () => effects++;
+  f.editor.focus = () => effects++;
+  const result = await runPage(f.document, { mode: "diagnose", authorization: null });
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), {
+    outcome: "observed", headerEvidence: { names: ["Alex（招聘）"], roles: ["技术负责人"] },
+  });
+  assert.equal(effects, 0);
+  assert.equal(f.editor.innerText, "");
+  assert.equal(result.conversationBinding, undefined);
+  const ordinary = await runPage(f.document, { mode: "inspect", conversationOrigin: job.url });
+  assert.equal(ordinary.ok, false, "diagnostic names do not broaden sending eligibility");
+  assert.equal(JSON.stringify(ordinary).includes("Alex"), false, "ordinary failure remains counts only");
+});
+
+test("read-only header evidence excludes wrong jobs, history, hidden fields and oversized labels", async () => {
+  for (const scenario of ["title", "city", "salary", "employer", "link", "history", "hidden", "oversized", "markup"]) {
+    const f = semanticChatFixture();
+    f.recruiter.innerText = "诊断测试姓名";
+    if (scenario === "title") f.title.innerText = "另一个岗位";
+    if (scenario === "city") f.city.innerText = "北京";
+    if (scenario === "salary") f.salary.innerText = "1-2K";
+    if (scenario === "employer") f.employer.innerText = "另一公司";
+    if (scenario === "link") {
+      const link = element("职位");
+      link.href = "https://www.zhipin.com/job_detail/different.html";
+      f.links.push(link);
+    }
+    if (scenario === "history") f.recruiter.closest = () => element("历史消息");
+    if (scenario === "hidden") f.recruiter.getClientRects = () => [];
+    if (scenario === "oversized") f.recruiter.innerText = "密".repeat(49);
+    if (scenario === "markup") f.recruiter.innerText = "<秘密>";
+    const result = await runPage(f.document, { mode: "diagnose" });
+    assert.equal(JSON.stringify(result).includes("诊断测试姓名"), false, scenario);
+    if (["title", "city", "salary", "employer", "link"].includes(scenario))
+      assert.equal(result.outcome, "not-found", scenario);
+    else assert.equal(result.headerEvidence?.names.length, 0, scenario);
+  }
+});
 async function runPage(
   document: any,
   request: any,

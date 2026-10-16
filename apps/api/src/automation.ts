@@ -45,6 +45,7 @@ interface Run {
   unreadableJobs?: { url: string; reason: string }[];
   unreadableSearches?: { url: string; reason: string }[];
   fieldReadings?: { url: string; reading: z.infer<typeof fieldReadingSchema>; message: string; evidence?: z.infer<typeof pageEvidenceSchema> }[];
+  searchReadings?: { url: string; page: number; diagnostic: z.infer<typeof searchDiagnosticSchema> }[];
   consecutiveUnreadable?: number;
   eligible: number;
   review: number;
@@ -178,6 +179,20 @@ function fieldReadingMessage(value: z.infer<typeof fieldReadingSchema>) {
   const missing = [!value.finalSalary && "薪资", !value.finalLocation && "地点", !value.finalIndustry && "行业"].filter(Boolean);
   return [route, merge, salary, industry, value.location === "missing" ? "未识别地点" : "", missing.length ? `入库仍缺：${missing.join("、")}` : "入库字段齐全（薪资金额仍需解析）"].filter(Boolean).join("；");
 }
+const searchCount = z.number().int().min(0).max(100);
+const searchSize = z.number().int().min(0).max(10_000_000);
+const searchDiagnosticSchema = z.object({
+  version: z.literal(1),
+  linkCount: searchCount,
+  pagination: z.object({ matched: searchCount, visible: searchCount, enabled: searchCount, disabled: searchCount, ambiguous: z.boolean(), truncated: z.boolean() }).strict(),
+  lists: z.object({ matched: searchCount, visible: searchCount, truncated: z.boolean() }).strict(),
+  scrollContainers: z.array(z.object({
+    kind: z.enum(["list", "ancestor", "document"]), depth: z.number().int().min(0).max(12),
+    clientHeight: searchSize, scrollHeight: searchSize, scrollTop: searchSize, remaining: searchSize,
+    canScroll: z.boolean(), atEnd: z.boolean(),
+  }).strict()).max(6),
+  truncated: z.boolean(),
+}).strict();
 const resultSchema = z
   .object({
     commandId: z.string().uuid(),
@@ -202,6 +217,7 @@ const resultSchema = z
     diagnostic: diagnosticSchema.optional(),
     fieldReading: fieldReadingSchema.optional(),
     pageEvidence: pageEvidenceSchema.optional(),
+    searchDiagnostic: searchDiagnosticSchema.optional(),
     detailContext: z.object({
       jobUrl: z.string().max(2000),
       title: z.string().trim().min(1).max(500),
@@ -233,6 +249,7 @@ export function createAutomation(o: Options) {
       unreadableJobs: r.unreadableJobs ?? [],
       unreadableSearches: r.unreadableSearches ?? [],
       fieldReadings: r.fieldReadings ?? [],
+      searchReadings: r.searchReadings ?? [],
       eligible: r.eligible,
       review: r.review,
       skipped: r.skipped,
@@ -358,6 +375,18 @@ export function createAutomation(o: Options) {
       throw new Error("任务已暂停或命令租约已失效");
     if (b.pageEvidence && (cmd.kind !== "detail" || b.outcome !== "ok" || !b.fieldReading))
       throw new Error("页面字段证据必须绑定成功的岗位详情诊断");
+    if (b.searchDiagnostic) {
+      const actual = new URL(b.url), expected = new URL(cmd.url);
+      if (cmd.kind === "detail" || b.outcome === "blocked" ||
+          ["login-required", "verification-required", "navigation-failed", "tab-closed"].includes(b.reason ?? "") ||
+          actual.origin !== "https://www.zhipin.com" || actual.username || actual.password ||
+          !/^\/web\/geek\/jobs?\/?$/.test(actual.pathname) ||
+          actual.searchParams.get("query") !== expected.searchParams.get("query") ||
+          actual.searchParams.get("city") !== expected.searchParams.get("city"))
+        throw new Error("列表诊断不属于当前搜索页面");
+      (r.searchReadings ??= []).push({ url: cmd.url, page: cmd.kind === "search" ? 1 : r.page + 1, diagnostic: b.searchDiagnostic });
+      r.searchReadings = r.searchReadings.slice(-20);
+    }
     if (b.outcome !== "ok") {
       const message = reasons[b.reason ?? "page-unrecognized"]!;
       if (cmd.kind !== "detail" && b.outcome === "error" &&

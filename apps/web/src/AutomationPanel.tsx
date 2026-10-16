@@ -1,4 +1,5 @@
 import { FormEvent, useEffect, useRef, useState } from "react";
+import type { SearchDiagnostic } from "../../../packages/contracts/src/index";
 
 type RunState = "running" | "paused" | "blocked" | "completed" | "cancelled";
 type Phase = "collecting" | "scoring" | "done";
@@ -21,6 +22,7 @@ type Run = {
   failed: number;
   unreadableJobs?: { url: string; reason: string }[];
   unreadableSearches?: { url: string; reason: string }[];
+  searchReadings?: { url: string; page: number; diagnostic: SearchDiagnostic }[];
   fieldReadings?: { url: string; message: string; evidence?: {
     title: string; company: string; descriptionPresent: boolean; clientLabelSeen: boolean;
     clientNames: string[]; headerLines: string[];
@@ -162,6 +164,12 @@ export function AutomationPanel({ mutate, onPolicy, onConnect }: { mutate: Mutat
       {run.failed > 0 && <p className="muted">有 {run.failed} 个岗位未能处理，系统已继续处理其余岗位。</p>}
       {!!run.unreadableJobs?.length && <details><summary>{run.unreadableJobs.length} 个岗位信息不完整，未导入</summary><ul>{run.unreadableJobs.map((item) => <li key={item.url}><a href={item.url} target="_blank" rel="noreferrer">查看原岗位</a>：{item.reason}</li>)}</ul></details>}
       {!!run.unreadableSearches?.length && <details><summary>{run.unreadableSearches.length} 个搜索页面未能读取</summary><ul>{run.unreadableSearches.map((item, index) => <li key={`${item.url}:${index}`}><a href={item.url} target="_blank" rel="noreferrer">查看搜索页面</a>：{item.reason}</li>)}</ul></details>}
+      {!!run.searchReadings?.length && <details><summary>列表续载检查（{run.searchReadings.length} 次）</summary><ul>{run.searchReadings.map((item, index) => <li key={index}>
+        <a href={item.url} target="_blank" rel="noreferrer">搜索页</a>，第 {item.page} 页：读到 {item.diagnostic.linkCount} 个链接；可用翻页控件 {item.diagnostic.pagination.enabled} 个，禁用 {item.diagnostic.pagination.disabled} 个。
+        <p>{item.diagnostic.pagination.ambiguous ? "存在多个可能的翻页入口，尚未确定。" : item.diagnostic.pagination.enabled === 0 ? "未找到可用翻页入口；这不代表没有更多职位。" : "已发现可用翻页入口。"} 发现 {item.diagnostic.scrollContainers.filter((container) => container.canScroll && !container.atEnd).length} 个仍可向下滚动的区域。</p>
+        <details><summary>滚动区域详情</summary>{item.diagnostic.scrollContainers.map((container, i) => <p key={i}>{ { list: "列表", ancestor: "列表外层", document: "整个页面" }[container.kind] }：可见高度 {container.clientHeight}，内容高度 {container.scrollHeight}，距底部 {container.remaining}。{container.atEnd ? "已在底部。" : "未到达底部。"}</p>)}</details>
+        {item.diagnostic.truncated && <p className="muted">诊断已达到数量上限，只保留部分区域。</p>}
+      </li>)}</ul><p className="muted">这里只记录控件数量和区域尺寸，没有执行滚动或发送操作。</p></details>}
       {!!run.fieldReadings?.length && <details><summary>字段读取情况（{run.fieldReadings.length} 条）</summary><ul>{run.fieldReadings.map((item) => <li key={item.url}>
         <a href={item.url} target="_blank" rel="noreferrer">查看原岗位</a>：{item.message}
         {item.evidence && <details><summary>页面字段证据</summary>

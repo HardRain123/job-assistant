@@ -66,6 +66,8 @@ export function createExtensionAccess(store: Store, now = Date.now) {
     "/extension/v1/application/authorize": "POST",
     "/extension/v1/application/attachment": "POST",
     "/extension/v1/application/result": "POST",
+    "/extension/v1/application/diagnostic-claim": "POST",
+    "/extension/v1/application/diagnostic-result": "POST",
   };
   async function guard(req: FastifyRequest, reply: FastifyReply) {
     const path = req.url.split("?")[0]!;

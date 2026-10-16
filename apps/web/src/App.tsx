@@ -3,6 +3,7 @@ import { accountLabel, isChatGPTAccount, modelNames } from "./provider-view";
 import { ExtensionPanel } from "./ExtensionPanel";
 import { AutomationPanel } from "./AutomationPanel";
 import { BulkPanel } from "./BulkPanel";
+import { ChatDiagnosticPanel } from "./ChatDiagnosticPanel";
 import type {
   Application as StoredApplication,
   ConversationProbe,
@@ -128,6 +129,7 @@ interface Policy {
 interface Application {
   id: string;
   bulkRunId?: string;
+  executor?: "worker" | "extension";
   stopReason?: string;
   pageDiagnostic?: StoredApplication["pageDiagnostic"];
   job: Job;
@@ -2196,6 +2198,9 @@ function Records({
                       重试尚未发送的任务
                     </button>
                   )}
+                {a.status === "needs-review" && a.executor === "extension" && (
+                  <ChatDiagnosticPanel applicationId={a.id} mutate={mutate} />
+                )}
                 <ConfirmSentMessage
                   application={a}
                   paused={s.paused}

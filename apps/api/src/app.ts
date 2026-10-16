@@ -37,6 +37,7 @@ import {
 import { assessJob, evaluateGates } from "../../../packages/matching/src/index.ts";
 import { decrypt, encrypt, equal } from "./security.ts";
 import { createExtensionAccess } from "./extension.ts";
+import { registerChatDiagnostics } from "./chat-diagnostics.ts";
 import { createAutomation } from "./automation.ts";
 import {
   attachmentManifest,
@@ -310,6 +311,7 @@ export async function createApp(o: AppOptions) {
   });
   app.get("/health", () => ({ ok: true, version: "0.1.0" }));
   extension.register(app);
+  registerChatDiagnostics(app, { store: o.store, status: extension.status });
   automation.register(app);
   app.post("/api/login", async (req, reply) => {
     const b = z.object({ password: z.string().max(512) }).parse(req.body);

@@ -155,6 +155,14 @@ export interface ConversationProbe {
   employerMatchCount: number;
   recruiterCount: number;
 }
+export interface SearchDiagnostic {
+  version: 1;
+  linkCount: number;
+  pagination: { matched: number; visible: number; enabled: number; disabled: number; ambiguous: boolean; truncated: boolean };
+  lists: { matched: number; visible: number; truncated: boolean };
+  scrollContainers: { kind: "list" | "ancestor" | "document"; depth: number; clientHeight: number; scrollHeight: number; scrollTop: number; remaining: number; canScroll: boolean; atEnd: boolean }[];
+  truncated: boolean;
+}
 export interface Application {
   id: string;
   bulkRunId?: string;

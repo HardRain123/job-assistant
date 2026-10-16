@@ -338,6 +338,55 @@ test("next never advances when paused, missing, or changed away from the command
   } finally { globalThis.fetch = originalFetch; }
 });
 
+test("search reports read-only continuation evidence even at the final page and never treats absent next as successful advance", async () => {
+  const originalFetch = globalThis.fetch;
+  const browser = (globalThis as Record<string, any>).chrome;
+  const originalScript = browser.scripting.executeScript;
+  const reports: Array<Record<string, any>> = [];
+  const url = "https://www.zhipin.com/web/geek/jobs?query=Java&city=101020100";
+  const evidence = { version: 1, linkCount: 1,
+    pagination: { matched: 0, visible: 0, enabled: 0, disabled: 0, ambiguous: false, truncated: false },
+    lists: { matched: 1, visible: 1, truncated: false }, scrollContainers: [], truncated: false };
+  const calls: Array<{ name: string; args?: unknown[] }> = [];
+  let diagnosticFails = false;
+  try {
+    globalThis.fetch = (async (path: string, options: RequestInit) => {
+      if (path.endsWith("/result")) { reports.push(JSON.parse(String(options.body))); return response({ ok: true }); }
+      return response({ run: { id: "r", state: "running" } });
+    }) as typeof fetch;
+    store.jobAssistantAutomationTabs = { runId: "r", searchTabId: 7 };
+    tab = { ...tab, url, status: "complete" };
+    browser.scripting.executeScript = async (options: { func: { name: string }; args?: unknown[] }) => {
+      calls.push({ name: options.func.name, args: options.args });
+      if (options.func.name === "inspectSearchContinuation") {
+        if (diagnosticFails) throw new Error("private diagnostic failure");
+        return [{ result: evidence }];
+      }
+      if (options.func.name === "advanceSearch") return [{ result: { clicked: false } }];
+      return [{ result: { recognized: true, links: [command.previousSignature], pageUrl: url, hasNext: false } }];
+    };
+    await worker.execute({ ...command, kind: "search", url }, "token");
+    assert.equal(reports[0].outcome, "ok");
+    assert.equal(reports[0].hasNext, false);
+    assert.deepEqual(reports[0].searchDiagnostic, evidence);
+    assert.equal(calls.some((call) => call.name === "advanceSearch"), false);
+    assert.deepEqual(calls.find((call) => call.name === "inspectSearchContinuation")?.args, [url]);
+
+    await worker.execute({ ...command, url }, "token");
+    assert.equal(reports[1].outcome, "error");
+    assert.equal(reports[1].reason, "page-repeated");
+    assert.deepEqual(reports[1].searchDiagnostic, evidence);
+    assert.equal(reports[1].links, undefined);
+    assert.equal(calls.filter((call) => call.name === "advanceSearch").length, 1);
+
+    diagnosticFails = true;
+    await worker.execute({ ...command, kind: "search", url }, "token");
+    assert.equal(reports[2].outcome, "ok");
+    assert.equal(reports[2].searchDiagnostic, undefined);
+    assert.equal(JSON.stringify(reports).includes("private diagnostic failure"), false);
+  } finally { globalThis.fetch = originalFetch; browser.scripting.executeScript = originalScript; }
+});
+
 test("pagination accepts new links only from the same search, retaining login and verification stops", async () => {
   const originalFetch = globalThis.fetch;
   const originalTimeout = globalThis.setTimeout;
@@ -361,6 +410,9 @@ test("pagination accepts new links only from the same search, retaining login an
       store.jobAssistantAutomationTabs = { runId: "r", searchTabId: 7 };
       tab = { ...tab, url, status: "complete" };
       browser.scripting.executeScript = async (options: { func: { name: string } }) => {
+        if (options.func.name === "inspectSearchContinuation") return [{ result: { version: 1, linkCount: advanced ? 2 : 1,
+          pagination: { matched: 0, visible: 0, enabled: 0, disabled: 0, ambiguous: false, truncated: false },
+          lists: { matched: 1, visible: 1, truncated: false }, scrollContainers: [], truncated: false } }];
         if (options.func.name === "advanceSearch") {
           advanced = true;
           if (scenario === "query") tab = { ...tab, url: otherQuery };
@@ -377,14 +429,17 @@ test("pagination accepts new links only from the same search, retaining login an
       if (scenario === "same-search") {
         assert.equal(reports[0].outcome, "ok");
         assert.deepEqual(reports[0].links, [newLink]);
+        assert.equal(reports[0].searchDiagnostic.linkCount, 2);
       } else {
         assert.equal(reports[0].links, undefined);
         if (scenario === "login" || scenario === "challenge") {
           assert.equal(reports[0].outcome, "blocked");
           assert.equal(reports[0].reason, scenario === "login" ? "login-required" : "verification-required");
+          assert.equal(reports[0].searchDiagnostic, undefined);
         } else {
           assert.equal(reports[0].outcome, "error");
           assert.equal(reports[0].diagnostic.code, "url-mismatch");
+          assert.equal(reports[0].searchDiagnostic, undefined);
         }
       }
     }

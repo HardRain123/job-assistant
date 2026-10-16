@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 // @ts-expect-error The injected module is deliberately plain JavaScript.
-import { inspectSplitSearch, clickAndReadSplitDetail } from "./split-page.mjs";
+import { inspectSplitSearch, inspectSearchContinuation, clickAndReadSplitDetail } from "./split-page.mjs";
 
 type Fake = {
   innerText: string; href?: string; tagName?: string; isConnected: boolean; nodeType: number;
@@ -83,6 +83,145 @@ async function metadata() {
   assert.equal(result.ok, true);
   return result.job;
 }
+
+type DiagnosticNode = Fake & {
+  clientHeight: number; scrollHeight: number; scrollTop: number; overflowY: string; disabled?: boolean;
+  closest(selector: string): DiagnosticNode | null;
+};
+const searchUrl = "https://www.zhipin.com/web/geek/jobs?query=Java&city=101020100";
+function diagnosticNode(text = "", parent: Fake | null = null): DiagnosticNode {
+  return Object.assign(node(text, parent), {
+    clientHeight: 500, scrollHeight: 500, scrollTop: 0, overflowY: "visible",
+    closest: () => null as DiagnosticNode | null,
+  });
+}
+// Deliberately synthetic DOM fixtures: these assert the read-only contract,
+// not that BOSS currently uses a particular scrolling/pagination layout.
+function diagnosticDom() {
+  const root = diagnosticNode(); root.scrollHeight = 2000;
+  const list = diagnosticNode("", root); list.overflowY = "auto"; list.scrollHeight = 1500; list.scrollTop = 100;
+  const target = card("a", "工程师", "甲公司");
+  target.box.parentElement = list;
+  target.link.display = "block"; target.link.rects = 1;
+  target.box.querySelectorAll = (selector) => selector === "a[href*='/job_detail/']" ? [target.link] : [];
+  list.querySelectorAll = (selector) => selector === ".job-card-box, .job-card-wrap" ? [target.box] : [];
+  const nodes: Record<string, Fake[]> = {
+    "a[href*='/job_detail/']": [target.link],
+    ".job-list-container, .job-list-box": [list],
+  };
+  Object.assign(globalThis, {
+    location: { href: searchUrl, pathname: "/web/geek/jobs" },
+    getComputedStyle: (n: DiagnosticNode) => ({ display: n.display, visibility: "visible", overflowY: n.overflowY }),
+    document: { scrollingElement: root, querySelectorAll: (selector: string) => nodes[selector] ?? [] },
+  });
+  return { root, list, target, nodes };
+}
+
+test("search continuation evidence reports bounded list dimensions without scrolling, clicking or reading text", () => {
+  const { root, list, target } = diagnosticDom();
+  let clicks = 0;
+  target.box.onClick = () => clicks++;
+  root.onClick = list.onClick = () => clicks++;
+  // Private page text must not be copied into fixed structural evidence.
+  root.innerText = "私密聊天 账户信息";
+  const result = inspectSearchContinuation(searchUrl);
+  assert.equal(result.version, 1);
+  assert.equal(result.linkCount, 1);
+  assert.deepEqual(result.pagination, { matched: 0, visible: 0, enabled: 0, disabled: 0, ambiguous: false, truncated: false });
+  assert.deepEqual(result.lists, { matched: 1, visible: 1, truncated: false });
+  assert.deepEqual(result.scrollContainers, [
+    { kind: "list", depth: 0, clientHeight: 500, scrollHeight: 1500, scrollTop: 100, remaining: 900, canScroll: true, atEnd: false },
+    { kind: "document", depth: 0, clientHeight: 500, scrollHeight: 2000, scrollTop: 0, remaining: 1500, canScroll: true, atEnd: false },
+  ]);
+  assert.equal(list.scrollTop, 100);
+  assert.equal(root.scrollTop, 0);
+  assert.equal(clicks, 0);
+  assert.equal(JSON.stringify(result).includes("私密"), false);
+  assert.equal(JSON.stringify(result).includes("甲公司"), false);
+});
+
+test("continuation diagnostics deduplicate official next controls and distinguish hidden, disabled and ambiguous controls", () => {
+  const { nodes } = diagnosticDom();
+  const enabled = diagnosticNode("下一页");
+  const icon = diagnosticNode("", enabled); icon.closest = () => enabled;
+  const disabledParent = diagnosticNode(); disabledParent.disabled = true;
+  const disabled = diagnosticNode("Next", disabledParent);
+  const hiddenParent = diagnosticNode(); hiddenParent.display = "none";
+  const hidden = diagnosticNode("下页", hiddenParent);
+  nodes["button, a"] = [enabled, disabled, hidden];
+  nodes[".ui-icon-arrow-right"] = [icon];
+  assert.deepEqual(inspectSearchContinuation(searchUrl).pagination,
+    { matched: 3, visible: 2, enabled: 1, disabled: 1, ambiguous: false, truncated: false });
+  nodes["button, a"].push(diagnosticNode("下一页"));
+  assert.equal(inspectSearchContinuation(searchUrl).pagination.ambiguous, true);
+  assert.equal(enabled.clicked, 0);
+});
+
+test("continuation diagnostics require the exact search query/city and stop at login or verification", () => {
+  const { nodes } = diagnosticDom();
+  for (const value of [searchUrl.replace("Java", "AI"), searchUrl.replace("101020100", "101010100"),
+    "https://www.zhipin.com/web/geek/jobs", searchUrl.replace("www.zhipin.com", "example.com"),
+    searchUrl.replace("https://", "https://user:pass@"), searchUrl.replace("/web/geek/jobs", "/web/geek/chat")]) {
+    assert.equal(inspectSearchContinuation(value), null, value);
+  }
+  nodes[".login-dialog form"] = [diagnosticNode()];
+  assert.equal(inspectSearchContinuation(searchUrl), null);
+  nodes[".login-dialog form"] = [];
+  nodes[".verify-dialog"] = [diagnosticNode()];
+  assert.equal(inspectSearchContinuation(searchUrl), null);
+  nodes[".verify-dialog"][0].display = "none";
+  assert.equal(inspectSearchContinuation(searchUrl).version, 1);
+});
+
+test("scroll evidence requires a visible known job list and excludes unrelated scrollable sections", () => {
+  const { nodes, list, target } = diagnosticDom();
+  const ancestor = diagnosticNode("", list.parentElement); ancestor.overflowY = "auto"; ancestor.scrollHeight = 1000;
+  list.parentElement = ancestor;
+  list.scrollTop = 1000;
+  const evidence = inspectSearchContinuation(searchUrl);
+  assert.equal(evidence.scrollContainers[0].atEnd, true);
+  assert.equal(evidence.scrollContainers[0].remaining, 0);
+  assert.equal(evidence.scrollContainers[1].kind, "ancestor");
+  target.link.href = "https://example.com/job_detail/a.html";
+  assert.deepEqual(inspectSearchContinuation(searchUrl).scrollContainers, []);
+  target.link.href = url("a");
+  list.display = "none";
+  assert.deepEqual(inspectSearchContinuation(searchUrl).scrollContainers, []);
+  list.display = "block";
+  target.link.display = "contents"; target.link.rects = 0;
+  target.link.children.span = node("工程师", target.link);
+  assert.equal(inspectSearchContinuation(searchUrl).linkCount, 1);
+  assert.equal(inspectSearchContinuation(searchUrl).scrollContainers.length, 3);
+  nodes[".job-list-container, .job-list-box"] = [];
+  assert.deepEqual(inspectSearchContinuation(searchUrl).scrollContainers, []);
+});
+
+test("continuation evidence caps counts, depths, dimensions and container count", () => {
+  const { list, nodes } = diagnosticDom();
+  list.scrollHeight = 50_000_000;
+  list.scrollTop = -50;
+  nodes["button, a"] = Array.from({ length: 300 }, () => diagnosticNode("下一页"));
+  let parent: DiagnosticNode = list;
+  for (let depth = 0; depth < 20; depth++) {
+    const next = diagnosticNode("", parent.parentElement); next.overflowY = "auto"; next.scrollHeight = 2000;
+    parent.parentElement = next;
+    parent = next;
+  }
+  const result = inspectSearchContinuation(searchUrl);
+  assert.equal(result.pagination.matched, 100);
+  assert.equal(result.pagination.enabled, 100);
+  assert.equal(result.pagination.truncated, true);
+  assert.equal(result.truncated, true);
+  assert.equal(result.scrollContainers.length, 6);
+  assert.equal(result.scrollContainers[0].scrollHeight, 10_000_000);
+  assert.equal(result.scrollContainers[0].scrollTop, 0);
+  for (const item of result.scrollContainers) {
+    assert.ok(item.depth >= 0 && item.depth <= 12);
+    for (const key of ["clientHeight", "scrollHeight", "scrollTop", "remaining"]) {
+      assert.ok(Number.isInteger(item[key]) && item[key] >= 0 && item[key] <= 10_000_000);
+    }
+  }
+});
 
 test("visible cards, display:contents links, nested wrappers and hidden links", () => {
   const first = card("a", "工程师", "甲公司");

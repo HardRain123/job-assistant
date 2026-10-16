@@ -1,9 +1,10 @@
 import { extractJobs } from "./extract.mjs";
-import { inspectSplitSearch, clickAndReadSplitDetail } from "./split-page.mjs";
-import { runExtensionApplication } from "./application.mjs";
+import { inspectSplitSearch, inspectSearchContinuation, clickAndReadSplitDetail } from "./split-page.mjs";
+import { runExtensionApplication, boundedApplicationScript } from "./application.mjs";
+import { runChatDiagnostic } from "./chat-diagnostics.mjs";
 
 const API_BASE = "http://127.0.0.1:3000";
-const VERSION = "0.4.10";
+const VERSION = "0.4.11";
 const STATE_KEY = "jobAssistantAutomationTabs";
 const DIAGNOSTIC_KEY = "jobAssistantAutomationDiagnostic";
 const ALARM = "job-assistant-automation-poll";
@@ -319,6 +320,7 @@ export async function execute(command, tokenValue) {
   let stage = "status-check";
   let inlineFallback = null;
   let pageEvidence;
+  let searchDiagnostic;
   const fieldReading = { route: "standalone", merge: "not-needed", salary: "unchecked", location: "unchecked", industry: "unchecked" };
   const mark = async (value, status = "working", reason = "") => {
     if (["status-check", "opening-tab", "navigating", "waiting-page", "reading-page", "advancing-page", "reporting"].includes(value)) stage = value;
@@ -326,6 +328,10 @@ export async function execute(command, tokenValue) {
   };
   const report = (tokenValue, command, payload) => submitResult(tokenValue, command, {
     ...payload,
+    ...(["search", "next"].includes(command.kind) &&
+      (payload.outcome === "ok" || (payload.outcome === "error" && ["page-repeated", "page-unrecognized"].includes(payload.reason))) &&
+      payload.diagnostic?.code !== "url-mismatch" &&
+      matchesIntendedUrl(payload.url, command.url, "search") && searchDiagnostic ? { searchDiagnostic } : {}),
     ...(command.kind === "detail" && payload.outcome === "ok" && pageEvidence ? { pageEvidence } : {}),
     ...(command.kind === "detail" && payload.outcome === "ok" ? { fieldReading: {
       ...fieldReading,
@@ -335,6 +341,14 @@ export async function execute(command, tokenValue) {
     } } : {}),
     ...(["error", "blocked"].includes(payload.outcome) ? { diagnostic: { stage, code: payload.reason === "page-unrecognized" ? "dom-unrecognized" : payload.reason === "tab-closed" ? "tab-unavailable" : "unknown-error", ...payload.diagnostic } } : {}),
   });
+  const readSearchDiagnostic = async (tabId) => {
+    // Optional read-only evidence must never trigger continuation or turn a
+    // usable list into a failed collection step.
+    try {
+      const [evidence] = await boundedApplicationScript(chrome.scripting.executeScript({ target: { tabId }, world: "ISOLATED", func: inspectSearchContinuation, args: [command.url] }), 3000);
+      searchDiagnostic = evidence?.result?.version === 1 ? evidence.result : undefined;
+    } catch { searchDiagnostic = undefined; }
+  };
   const reportInline = async () => {
     if (!(await runningRun(tokenValue, command.runId))) return;
     await mark("reporting");
@@ -496,6 +510,7 @@ export async function execute(command, tokenValue) {
     if (!page) return report(tokenValue, command, { outcome: "error", url: currentUrl || command.url, reason: "page-unrecognized" });
     if (page.login || page.challenge) return report(tokenValue, command, { outcome: "blocked", url: currentUrl || command.url, reason: page.login ? "login-required" : "verification-required" });
     if (!page.recognized) return report(tokenValue, command, { outcome: "error", url: currentUrl || command.url, reason: "page-unrecognized" });
+    await readSearchDiagnostic(tabId);
     if (command.kind === "next") {
       if (!(await runningRun(tokenValue, command.runId))) return;
       if (await actualUrl(tabId) !== command.url || !isSearchUrl(command.url)) return report(tokenValue, command, { outcome: "error", url: await actualUrl(tabId) || command.url, reason: "navigation-failed" });
@@ -521,6 +536,7 @@ export async function execute(command, tokenValue) {
       }
       if (!changed) return report(tokenValue, command, { outcome: "error", url: currentUrl || command.url, reason: "page-repeated" });
       page = changed;
+      await readSearchDiagnostic(tabId);
     }
     currentUrl = await actualUrl(tabId);
     // A successful DOM read can race a user/site navigation. Keep every page
@@ -545,6 +561,7 @@ export async function wake() {
   try {
     const tokenValue = await token();
     if (!tokenValue) return;
+    if (await runChatDiagnostic(api, tokenValue)) return;
     for (let step = 0; step < STEP_LIMIT; step += 1) {
       const claim = await api("/extension/v1/claim", { method: "POST", token: tokenValue, version: true });
       if (!claim.command) {
