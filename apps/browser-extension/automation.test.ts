@@ -20,7 +20,7 @@ let scriptError: Error | null = null;
   tabs: {
     async get() { return tab; },
     async create() { return tab; },
-    async update(_id: number, value: { url: string }) { tab = { ...tab, url: value.url }; return tab; },
+    async update(_id: number, value: { url?: string; active?: boolean }) { tab = { ...tab, ...(value.url ? { url: value.url } : {}) }; return tab; },
   },
   scripting: { async executeScript(options: { func: { name: string } }) { scriptNames.push(options.func.name); if (scriptError) throw scriptError; return [{ result: scriptResults ? scriptResults[options.func.name] : scriptResult }]; } },
 };
@@ -391,12 +391,22 @@ test("scroll continuation reports new links and an explicit unchanged end, stopp
   const originalFetch = globalThis.fetch;
   const browser = (globalThis as Record<string, any>).chrome;
   const originalScript = browser.scripting.executeScript;
+  const originalUpdate = browser.tabs.update;
+  let activations = 0;
   const reports: Array<Record<string, any>> = [];
   const url = "https://www.zhipin.com/web/geek/jobs?query=Java&city=101020100";
   const oldLink = "https://www.zhipin.com/job_detail/a.html", newLink = "https://www.zhipin.com/job_detail/b.html";
   const evidence = { version: 1, linkCount: 1, pagination: { matched: 0, visible: 0, enabled: 0, disabled: 0, ambiguous: false, truncated: false },
     lists: { matched: 1, visible: 1, truncated: false }, scrollContainers: [{ kind: "document", depth: 0, clientHeight: 825, scrollHeight: 2434, scrollTop: 0, remaining: 1609, canScroll: true, atEnd: false }], truncated: false };
   try {
+    browser.tabs.update = async (tabId: number, update: { active?: boolean; url?: string }) => {
+      assert.equal(tabId, 7);
+      if (update.active !== undefined) {
+        assert.deepEqual(update, { active: true });
+        activations++;
+      }
+      return originalUpdate(tabId, update);
+    };
     let running = true;
     globalThis.fetch = (async (path: string, options: RequestInit) => {
       if (path.endsWith("/result")) { reports.push(JSON.parse(String(options.body))); return response({ ok: true }); }
@@ -404,6 +414,7 @@ test("scroll continuation reports new links and an explicit unchanged end, stopp
     }) as typeof fetch;
     for (const scenario of ["changed", "next-changed", "next-control", "end", "limit", "wrong-query", "verification", "paused"]) {
       reports.length = 0;
+      activations = 0;
       running = true;
       let clicked = 0, scrolled = 0;
       store.jobAssistantAutomationTabs = { runId: "r", searchTabId: 7 };
@@ -416,7 +427,7 @@ test("scroll continuation reports new links and an explicit unchanged end, stopp
           assert.deepEqual(options.args, [url, oldLink]);
           if (scenario === "paused") running = false;
           const outcome = scenario === "end" ? "end" : scenario === "limit" ? "limit" : scenario === "verification" ? "blocked" : scenario === "next-control" ? "next-control" : "changed";
-          return [{ result: { outcome, reason: scenario === "verification" ? "verification-required" : undefined,
+          return [{ result: { outcome, reason: scenario === "verification" ? "verification-required" : scenario === "limit" ? "time-limit" : undefined,
             pageUrl: scenario === "wrong-query" ? url.replace("query=Java", "query=Python") : url,
             links: outcome === "end" ? [oldLink] : [oldLink, newLink], hasNext: outcome !== "end" } }];
         }
@@ -424,6 +435,7 @@ test("scroll continuation reports new links and an explicit unchanged end, stopp
       };
       await worker.execute({ ...command, kind: ["end", "next-changed"].includes(scenario) ? "next" : "search", url, previousSignature: oldLink }, "token");
       assert.equal(scrolled, 1, scenario);
+      assert.equal(activations, 1, scenario);
       assert.equal(clicked, 0, scenario);
       if (scenario === "paused") { assert.equal(reports.length, 0); continue; }
       assert.equal(reports.length, 1);
@@ -444,10 +456,10 @@ test("scroll continuation reports new links and an explicit unchanged end, stopp
       } else {
         assert.equal(reports[0].links, undefined);
         if (scenario === "verification") assert.equal(reports[0].reason, "verification-required");
-        else assert.equal(reports[0].diagnostic.code, scenario === "limit" ? "continuation-limit" : "url-mismatch");
+        else assert.equal(reports[0].diagnostic.code, scenario === "limit" ? "continuation-time-limit" : "url-mismatch");
       }
     }
-  } finally { globalThis.fetch = originalFetch; browser.scripting.executeScript = originalScript; }
+  } finally { globalThis.fetch = originalFetch; browser.scripting.executeScript = originalScript; browser.tabs.update = originalUpdate; }
 });
 
 test("pagination accepts new links only from the same search, retaining login and verification stops", async () => {

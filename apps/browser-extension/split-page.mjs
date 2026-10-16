@@ -255,7 +255,7 @@ export async function advanceSearchList(expectedUrl, previousSignature) {
       if (bottom === lastBottom) bottomStable++;
       else { bottomStable = 0; bottomSince = Date.now(); }
       lastBottom = bottom;
-      if (bottomStable >= 5 && Date.now() - bottomSince >= 2000) return answer("end", "stable-bottom");
+      if (bottomStable >= 2 && Date.now() - bottomSince >= 2000) return answer("end", "stable-bottom");
     } else {
       bottomStable = 0; lastBottom = "";
       const position = [value.total, value.top].join(";");

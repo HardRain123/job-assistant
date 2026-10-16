@@ -4,7 +4,7 @@ import { runExtensionApplication, boundedApplicationScript } from "./application
 import { runChatDiagnostic } from "./chat-diagnostics.mjs";
 
 const API_BASE = "http://127.0.0.1:3000";
-const VERSION = "0.4.12";
+const VERSION = "0.4.13";
 const STATE_KEY = "jobAssistantAutomationTabs";
 const DIAGNOSTIC_KEY = "jobAssistantAutomationDiagnostic";
 const ALARM = "job-assistant-automation-poll";
@@ -515,6 +515,12 @@ export async function execute(command, tokenValue) {
     const scrollList = async () => {
       if (!(await runningRun(tokenValue, command.runId))) return null;
       await mark("advancing-page");
+      // Rendered lists can defer continuation while their dedicated tab is in
+      // the background. Activate only this run's already verified search tab.
+      if (!matchesIntendedUrl(await actualUrl(tabId), command.url, "search"))
+        return { stop: { outcome: "error", url: command.url, reason: "navigation-failed", diagnostic: { code: "url-mismatch" } } };
+      await boundedApplicationScript(chrome.tabs.update(tabId, { active: true }), 3000);
+      if (!(await runningRun(tokenValue, command.runId))) return null;
       const [result] = await boundedApplicationScript(chrome.scripting.executeScript({ target: { tabId }, world: "ISOLATED", func: advanceSearchList,
         args: [command.url, listSignature(page.links)] }), 10_000);
       if (!(await runningRun(tokenValue, command.runId))) return null;
@@ -528,7 +534,8 @@ export async function execute(command, tokenValue) {
       await readSearchDiagnostic(tabId);
       if (!["changed", "next-control", "end"].includes(continuation?.outcome))
         return { stop: { outcome: "error", url: currentUrl, reason: "page-unrecognized", diagnostic: {
-          code: continuation?.outcome === "limit" ? "continuation-limit" : "continuation-unrecognized" } } };
+          code: continuation?.outcome === "limit" ? ({ "time-limit": "continuation-time-limit", "step-limit": "continuation-step-limit",
+            "control-limit": "continuation-control-limit", "scroll-not-moving": "continuation-scroll-stuck" }[continuation.reason] || "continuation-limit") : "continuation-unrecognized" } } };
       if (continuation.outcome === "changed" || continuation.outcome === "end") {
         page = { ...page, links: continuation.links, pageUrl: continuation.pageUrl, hasNext: continuation.hasNext };
         continuationEnded = command.kind === "next" && continuation.outcome === "end";

@@ -177,6 +177,14 @@ test("search continuation scrolls only the bound document with the observed 825/
   assert.equal(cards.reduce((sum, item) => sum + item.box.clicked + item.link.clicked, 0), 0);
 });
 
+test("bottom settling uses elapsed time when background timers fire only once per second", async () => {
+  const { state, signature } = advanceDom();
+  const result = await advanceClock(() => advanceSearchList(searchUrl, signature()), () => {}, 1000);
+  assert.equal(result.outcome, "end");
+  assert.equal(result.reason, "stable-bottom");
+  assert.deepEqual(state.positions, [660, 1320, 1609]);
+});
+
 test("search continuation recognizes incremental jobs and allows another bounded check without inventing pagination", async () => {
   const { root, cards, append, state, signature } = advanceDom();
   const before = signature();
