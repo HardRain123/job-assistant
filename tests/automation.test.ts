@@ -67,6 +67,40 @@ test("列表诊断拒绝越界、任意内容、错误来源和验证页，不�
   } finally { await f.close(); }
 });
 
+test("滚动列表超过30个链接仍完整排队，超过300个拒绝", async () => {
+  const f = await fixture();
+  try {
+    await f.start({ maxJobs: 300 });
+    const search = await f.claim();
+    const links = Array.from({ length: 300 }, (_, i) => url(`scroll-${i}`));
+    assert.equal((await f.result(search, { links: [...links, url("overflow")], hasNext: true })).statusCode, 400);
+    assert.equal((await f.result(search, { links, hasNext: true })).statusCode, 200);
+    assert.equal((await f.state()).discovered, 300);
+    assert.equal(f.store.applications().length, 0);
+  } finally { await f.close(); }
+});
+
+test("滚动到底无新增可以结束续载，结束标记不得隐藏新列表或伪装首屏", async () => {
+  const f = await fixture();
+  try {
+    await f.start({ keywords: ["Java"], maxJobs: 10, maxPages: 2 });
+    const search = await f.claim();
+    assert.equal((await f.result(search, { links: [url("a")], hasNext: false, continuationEnded: true })).statusCode, 400);
+    await f.result(search, { links: [url("a")], hasNext: true });
+    const detail = await f.claim();
+    await f.result(detail, { jobs: [job("a")] });
+    const next = await f.claim();
+    assert.equal(next.kind, "next");
+    for (const payload of [{ links: [url("b")], hasNext: false }, { links: [], hasNext: false }, { links: [url("a")], hasNext: true }])
+      assert.equal((await f.result(next, { ...payload, continuationEnded: true })).statusCode, 400);
+    assert.equal((await f.result(next, { links: [url("a")], hasNext: false, continuationEnded: true })).statusCode, 200);
+    assert.equal(await f.claim(), null);
+    assert.equal((await f.state()).state, "completed");
+    assert.equal((await f.state()).discovered, 1);
+    assert.equal(f.store.applications().length, 0);
+  } finally { await f.close(); }
+});
+
 test("批量候选可采集至300个，超界请求被拒绝且不启动投递", async () => {
   const f = await fixture();
   try {

@@ -406,7 +406,7 @@ export async function applicationPageStep(request) {
       // A plain name needs the full Name / exact Employer / recruiting Role row.
       // Do not accept arbitrary header text or online/activity labels as names.
       const roles = header.filter((node) =>
-        /^(HR|HRBP|招聘者|人事|招聘专员|招聘经理|招聘负责人)$/i.test(
+        /^(HR|HRBP|招聘者|人事|招聘助理|招聘专员|招聘经理|招聘负责人)$/i.test(
           text(node),
         ),
       );

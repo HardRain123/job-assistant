@@ -129,6 +129,8 @@ const diagnosticCodes = {
   "panel-incomplete": "详情标题或正文未识别",
   "identity-mismatch": "详情与目标岗位身份不一致",
   "detail-unchanged": "点击后详情未更新",
+  "continuation-limit": "列表续载已到本次等待或滚动上限，不能确认列表结束",
+  "continuation-unrecognized": "列表续载结构或岗位集合发生变化，未继续滚动",
   "request-failed": "请求失败",
   "unknown-error": "未知错误",
 } as const;
@@ -201,9 +203,10 @@ const resultSchema = z
     outcome: z.enum(["ok", "blocked", "error"]),
     url: z.string().max(2000),
     jobs: z.array(z.unknown()).max(1).optional(),
-    links: z.array(z.string().max(2000)).max(30).optional(),
+    links: z.array(z.string().max(2000)).max(300).optional(),
     hasNext: z.boolean().optional(),
-    signature: z.string().max(20000).optional(),
+    signature: z.string().max(200000).optional(),
+    continuationEnded: z.literal(true).optional(),
     reason: z
       .enum([
         "login-required",
@@ -375,6 +378,9 @@ export function createAutomation(o: Options) {
       throw new Error("任务已暂停或命令租约已失效");
     if (b.pageEvidence && (cmd.kind !== "detail" || b.outcome !== "ok" || !b.fieldReading))
       throw new Error("页面字段证据必须绑定成功的岗位详情诊断");
+    if (b.continuationEnded && (cmd.kind !== "next" || b.outcome !== "ok" || b.hasNext !== false ||
+        !b.links?.length || [...new Set(b.links.map(canonicalJobUrl))].sort().join("|") !== r.signature))
+      throw new Error("列表结束标记必须对应同一列表的无新增续载结果");
     if (b.searchDiagnostic) {
       const actual = new URL(b.url), expected = new URL(cmd.url);
       if (cmd.kind === "detail" || b.outcome === "blocked" ||
@@ -504,7 +510,7 @@ export function createAutomation(o: Options) {
           throw new Error("搜索结果缺少翻页状态");
         const links = [...new Set(b.links.map(canonicalJobUrl))];
         const signature = [...links].sort().join("|");
-        if (cmd.kind === "next" && signature && signature === r.signature) {
+        if (cmd.kind === "next" && signature && signature === r.signature && !b.continuationEnded) {
           block(r, reasons["page-repeated"]!);
           return;
         }

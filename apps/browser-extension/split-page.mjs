@@ -1,6 +1,5 @@
 // Standalone functions for chrome.scripting.executeScript: each carries its helpers.
-// Read-only, bounded structural evidence. Until an actual search page identifies
-// its continuation mechanism, never guess which element should be scrolled.
+// Read-only, bounded structural evidence for the list continuation decision.
 export function inspectSearchContinuation(expectedUrl) {
   try {
     const actual = new URL(location.href);
@@ -105,6 +104,176 @@ export function inspectSearchContinuation(expectedUrl) {
   };
 }
 
+// Standalone, bounded continuation of the currently bound search list. This may
+// scroll the list's own viewport (or its document), but never clicks a control.
+// A newly exposed pagination control is handed back to the existing next action.
+export async function advanceSearchList(expectedUrl, previousSignature) {
+  const deadline = Date.now() + 5500;
+  let steps = 0;
+  let latest = [];
+  const answer = (outcome, reason, canContinue = false) => ({
+    outcome, reason, links: latest, signature: latest.join("|"),
+    hasNext: canContinue, canContinue, pageUrl: location.href, steps,
+  });
+  const sameSearch = () => {
+    try {
+      const actual = new URL(location.href), expected = new URL(expectedUrl);
+      return [actual, expected].every((entry) => entry.origin === "https://www.zhipin.com" && !entry.username && !entry.password && /^\/web\/geek\/jobs?\/?$/.test(entry.pathname)) &&
+        !!expected.searchParams.get("query") && !!expected.searchParams.get("city") &&
+        actual.searchParams.get("query") === expected.searchParams.get("query") && actual.searchParams.get("city") === expected.searchParams.get("city");
+    } catch { return false; }
+  };
+  const canonical = (href) => {
+    try {
+      if (typeof href !== "string" || href.length > 2048) return "";
+      const entry = new URL(href, location.href);
+      return entry.origin === "https://www.zhipin.com" && !entry.username && !entry.password && /^\/job_detail\/[\w-]{1,256}\.html$/.test(entry.pathname) ? entry.origin + entry.pathname : "";
+    } catch { return ""; }
+  };
+  const visible = (node) => {
+    if (!node?.isConnected || !node.getClientRects().length) return false;
+    for (let part = node, depth = 0; part?.nodeType === 1; part = part.parentElement) {
+      if (++depth > 64) return false;
+      const style = getComputedStyle(part);
+      if (style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse") return false;
+    }
+    return true;
+  };
+  const rendered = (node) => visible(node) || (node?.isConnected && getComputedStyle(node).display === "contents" &&
+    [...node.querySelectorAll("*")].slice(0, 20).some(visible));
+  const blocked = () => {
+    const anyVisible = (selectors) => selectors.some((selector) => [...document.querySelectorAll(selector)].slice(0, 100).some(visible));
+    if (anyVisible([".login-dialog form", ".login-box form", "[class*='login-dialog'] form", "form:has(input[type='password'])"])) return "login-required";
+    if (anyVisible(["iframe[src*='captcha']", "iframe[src*='verify']", ".geetest_panel", ".verify-dialog", "[class*='captcha-dialog']", "[class*='verify-dialog']"])) return "verification-required";
+    return "";
+  };
+  const clean = (value) => String(value || "").replace(/\s+/g, " ").trim();
+  const disabled = (node) => {
+    for (let part = node, depth = 0; part?.nodeType === 1; part = part.parentElement) {
+      if (++depth > 64) return true;
+      if (part.disabled || part.getAttribute("aria-disabled") === "true" || part.classList.contains("disabled")) return true;
+    }
+    return false;
+  };
+  const controls = () => {
+    const nodes = document.querySelectorAll("button, a"), icons = document.querySelectorAll(".ui-icon-arrow-right");
+    if (nodes.length > 2000 || icons.length > 100) return { error: "control-limit" };
+    const found = new Set();
+    for (const node of nodes) if (visible(node) && !disabled(node) && /^(下一页|下页|Next)$/i.test(clean(node.innerText || node.getAttribute("aria-label") || node.title))) found.add(node);
+    for (const icon of icons) {
+      const node = icon.closest("a, button, li") || icon.parentElement;
+      if (visible(icon) && visible(node) && !disabled(icon) && !disabled(node)) found.add(node);
+    }
+    return { count: found.size };
+  };
+  const read = () => {
+    if (!sameSearch()) return { outcome: "stale", reason: "search-changed" };
+    const blockReason = blocked();
+    if (blockReason) return { outcome: "blocked", reason: blockReason };
+    const nodes = document.querySelectorAll(".job-list-container, .job-list-box");
+    if (nodes.length > 32) return { outcome: "limit", reason: "list-limit" };
+    const lists = [];
+    for (const list of nodes) {
+      if (!visible(list)) continue;
+      const cards = list.querySelectorAll(".job-card-box, .job-card-wrap");
+      if (cards.length > 1200) return { outcome: "limit", reason: "card-limit" };
+      const links = new Set();
+      for (const card of cards) {
+        if (!visible(card)) continue;
+        const title = card.querySelector(".job-name");
+        const link = card.querySelector("a.job-name[href], .job-name a[href], a[href*='/job_detail/']");
+        if (!title || !rendered(title) || !clean(title.innerText) || !link) continue;
+        let hidden = false;
+        for (let part = link, depth = 0; part && part !== card; part = part.parentElement) {
+          if (++depth > 64) { hidden = true; break; }
+          const style = getComputedStyle(part);
+          if (style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse") hidden = true;
+        }
+        const value = canonical(link.href);
+        if (!hidden && value) links.add(value);
+      }
+      if (links.size) lists.push({ list, links: [...links].sort() });
+    }
+    if (!lists.length) return { outcome: "unrecognized", reason: "list-missing" };
+    // Nested wrappers of the same list are acceptable; distinct visible lists,
+    // including two copies with identical links, must not authorize scrolling.
+    for (let a = 0; a < lists.length; a++) for (let b = a + 1; b < lists.length; b++) {
+      if ((!lists[a].list.contains(lists[b].list) && !lists[b].list.contains(lists[a].list)) || lists[a].links.join("|") !== lists[b].links.join("|"))
+        return { outcome: "unrecognized", reason: "ambiguous-list" };
+    }
+    const bound = lists.find((entry) => !lists.some((other) => other !== entry && entry.list.contains(other.list)));
+    return { list: bound.list, links: bound.links, capped: bound.links.length >= 300 };
+  };
+  const metrics = (node) => {
+    const height = Number(node?.clientHeight), total = Number(node?.scrollHeight), top = Number(node?.scrollTop);
+    if (![height, total, top].every(Number.isFinite) || height <= 0 || total < height || total > 10_000_000 || Math.abs(top) > 10_000_000) return null;
+    return { height, total, top: Math.max(0, top), remaining: Math.max(0, total - height - top) };
+  };
+  const viewport = (list) => {
+    const root = document.scrollingElement, candidates = [];
+    let reachedRoot = false;
+    for (let part = list, depth = 0; part; part = part.parentElement, depth++) {
+      if (depth > 12 || !visible(part)) return { reason: "unbound-scroll-container" };
+      if (part === root) { reachedRoot = true; break; }
+      const value = metrics(part), overflow = getComputedStyle(part).overflowY;
+      if (value && value.total > value.height + 2) {
+        if (/^(hidden|clip)$/.test(overflow)) return { reason: "clipped-list" };
+        if (/^(auto|scroll)$/.test(overflow)) candidates.push(part);
+      }
+    }
+    if (!reachedRoot || !metrics(root)) return { reason: "unbound-scroll-container" };
+    if (candidates.length > 1) return { reason: "ambiguous-scroll-container" };
+    return { node: candidates[0] || root };
+  };
+  if (typeof previousSignature !== "string" || previousSignature.length > 100_000) return answer("stale", "invalid-signature");
+  const previous = previousSignature ? previousSignature.split("|") : [];
+  if (!previous.length || previous.length > 300 || new Set(previous).size !== previous.length || previous.some((item) => canonical(item) !== item)) return answer("stale", "invalid-signature");
+  const previousSet = new Set(previous);
+  let originalViewport = null, lastBottom = "", bottomSince = 0, bottomStable = 0, lastPosition = "", stuck = 0;
+  while (Date.now() < deadline) {
+    const current = read();
+    if (current.outcome) return answer(current.outcome, current.reason);
+    latest = current.links.slice(0, 300);
+    // Validate continuity before truncating the returned set: appended jobs can
+    // sort ahead of an older URL at the 300-link boundary without replacing it.
+    const currentSet = new Set(current.links);
+    if (previous.some((item) => !currentSet.has(item))) return answer("stale", "list-replaced");
+    if (latest.some((item) => !previousSet.has(item))) return answer("changed", current.capped ? "link-limit" : "new-jobs", !current.capped);
+    if (current.capped) return answer("limit", "link-limit");
+    const next = controls();
+    if (next.error) return answer("limit", next.error);
+    if (next.count > 1) return answer("unrecognized", "ambiguous-next-control");
+    if (next.count === 1) return answer("next-control", "next-control-visible", true);
+    const selected = viewport(current.list);
+    if (!selected.node) return answer("unrecognized", selected.reason);
+    if (originalViewport && selected.node !== originalViewport) return answer("stale", "scroll-container-changed");
+    originalViewport = selected.node;
+    const value = metrics(selected.node);
+    if (!value) return answer("unrecognized", "invalid-scroll-container");
+    if (value.remaining <= 2) {
+      const bottom = [latest.join("|"), value.total, value.top].join(";");
+      if (bottom === lastBottom) bottomStable++;
+      else { bottomStable = 0; bottomSince = Date.now(); }
+      lastBottom = bottom;
+      if (bottomStable >= 5 && Date.now() - bottomSince >= 2000) return answer("end", "stable-bottom");
+    } else {
+      bottomStable = 0; lastBottom = "";
+      const position = [value.total, value.top].join(";");
+      stuck = position === lastPosition ? stuck + 1 : 0;
+      lastPosition = position;
+      if (stuck >= 2) return answer("limit", "scroll-not-moving", true);
+      if (steps >= 8) return answer("limit", "step-limit", true);
+      // Assignment only affects the validated list viewport, not focus, inputs,
+      // buttons, job cards, or communication controls.
+      try { selected.node.scrollTop = Math.min(value.total - value.height, value.top + Math.max(200, Math.floor(value.height * 0.8))); }
+      catch { return answer("unrecognized", "scroll-unavailable"); }
+      steps++;
+    }
+    await new Promise((resolve) => setTimeout(resolve, Math.min(400, Math.max(0, deadline - Date.now()))));
+  }
+  return answer("limit", "time-limit", true);
+}
+
 export function inspectSplitSearch() {
   if (new URL(location.href).origin !== "https://www.zhipin.com" || !/^\/web\/geek\/jobs?\/?$/.test(location.pathname))
     return { recognized: false, links: [], signature: "", hasNext: false, empty: false, readyState: document.readyState, pageUrl: location.href };
@@ -140,7 +309,7 @@ export function inspectSplitSearch() {
     if (hidden || !clean(title.innerText)) continue;
     const url = canonical(link.href);
     if (url) links.add(url);
-    if (links.size >= 30) break;
+    if (links.size >= 300) break;
   }
   const found = [...links].sort();
   const empty = [...document.querySelectorAll(".job-list-container [class*='empty']")]

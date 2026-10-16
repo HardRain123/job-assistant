@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 // @ts-expect-error The injected module is deliberately plain JavaScript.
-import { inspectSplitSearch, inspectSearchContinuation, clickAndReadSplitDetail } from "./split-page.mjs";
+import { inspectSplitSearch, inspectSearchContinuation, advanceSearchList, clickAndReadSplitDetail } from "./split-page.mjs";
 
 type Fake = {
   innerText: string; href?: string; tagName?: string; isConnected: boolean; nodeType: number;
@@ -116,6 +116,232 @@ function diagnosticDom() {
   });
   return { root, list, target, nodes };
 }
+
+function advanceDom(count = 15) {
+  const root = diagnosticNode(); root.clientHeight = 825; root.scrollHeight = 2434;
+  const list = diagnosticNode("", root); list.clientHeight = list.scrollHeight = 2234;
+  const cards: ReturnType<typeof card>[] = [];
+  const nodes: Record<string, Fake[]> = { ".job-list-container, .job-list-box": [list] };
+  const append = (amount: number) => {
+    for (let i = 0; i < amount; i++) {
+      const item = card("job" + String(cards.length).padStart(3, "0"), "工程师", "甲公司");
+      item.box.parentElement = list;
+      cards.push(item);
+    }
+  };
+  append(count);
+  list.querySelectorAll = (selector) => selector === ".job-card-box, .job-card-wrap" ? cards.map((item) => item.box) : [];
+  const state = { onScroll: (_position: number) => {}, positions: [] as number[], moves: true };
+  let position = 0;
+  Object.defineProperty(root, "scrollTop", { configurable: true, get: () => position, set: (value: number) => {
+    if (state.moves) position = Math.min(root.scrollHeight - root.clientHeight, Math.max(0, value));
+    state.positions.push(position);
+    state.onScroll(position);
+  } });
+  Object.assign(globalThis, {
+    location: { href: searchUrl, pathname: "/web/geek/jobs" },
+    getComputedStyle: (n: DiagnosticNode) => ({ display: n.display, visibility: "visible", overflowY: n.overflowY }),
+    document: { scrollingElement: root, querySelectorAll: (selector: string) => nodes[selector] ?? [] },
+  });
+  return { root, list, cards, nodes, state, append, signature: () => cards.map((item) => item.link.href!).sort().join("|") };
+}
+type AdvanceResult = { outcome: string; reason: string; links: string[]; signature: string; hasNext: boolean; canContinue: boolean; steps: number; pageUrl: string };
+async function advanceClock(action: () => Promise<AdvanceResult>, onWait: (waits: number) => void = () => {}, elapsedPerWait?: number): Promise<AdvanceResult> {
+  const originalTimeout = globalThis.setTimeout, originalNow = Date.now;
+  let clock = 0, waits = 0;
+  Date.now = () => clock;
+  globalThis.setTimeout = ((fn: () => void, delay: number) => {
+    clock += elapsedPerWait ?? delay;
+    onWait(++waits);
+    queueMicrotask(fn);
+    return 1 as unknown as ReturnType<typeof setTimeout>;
+  }) as typeof setTimeout;
+  try { return await action(); } finally { Date.now = originalNow; globalThis.setTimeout = originalTimeout; }
+}
+
+test("search continuation scrolls only the bound document with the observed 825/2434 dimensions and stops at a stable bottom", async () => {
+  const { root, list, cards, state, signature } = advanceDom();
+  const before = signature();
+  // Re-evaluation catches accidental closure dependencies in executeScript code.
+  const injected = (0, eval)("(" + advanceSearchList.toString() + ")") as typeof advanceSearchList;
+  const result = await advanceClock(() => injected(searchUrl, before));
+  assert.equal(result.outcome, "end");
+  assert.equal(result.reason, "stable-bottom");
+  assert.deepEqual(state.positions, [660, 1320, 1609]);
+  assert.equal(root.scrollTop, 1609);
+  assert.equal(list.scrollTop, 0);
+  assert.equal(result.signature, before);
+  assert.equal(result.canContinue, false);
+  assert.equal(result.hasNext, false);
+  assert.equal(result.steps, 3);
+  assert.equal(cards.reduce((sum, item) => sum + item.box.clicked + item.link.clicked, 0), 0);
+});
+
+test("search continuation recognizes incremental jobs and allows another bounded check without inventing pagination", async () => {
+  const { root, cards, append, state, signature } = advanceDom();
+  const before = signature();
+  state.onScroll = (position) => {
+    if (position === 1320 && cards.length === 15) { append(15); root.scrollHeight += 1700; }
+  };
+  const result = await advanceClock(() => advanceSearchList(searchUrl, before));
+  assert.equal(result.outcome, "changed");
+  assert.equal(result.reason, "new-jobs");
+  assert.equal(result.links.length, 30);
+  assert.equal(result.signature, signature());
+  assert.equal(result.hasNext, true);
+  assert.equal(result.canContinue, true);
+  assert.deepEqual(state.positions, [660, 1320]);
+  assert.equal(cards.reduce((sum, item) => sum + item.box.clicked + item.link.clicked, 0), 0);
+});
+
+test("a next control exposed at the bottom is returned without clicking, including after more than 250 links", async () => {
+  const { root, nodes, state, signature } = advanceDom();
+  const next = diagnosticNode("下一页", root);
+  nodes["button, a"] = Array.from({ length: 300 }, () => diagnosticNode("普通链接", root));
+  state.onScroll = (position) => { if (position === 1609) nodes["button, a"].push(next); };
+  const result = await advanceClock(() => advanceSearchList(searchUrl, signature()));
+  assert.equal(result.outcome, "next-control");
+  assert.equal(result.hasNext, true);
+  assert.equal(next.clicked, 0);
+  assert.deepEqual(state.positions, [660, 1320, 1609]);
+});
+
+test("continuation binds one list viewport, accepts equivalent nested wrappers, and rejects distinct lists or nested scroll ambiguity", async () => {
+  let fixture = advanceDom();
+  const inner = fixture.list;
+  const wrapper = diagnosticNode("", fixture.root);
+  inner.parentElement = wrapper;
+  wrapper.querySelectorAll = inner.querySelectorAll;
+  fixture.nodes[".job-list-container, .job-list-box"] = [wrapper, inner];
+  inner.overflowY = "auto"; inner.clientHeight = 500; inner.scrollHeight = 900;
+  let result = await advanceClock(() => advanceSearchList(searchUrl, fixture.signature()));
+  assert.equal(result.outcome, "end");
+  assert.equal(inner.scrollTop, 400);
+  assert.deepEqual(fixture.state.positions, []);
+  fixture = advanceDom();
+  const other = diagnosticNode("", fixture.root);
+  other.querySelectorAll = fixture.list.querySelectorAll;
+  fixture.nodes[".job-list-container, .job-list-box"].push(other);
+  result = await advanceClock(() => advanceSearchList(searchUrl, fixture.signature()));
+  assert.equal(result.reason, "ambiguous-list");
+  assert.deepEqual(fixture.state.positions, []);
+  fixture = advanceDom();
+  fixture.list.overflowY = "auto"; fixture.list.clientHeight = 500;
+  const outer = diagnosticNode("", fixture.root); outer.overflowY = "auto"; outer.scrollHeight = 1000;
+  fixture.list.parentElement = outer;
+  result = await advanceClock(() => advanceSearchList(searchUrl, fixture.signature()));
+  assert.equal(result.reason, "ambiguous-scroll-container");
+  assert.deepEqual(fixture.state.positions, []);
+  assert.equal(fixture.list.scrollTop, 0);
+});
+
+test("continuation stops before scrolling for wrong search, missing bindings, hidden links, login or verification", async () => {
+  for (const expected of [searchUrl.replace("Java", "AI"), searchUrl.replace("101020100", "101010100"), searchUrl.replace("www.zhipin.com", "example.com"), searchUrl.replace("https://", "https://user:pass@")]) {
+    const fixture = advanceDom();
+    const result = await advanceClock(() => advanceSearchList(expected, fixture.signature()));
+    assert.equal(result.outcome, "stale");
+    assert.deepEqual(fixture.state.positions, []);
+  }
+  for (const selector of [".login-dialog form", ".verify-dialog", "iframe[src*='captcha']"]) {
+    const fixture = advanceDom(); fixture.nodes[selector] = [diagnosticNode()];
+    const result = await advanceClock(() => advanceSearchList(searchUrl, fixture.signature()));
+    assert.equal(result.outcome, "blocked");
+    assert.equal(result.reason, selector === ".login-dialog form" ? "login-required" : "verification-required");
+    assert.deepEqual(fixture.state.positions, []);
+  }
+  let fixture = advanceDom();
+  fixture.nodes[".job-list-container, .job-list-box"] = [];
+  assert.equal((await advanceClock(() => advanceSearchList(searchUrl, fixture.signature()))).reason, "list-missing");
+  assert.deepEqual(fixture.state.positions, []);
+  fixture = advanceDom();
+  for (const item of fixture.cards) item.link.display = "none";
+  assert.equal((await advanceClock(() => advanceSearchList(searchUrl, fixture.signature()))).reason, "list-missing");
+  assert.deepEqual(fixture.state.positions, []);
+});
+
+test("continuation revalidates navigation, verification and prior jobs after each wait", async () => {
+  for (const change of ["url", "verification", "replace"] as const) {
+    const fixture = advanceDom();
+    const before = fixture.signature();
+    const result = await advanceClock(() => advanceSearchList(searchUrl, before), () => {
+      if (change === "url") (globalThis.location as unknown as { href: string }).href = searchUrl.replace("Java", "AI");
+      if (change === "verification") fixture.nodes[".verify-dialog"] = [diagnosticNode()];
+      if (change === "replace") fixture.cards[0].link.href = url("different");
+    });
+    assert.equal(result.outcome, change === "verification" ? "blocked" : "stale");
+    assert.equal(fixture.state.positions.length, 1);
+  }
+});
+
+test("continuation waits at least two stable seconds at the bottom and observes delayed added jobs", async () => {
+  const fixture = advanceDom(), before = fixture.signature();
+  let firstBottomWait = 0;
+  const result = await advanceClock(() => advanceSearchList(searchUrl, before), (waits) => {
+    if (fixture.root.scrollTop === 1609 && !firstBottomWait) firstBottomWait = waits;
+    // A delayed response arrives 1.6 seconds after reaching the bottom.
+    if (firstBottomWait && waits - firstBottomWait === 4) fixture.append(1);
+  });
+  assert.equal(result.outcome, "changed");
+  assert.equal(result.links.length, 16);
+  assert.equal(result.hasNext, true);
+});
+
+test("continuation distinguishes step/time/stalled limits from a real end and never scrolls unrelated containers", async () => {
+  let fixture = advanceDom(); fixture.root.scrollHeight = 100_000;
+  let result = await advanceClock(() => advanceSearchList(searchUrl, fixture.signature()));
+  assert.equal(result.outcome, "limit"); assert.equal(result.reason, "step-limit"); assert.equal(result.canContinue, true);
+  assert.equal(result.steps, 8);
+  fixture = advanceDom(); fixture.root.scrollHeight = 100_000;
+  result = await advanceClock(() => advanceSearchList(searchUrl, fixture.signature()), () => {}, 1500);
+  assert.equal(result.outcome, "limit"); assert.equal(result.reason, "time-limit"); assert.equal(result.canContinue, true);
+  assert.ok(result.steps <= 4);
+  fixture = advanceDom(); fixture.state.moves = false;
+  result = await advanceClock(() => advanceSearchList(searchUrl, fixture.signature()));
+  assert.equal(result.reason, "scroll-not-moving"); assert.equal(result.outcome, "limit");
+  assert.equal(fixture.state.positions.length, 2);
+  fixture = advanceDom(); fixture.list.parentElement = diagnosticNode();
+  result = await advanceClock(() => advanceSearchList(searchUrl, fixture.signature()));
+  assert.equal(result.reason, "unbound-scroll-container"); assert.deepEqual(fixture.state.positions, []);
+});
+
+test("continuation preserves naturally arrived jobs, supports more than 30 links and caps the collected set at 300", async () => {
+  const fixture = advanceDom(290), before = fixture.signature();
+  fixture.append(10);
+  const result = await advanceClock(() => advanceSearchList(searchUrl, before));
+  assert.equal(result.outcome, "changed");
+  assert.equal(result.links.length, 300);
+  assert.equal(result.signature, fixture.signature());
+  assert.equal(result.reason, "link-limit");
+  assert.equal(result.canContinue, false);
+  assert.deepEqual(fixture.state.positions, []);
+  install(fixture.cards.map((item) => item.box), null);
+  assert.equal(inspectSplitSearch().links.length, 300);
+  const overflow = advanceDom(290), original = overflow.signature();
+  overflow.append(20);
+  for (const item of overflow.cards.slice(290)) item.link.href = url("aaa" + item.link.href!.split("/").pop()!.replace(".html", ""));
+  const capped = await advanceClock(() => advanceSearchList(searchUrl, original));
+  assert.equal(capped.outcome, "changed");
+  assert.equal(capped.links.length, 300);
+  assert.equal(capped.canContinue, false);
+  assert.deepEqual(overflow.state.positions, []);
+});
+
+test("continuation fails closed on ambiguous next controls, clipped lists, excessive controls and invalid signatures", async () => {
+  let fixture = advanceDom();
+  fixture.nodes["button, a"] = [diagnosticNode("下一页"), diagnosticNode("Next")];
+  let result = await advanceClock(() => advanceSearchList(searchUrl, fixture.signature()));
+  assert.equal(result.reason, "ambiguous-next-control"); assert.deepEqual(fixture.state.positions, []);
+  fixture = advanceDom(); fixture.list.overflowY = "hidden"; fixture.list.clientHeight = 500;
+  result = await advanceClock(() => advanceSearchList(searchUrl, fixture.signature()));
+  assert.equal(result.reason, "clipped-list"); assert.deepEqual(fixture.state.positions, []);
+  fixture = advanceDom(); fixture.nodes["button, a"] = Array.from({ length: 2001 }, () => diagnosticNode("链接"));
+  result = await advanceClock(() => advanceSearchList(searchUrl, fixture.signature()));
+  assert.equal(result.reason, "control-limit"); assert.deepEqual(fixture.state.positions, []);
+  for (const signature of ["", "javascript:alert(1)", url("x") + "|" + url("x"), "x".repeat(100001)]) {
+    result = await advanceClock(() => advanceSearchList(searchUrl, signature));
+    assert.equal(result.reason, "invalid-signature"); assert.deepEqual(fixture.state.positions, []);
+  }
+});
 
 test("search continuation evidence reports bounded list dimensions without scrolling, clicking or reading text", () => {
   const { root, list, target } = diagnosticDom();

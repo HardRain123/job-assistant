@@ -387,6 +387,69 @@ test("search reports read-only continuation evidence even at the final page and 
   } finally { globalThis.fetch = originalFetch; browser.scripting.executeScript = originalScript; }
 });
 
+test("scroll continuation reports new links and an explicit unchanged end, stopping on limits or changed pages", async () => {
+  const originalFetch = globalThis.fetch;
+  const browser = (globalThis as Record<string, any>).chrome;
+  const originalScript = browser.scripting.executeScript;
+  const reports: Array<Record<string, any>> = [];
+  const url = "https://www.zhipin.com/web/geek/jobs?query=Java&city=101020100";
+  const oldLink = "https://www.zhipin.com/job_detail/a.html", newLink = "https://www.zhipin.com/job_detail/b.html";
+  const evidence = { version: 1, linkCount: 1, pagination: { matched: 0, visible: 0, enabled: 0, disabled: 0, ambiguous: false, truncated: false },
+    lists: { matched: 1, visible: 1, truncated: false }, scrollContainers: [{ kind: "document", depth: 0, clientHeight: 825, scrollHeight: 2434, scrollTop: 0, remaining: 1609, canScroll: true, atEnd: false }], truncated: false };
+  try {
+    let running = true;
+    globalThis.fetch = (async (path: string, options: RequestInit) => {
+      if (path.endsWith("/result")) { reports.push(JSON.parse(String(options.body))); return response({ ok: true }); }
+      return response({ run: { id: "r", state: running ? "running" : "paused" } });
+    }) as typeof fetch;
+    for (const scenario of ["changed", "next-changed", "next-control", "end", "limit", "wrong-query", "verification", "paused"]) {
+      reports.length = 0;
+      running = true;
+      let clicked = 0, scrolled = 0;
+      store.jobAssistantAutomationTabs = { runId: "r", searchTabId: 7 };
+      tab = { ...tab, url, status: "complete" };
+      browser.scripting.executeScript = async (options: { func: { name: string }; args?: unknown[] }) => {
+        if (options.func.name === "inspectSearchContinuation") return [{ result: evidence }];
+        if (options.func.name === "advanceSearch") { clicked++; return [{ result: { clicked: false } }]; }
+        if (options.func.name === "advanceSearchList") {
+          scrolled++;
+          assert.deepEqual(options.args, [url, oldLink]);
+          if (scenario === "paused") running = false;
+          const outcome = scenario === "end" ? "end" : scenario === "limit" ? "limit" : scenario === "verification" ? "blocked" : scenario === "next-control" ? "next-control" : "changed";
+          return [{ result: { outcome, reason: scenario === "verification" ? "verification-required" : undefined,
+            pageUrl: scenario === "wrong-query" ? url.replace("query=Java", "query=Python") : url,
+            links: outcome === "end" ? [oldLink] : [oldLink, newLink], hasNext: outcome !== "end" } }];
+        }
+        return [{ result: { recognized: true, links: [oldLink], pageUrl: url, hasNext: false } }];
+      };
+      await worker.execute({ ...command, kind: ["end", "next-changed"].includes(scenario) ? "next" : "search", url, previousSignature: oldLink }, "token");
+      assert.equal(scrolled, 1, scenario);
+      assert.equal(clicked, 0, scenario);
+      if (scenario === "paused") { assert.equal(reports.length, 0); continue; }
+      assert.equal(reports.length, 1);
+      if (["changed", "next-changed"].includes(scenario)) {
+        assert.equal(reports[0].outcome, "ok");
+        assert.deepEqual(reports[0].links, [oldLink, newLink]);
+        assert.equal(reports[0].hasNext, true);
+        assert.equal(reports[0].continuationEnded, undefined);
+      } else if (scenario === "next-control") {
+        assert.equal(reports[0].outcome, "ok");
+        assert.deepEqual(reports[0].links, [oldLink]);
+        assert.equal(reports[0].hasNext, true);
+      } else if (scenario === "end") {
+        assert.equal(reports[0].outcome, "ok");
+        assert.deepEqual(reports[0].links, [oldLink]);
+        assert.equal(reports[0].hasNext, false);
+        assert.equal(reports[0].continuationEnded, true);
+      } else {
+        assert.equal(reports[0].links, undefined);
+        if (scenario === "verification") assert.equal(reports[0].reason, "verification-required");
+        else assert.equal(reports[0].diagnostic.code, scenario === "limit" ? "continuation-limit" : "url-mismatch");
+      }
+    }
+  } finally { globalThis.fetch = originalFetch; browser.scripting.executeScript = originalScript; }
+});
+
 test("pagination accepts new links only from the same search, retaining login and verification stops", async () => {
   const originalFetch = globalThis.fetch;
   const originalTimeout = globalThis.setTimeout;

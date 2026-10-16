@@ -1,10 +1,10 @@
 import { extractJobs } from "./extract.mjs";
-import { inspectSplitSearch, inspectSearchContinuation, clickAndReadSplitDetail } from "./split-page.mjs";
+import { inspectSplitSearch, inspectSearchContinuation, advanceSearchList, clickAndReadSplitDetail } from "./split-page.mjs";
 import { runExtensionApplication, boundedApplicationScript } from "./application.mjs";
 import { runChatDiagnostic } from "./chat-diagnostics.mjs";
 
 const API_BASE = "http://127.0.0.1:3000";
-const VERSION = "0.4.11";
+const VERSION = "0.4.12";
 const STATE_KEY = "jobAssistantAutomationTabs";
 const DIAGNOSTIC_KEY = "jobAssistantAutomationDiagnostic";
 const ALARM = "job-assistant-automation-poll";
@@ -258,7 +258,7 @@ export function inspectSearch() {
         return url.origin === "https://www.zhipin.com" && m ? `${url.origin}/job_detail/${m[1]}.html` : "";
       } catch { return ""; }
     }).filter(Boolean);
-  const unique = [...new Set(links)].sort().slice(0, 30);
+  const unique = [...new Set(links)].sort().slice(0, 300);
   const enabled = (node) => node && visible(node) && !node.disabled && node.getAttribute("aria-disabled") !== "true" && !node.classList.contains("disabled");
   const textNext = [...document.querySelectorAll("button, a")].find((node) => {
     const label = clean(node.innerText || node.getAttribute("aria-label") || node.title);
@@ -511,28 +511,66 @@ export async function execute(command, tokenValue) {
     if (page.login || page.challenge) return report(tokenValue, command, { outcome: "blocked", url: currentUrl || command.url, reason: page.login ? "login-required" : "verification-required" });
     if (!page.recognized) return report(tokenValue, command, { outcome: "error", url: currentUrl || command.url, reason: "page-unrecognized" });
     await readSearchDiagnostic(tabId);
+    let continuationEnded = false;
+    const scrollList = async () => {
+      if (!(await runningRun(tokenValue, command.runId))) return null;
+      await mark("advancing-page");
+      const [result] = await boundedApplicationScript(chrome.scripting.executeScript({ target: { tabId }, world: "ISOLATED", func: advanceSearchList,
+        args: [command.url, listSignature(page.links)] }), 10_000);
+      if (!(await runningRun(tokenValue, command.runId))) return null;
+      const continuation = result?.result;
+      currentUrl = await actualUrl(tabId);
+      if (continuation?.outcome === "blocked") return { stop: { outcome: "blocked", url: currentUrl || command.url,
+        reason: continuation.reason === "login-required" ? "login-required" : "verification-required" } };
+      if (!matchesIntendedUrl(currentUrl, command.url, "search") ||
+          !matchesIntendedUrl(continuation?.pageUrl, command.url, "search"))
+        return { stop: { outcome: "error", url: currentUrl || command.url, reason: "navigation-failed", diagnostic: { code: "url-mismatch" } } };
+      await readSearchDiagnostic(tabId);
+      if (!["changed", "next-control", "end"].includes(continuation?.outcome))
+        return { stop: { outcome: "error", url: currentUrl, reason: "page-unrecognized", diagnostic: {
+          code: continuation?.outcome === "limit" ? "continuation-limit" : "continuation-unrecognized" } } };
+      if (continuation.outcome === "changed" || continuation.outcome === "end") {
+        page = { ...page, links: continuation.links, pageUrl: continuation.pageUrl, hasNext: continuation.hasNext };
+        continuationEnded = command.kind === "next" && continuation.outcome === "end";
+      } else page.hasNext = true;
+      return continuation;
+    };
+    if (command.kind === "search" && !page.hasNext && searchDiagnostic?.scrollContainers?.some((container) => container.canScroll && !container.atEnd)) {
+      const continuation = await scrollList();
+      if (!continuation) return;
+      if (continuation.stop) return report(tokenValue, command, continuation.stop);
+    }
     if (command.kind === "next") {
       if (!(await runningRun(tokenValue, command.runId))) return;
       if (await actualUrl(tabId) !== command.url || !isSearchUrl(command.url)) return report(tokenValue, command, { outcome: "error", url: await actualUrl(tabId) || command.url, reason: "navigation-failed" });
       const oldSignature = command.previousSignature || listSignature(page.links);
       if (command.previousSignature && listSignature(page.links) !== command.previousSignature) return report(tokenValue, command, { outcome: "error", url: currentUrl, reason: "page-repeated" });
-      const [advanced] = await chrome.scripting.executeScript({ target: { tabId }, world: "ISOLATED", func: advanceSearch });
-      if (!advanced?.result?.clicked) return report(tokenValue, command, { outcome: "error", url: command.url, reason: "page-repeated" });
       let changed = null;
-      let lastCancellationCheck = 0;
-      for (let elapsed = 0; elapsed < WAIT_MS; elapsed += WAIT_INTERVAL_MS) {
-        await sleep(WAIT_INTERVAL_MS);
-        if (elapsed - lastCancellationCheck >= 2_000) {
-          lastCancellationCheck = elapsed;
-          if (!(await runningRun(tokenValue, command.runId))) return;
+      if (!page.hasNext && searchDiagnostic?.scrollContainers?.some((container) => container.canScroll)) {
+        const continuation = await scrollList();
+        if (!continuation) return;
+        if (continuation.stop) return report(tokenValue, command, continuation.stop);
+        if (continuation.outcome !== "next-control") changed = page;
+      }
+      if (!changed) {
+        if (!(await runningRun(tokenValue, command.runId))) return;
+        const [advanced] = await chrome.scripting.executeScript({ target: { tabId }, world: "ISOLATED", func: advanceSearch });
+        if (!advanced?.result?.clicked) return report(tokenValue, command, { outcome: "error", url: command.url, reason: "page-repeated" });
+        let lastCancellationCheck = 0;
+        for (let elapsed = 0; elapsed < WAIT_MS; elapsed += WAIT_INTERVAL_MS) {
+          await sleep(WAIT_INTERVAL_MS);
+          if (elapsed - lastCancellationCheck >= 2_000) {
+            lastCancellationCheck = elapsed;
+            if (!(await runningRun(tokenValue, command.runId))) return;
+          }
+          page = await inspect(tabId);
+          currentUrl = await actualUrl(tabId);
+          if (page?.login || page?.challenge) return report(tokenValue, command, { outcome: "blocked", url: currentUrl || command.url, reason: page.login ? "login-required" : "verification-required" });
+          if (!matchesIntendedUrl(currentUrl, command.url, "search") ||
+            (page?.pageUrl && !matchesIntendedUrl(page.pageUrl, command.url, "search")))
+            return report(tokenValue, command, { outcome: "error", url: currentUrl || command.url, reason: "navigation-failed", diagnostic: { code: "url-mismatch" } });
+          if (page?.recognized && (page.links.length > 0 || page.empty) && listSignature(page.links) !== oldSignature) { changed = page; break; }
         }
-        page = await inspect(tabId);
-        currentUrl = await actualUrl(tabId);
-        if (page?.login || page?.challenge) return report(tokenValue, command, { outcome: "blocked", url: currentUrl || command.url, reason: page.login ? "login-required" : "verification-required" });
-        if (!matchesIntendedUrl(currentUrl, command.url, "search") ||
-          (page?.pageUrl && !matchesIntendedUrl(page.pageUrl, command.url, "search")))
-          return report(tokenValue, command, { outcome: "error", url: currentUrl || command.url, reason: "navigation-failed", diagnostic: { code: "url-mismatch" } });
-        if (page?.recognized && (page.links.length > 0 || page.empty) && listSignature(page.links) !== oldSignature) { changed = page; break; }
       }
       if (!changed) return report(tokenValue, command, { outcome: "error", url: currentUrl || command.url, reason: "page-repeated" });
       page = changed;
@@ -545,7 +583,7 @@ export async function execute(command, tokenValue) {
       (page?.pageUrl && !matchesIntendedUrl(page.pageUrl, command.url, "search")))
       return report(tokenValue, command, { outcome: "error", url: currentUrl || command.url, reason: "navigation-failed", diagnostic: { code: "url-mismatch" } });
     await mark("reporting");
-    const response = await report(tokenValue, command, { outcome: "ok", url: currentUrl, links: page.links, hasNext: page.hasNext, signature: listSignature(page.links) });
+    const response = await report(tokenValue, command, { outcome: "ok", url: currentUrl, links: page.links, hasNext: page.hasNext, signature: listSignature(page.links), ...(continuationEnded ? { continuationEnded: true } : {}) });
     await mark("idle", "idle");
     return response;
   } catch (error) {

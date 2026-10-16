@@ -585,7 +585,7 @@ test("semantic header rejects conflicting links outside the job card and changed
 });
 
 test("plain recruiter names require an aligned exact employer and explicit recruiting role and stay bound across sends", async () => {
-  for (const label of ["hr", "HRBP", "招聘者", "人事"]) {
+  for (const label of ["hr", "HRBP", "招聘者", "人事", "招聘助理"]) {
     const f = semanticChatFixture();
     f.recruiter.innerText = "周颖";
     const role = element(label);
@@ -597,6 +597,10 @@ test("plain recruiter names require an aligned exact employer and explicit recru
       bottom: 170,
     });
     f.allFields.push(role);
+    const more = element("更多");
+    more.parentElement = f.root;
+    more.getBoundingClientRect = () => ({ left: 710, right: 760, top: 140, bottom: 170 });
+    f.allFields.push(more);
     const request = { mode: "inspect", conversationOrigin: job.url };
     const result = await runPage(f.document, request);
     assert.equal(result.page, "conversation", label);

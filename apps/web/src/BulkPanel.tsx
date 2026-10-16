@@ -241,7 +241,7 @@ export function BulkPanel({
         {!connected && (
           <div className="notice">
           {data && !data.extension.paired ? "配对已失效或尚未连接，请重新生成配对码并连接扩展。" : ""}
-            请保持 BOSS 已登录，扩展至少为 0.4.8；当前推荐 0.4.11。当前上报版本：
+            请保持 BOSS 已登录，扩展至少为 0.4.8；当前推荐 0.4.12。当前上报版本：
             {data?.extension.version ?? "未连接"}。{" "}
             <button className="link" onClick={onConnect}>
               查看连接
