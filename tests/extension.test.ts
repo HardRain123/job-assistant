@@ -10,6 +10,8 @@ import Fastify from "fastify";
 import { Store } from "../packages/storage/src/index.ts";
 import { createApp } from "../apps/api/src/app.ts";
 import { createExtensionAccess } from "../apps/api/src/extension.ts";
+// @ts-expect-error The shipped extension helper is plain JavaScript.
+import { localApiBase, connectionApiBase } from "../apps/browser-extension/connection.mjs";
 
 const origin = `chrome-extension://${"a".repeat(32)}`;
 const otherOrigin = `chrome-extension://${"b".repeat(32)}`;
@@ -195,7 +197,7 @@ test("扩展弹窗请求与真实 API 契约一致：配对、导入、查询和
     const popup = readFileSync(
       new URL("../apps/browser-extension/popup.js", import.meta.url),
       "utf8",
-    ).replace(/^import .*\n/, "");
+    ).replace(/^import .*\r?\n/gm, "");
     const element = {
       addEventListener() {},
       classList: { toggle() {}, add() {} },
@@ -203,6 +205,7 @@ test("扩展弹窗请求与真实 API 契约一致：配对、导入、查询和
     const { api, importPayload } = runInNewContext(
       popup + "\n({api, importPayload})",
       {
+        localApiBase,
         document: { getElementById: () => element },
         chrome: {
           storage: {
@@ -258,6 +261,56 @@ test("扩展弹窗请求与真实 API 契约一致：配对、导入、查询和
   } finally {
     await f.close();
   }
+});
+
+test("扩展更换本机端口时重新配对，令牌和端口一同保存，未提交的端口不改变认证请求", async () => {
+  const f = await fixture();
+  try {
+    const elements = new Map<string, any>();
+    const element = (id: string) => {
+      if (!elements.has(id)) elements.set(id, {
+        value: "", handlers: {}, classList: { toggle() {}, add() {}, remove() {} }, style: {},
+        addEventListener(name: string, fn: unknown) { this.handlers[name] = fn; },
+      });
+      return elements.get(id);
+    };
+    const stored: Record<string, unknown> = {};
+    const requests: Array<{ url: string; headers: any }> = [];
+    const source = readFileSync(new URL("../apps/browser-extension/popup.js", import.meta.url), "utf8").replace(/^import .*\r?\n/gm, "");
+    const popup = runInNewContext(source + "\n({api, init})", {
+      document: { getElementById: element }, localApiBase, AbortController, setTimeout, clearTimeout,
+      chrome: { runtime: { sendMessage() {} }, storage: { local: {
+        setAccessLevel: async () => {}, get: async () => ({ ...stored }),
+        set: async (value: Record<string, unknown>) => Object.assign(stored, value),
+      } } },
+      fetch: async (url: string, options: any) => {
+        requests.push({ url, headers: options.headers });
+        const response = await f.app.inject({ method: options.method ?? "GET", url: new URL(url).pathname,
+          headers: { ...options.headers, origin }, payload: options.body });
+        return { ok: response.statusCode < 400, status: response.statusCode, json: async () => response.json() };
+      },
+    });
+    await popup.init();
+    element("workbenchPort").value = "3003";
+    element("pairCode").value = await f.code();
+    await element("pairForm").handlers.submit({ preventDefault() {}, submitter: {} });
+    assert.equal(stored.jobAssistantPort, 3003);
+    assert.equal(typeof stored.jobAssistantToken, "string");
+    assert.equal(requests[0]!.url, "http://127.0.0.1:3003/extension/v1/pair");
+    assert.equal(requests[0]!.headers.Authorization, undefined);
+    assert.equal(element("workbenchLink").href, "http://127.0.0.1:3003/");
+    element("workbenchPort").value = "3004";
+    const status = await popup.api("/extension/v1/status", { method: "POST", headers: { Authorization: `Bearer ${stored.jobAssistantToken}` } });
+    assert.equal(status.connected, true);
+    assert.equal(requests.at(-1)!.url, "http://127.0.0.1:3003/extension/v1/status");
+    for (const port of [0, 80, 65536, "3003/evil", "https://example.com", "3003.5"]) {
+      assert.throws(() => localApiBase(port), /端口/);
+    }
+    assert.equal(connectionApiBase({ jobAssistantToken: "old" }, "old"), "http://127.0.0.1:3000");
+    assert.equal(connectionApiBase(stored, stored.jobAssistantToken), "http://127.0.0.1:3003");
+    assert.throws(() => connectionApiBase(stored, "previous-token"), /连接已变化/);
+    assert.throws(() => connectionApiBase({ jobAssistantPort: 3003 }, "previous-token"), /连接已变化/);
+  } finally { await f.close(); }
 });
 
 test("配对码单次使用、错误次数限制、过期、连接替换和撤销", async () => {

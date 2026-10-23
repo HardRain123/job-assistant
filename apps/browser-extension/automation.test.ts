@@ -43,6 +43,98 @@ function response(body: unknown) {
 }
 const command = { id: "c", runId: "r", leaseToken: "l", kind: "next" as const, url: "https://www.zhipin.com/web/geek/job?city=101010100", previousSignature: "https://www.zhipin.com/job_detail/a.html", intervalSeconds: 0 };
 
+test("自动任务请求沿用配对端口，连接被替换后不发送旧令牌", async () => {
+  const browser = (globalThis as Record<string, any>).chrome;
+  const originalGet = browser.storage.local.get, originalFetch = globalThis.fetch;
+  const requests: string[] = [];
+  try {
+    browser.storage.local.get = async () => ({ jobAssistantToken: "token", jobAssistantPort: 3003 });
+    globalThis.fetch = (async (url: string) => { requests.push(url); return response({ command: null, task: null }); }) as typeof fetch;
+    await worker.wake();
+    assert.ok(requests.length > 0);
+    assert.ok(requests.every((url) => url.startsWith("http://127.0.0.1:3003/extension/")));
+    requests.length = 0;
+    let reads = 0;
+    browser.storage.local.get = async () => ({ jobAssistantToken: ++reads === 1 ? "token" : "new-token", jobAssistantPort: 3004 });
+    await worker.wake();
+    assert.equal(requests.length, 0);
+  } finally { browser.storage.local.get = originalGet; globalThis.fetch = originalFetch; }
+});
+
+function fakeClock(autoSleep = true) {
+  const original = { setTimeout: globalThis.setTimeout, clearTimeout: globalThis.clearTimeout, now: Date.now };
+  let time = 1_000_000, nextId = 0;
+  const timers = new Map<number, { at: number; callback: () => void }>();
+  const clock = {
+    onSleep: () => {},
+    now: () => time,
+    advance(ms: number) {
+      const end = time + ms;
+      while (true) {
+        const next = [...timers].filter(([, timer]) => timer.at <= end).sort((a, b) => a[1].at - b[1].at)[0];
+        if (!next) break;
+        time = next[1].at;
+        timers.delete(next[0]);
+        next[1].callback();
+      }
+      time = end;
+    },
+    restore() { globalThis.setTimeout = original.setTimeout; globalThis.clearTimeout = original.clearTimeout; Date.now = original.now; },
+  };
+  Date.now = () => time;
+  globalThis.setTimeout = ((callback: () => void, ms = 0) => {
+    const id = ++nextId;
+    timers.set(id, { at: time + Number(ms), callback });
+    if (autoSleep && ms <= 500) queueMicrotask(async () => {
+      // Let immediately resolved browser calls clear their deadline timers;
+      // only genuinely pending short waits advance this synthetic clock.
+      for (let turn = 0; turn < 12; turn++) await Promise.resolve();
+      if (timers.has(id)) { clock.onSleep(); clock.advance(Number(ms)); }
+    });
+    return id as unknown as ReturnType<typeof setTimeout>;
+  }) as typeof setTimeout;
+  globalThis.clearTimeout = ((id: ReturnType<typeof setTimeout>) => { timers.delete(Number(id)); }) as typeof clearTimeout;
+  return clock;
+}
+async function settle() { for (let turn = 0; turn < 100; turn++) await Promise.resolve(); }
+
+async function executionFixture(action: (fixture: {
+  browser: any; clock: ReturnType<typeof fakeClock>; reports: Array<Record<string, any>>;
+  requests: string[]; scripts: string[]; navigations: unknown[]; searchUrl: string;
+}) => Promise<void>) {
+  const browser = (globalThis as Record<string, any>).chrome;
+  const originalFetch = globalThis.fetch;
+  const original = { tabs: { ...browser.tabs }, local: { ...browser.storage.local },
+    session: { ...browser.storage.session }, scripting: { ...browser.scripting } };
+  const clock = fakeClock();
+  const reports: Array<Record<string, any>> = [], requests: string[] = [], scripts: string[] = [], navigations: unknown[] = [];
+  const searchUrl = "https://www.zhipin.com/web/geek/jobs?query=Java&city=101020100";
+  try {
+    tab = { ...tab, url: searchUrl, status: "complete" };
+    store.jobAssistantAutomationTabs = { runId: "r", searchTabId: 7, detailTabId: 7 };
+    browser.tabs.update = async (_id: number, options: { url?: string }) => {
+      navigations.push(options); if (options.url) tab = { ...tab, url: options.url }; return tab;
+    };
+    browser.scripting.executeScript = async (options: { func: { name: string } }) => {
+      scripts.push(options.func.name);
+      if (options.func.name === "advanceSearch") return [{ result: { clicked: false } }];
+      if (options.func.name === "inspectSearchContinuation") return [{ result: null }];
+      return [{ result: { recognized: true, links: [command.previousSignature], pageUrl: tab.url, hasNext: false } }];
+    };
+    globalThis.fetch = (async (path: string, options: RequestInit) => {
+      requests.push(path);
+      if (path.endsWith("/result")) { reports.push(JSON.parse(String(options.body))); return response({ ok: true }); }
+      if (path.endsWith("/claim") || path.endsWith("diagnostic-claim")) return response({ command: null });
+      return response({ run: { id: "r", state: "running" } });
+    }) as typeof fetch;
+    await action({ browser, clock, reports, requests, scripts, navigations, searchUrl });
+  } finally {
+    Object.assign(browser.tabs, original.tabs); Object.assign(browser.storage.local, original.local);
+    Object.assign(browser.storage.session, original.session); Object.assign(browser.scripting, original.scripting);
+    globalThis.fetch = originalFetch; clock.restore();
+  }
+}
+
 test("footer login text does not block, while visible login and verification controls do", () => {
   installDom({ "a[href*='/job_detail/']": [], "button, a": [], ".job-list-box, [class*='job-list'], [class*='empty']": [] });
   assert.equal(worker.inspectSearch().login, false);
@@ -78,15 +170,14 @@ test("observed BOSS pagination icon is accepted only through its enabled control
 });
 
 test("waitForUrl requires a completed tab and recognized rendered list", async () => {
-  const originalTimeout = globalThis.setTimeout;
-  globalThis.setTimeout = ((fn: () => void) => { queueMicrotask(fn); return 1 as unknown as ReturnType<typeof setTimeout>; }) as typeof setTimeout;
+  const clock = fakeClock();
   try {
     tab = { ...tab, status: "loading" };
     scriptResult = { recognized: true, links: ["https://www.zhipin.com/job_detail/a.html"] };
     const pending = worker.waitForUrl(7, tab.url, "search", "token", "r");
     queueMicrotask(() => { tab = { ...tab, status: "complete" }; });
     assert.deepEqual(await pending, { ok: true });
-  } finally { globalThis.setTimeout = originalTimeout; }
+  } finally { clock.restore(); }
 });
 
 test("waitForUrl reports a completed login redirect before matching the requested URL", async () => {
@@ -96,32 +187,29 @@ test("waitForUrl reports a completed login redirect before matching the requeste
 });
 
 test("waitForUrl distinguishes an opened but unrecognized matching page", async () => {
-  const originalTimeout = globalThis.setTimeout;
+  const clock = fakeClock();
   const originalFetch = globalThis.fetch;
-  globalThis.setTimeout = ((fn: () => void) => { queueMicrotask(fn); return 1 as unknown as ReturnType<typeof setTimeout>; }) as typeof setTimeout;
   globalThis.fetch = (async () => response({ run: { id: "r", state: "running" } })) as typeof fetch;
   try {
   tab = { ...tab, url: "https://www.zhipin.com/web/geek/jobs?query=frontend&city=101010100", status: "complete" };
   scriptResult = { login: false, challenge: false, recognized: false, links: [] };
   assert.deepEqual(await worker.waitForUrl(7, tab.url, "search", "token", "r"), { unrecognized: true, failure: { code: "dom-unrecognized", tabState: "complete" } });
-  } finally { globalThis.setTimeout = originalTimeout; globalThis.fetch = originalFetch; }
+  } finally { clock.restore(); globalThis.fetch = originalFetch; }
 });
 
 test("waitForUrl waits for delayed SPA content after the tab completes", async () => {
-  const originalTimeout = globalThis.setTimeout;
+  const clock = fakeClock();
   let waits = 0;
   try {
     tab = { ...tab, url: "https://www.zhipin.com/web/geek/jobs?query=AI&city=101020100", status: "complete" };
     scriptResult = { recognized: false, links: [], pageUrl: tab.url, readyState: "complete" };
-    globalThis.setTimeout = ((fn: () => void) => {
+    clock.onSleep = () => {
       waits++;
       scriptResult = { recognized: true, links: ["https://www.zhipin.com/job_detail/a.html"], pageUrl: tab.url, readyState: "complete" };
-      queueMicrotask(fn);
-      return 1 as unknown as ReturnType<typeof setTimeout>;
-    }) as typeof setTimeout;
+    };
     assert.deepEqual(await worker.waitForUrl(7, tab.url, "search", "token", "r"), { ok: true });
     assert.equal(waits, 1);
-  } finally { globalThis.setTimeout = originalTimeout; }
+  } finally { clock.restore(); }
 });
 
 test("inline details report the actual search URL and bound identity, rejecting a mismatched panel", async () => {
@@ -168,7 +256,7 @@ test("inline details report the actual search URL and bound identity, rejecting 
 
 test("同页缺字段时核验独立详情，保留完整雇主记录，拒绝错误链接或标题", async () => {
   const originalFetch = globalThis.fetch;
-  const originalTimeout = globalThis.setTimeout;
+  const clock = fakeClock();
   const url = "https://www.zhipin.com/job_detail/a.html";
   const searchUrl = "https://www.zhipin.com/web/geek/jobs?query=AI&city=101020100";
   const base = { url, title: "AI工程师", company: "示例公司", description: "企业 AI 应用开发", detail: true, location: "上海", salaryText: "", industry: "", status: "active" };
@@ -176,8 +264,7 @@ test("同页缺字段时核验独立详情，保留完整雇主记录，拒绝�
   const evidence = { title: base.title, company: base.company, registeredCompany: "示例公司有限公司", descriptionPresent: true, clientLabelSeen: false, clientNames: [], headerLines: ["25-35K"], companySections: [] };
   const reports: Array<Record<string, any>> = [];
   try {
-    globalThis.setTimeout = ((fn: () => void) => { queueMicrotask(fn); return 1 as unknown as ReturnType<typeof setTimeout>; }) as typeof setTimeout;
-    globalThis.fetch = (async (path: string, options: RequestInit) => {
+      globalThis.fetch = (async (path: string, options: RequestInit) => {
       if (path.endsWith("/result")) { reports.push(JSON.parse(String(options.body))); return response({ ok: true }); }
       return response({ run: { id: "r", state: "running" } });
     }) as typeof fetch;
@@ -262,19 +349,18 @@ test("同页缺字段时核验独立详情，保留完整雇主记录，拒绝�
     assert.equal(wrongUrl.pageEvidence, undefined);
     const login = await run(base, detail, { login: true });
     assert.equal(login.outcome, "blocked");
-  } finally { globalThis.fetch = originalFetch; globalThis.setTimeout = originalTimeout; scriptResults = null; }
+  } finally { globalThis.fetch = originalFetch; clock.restore(); scriptResults = null; }
 });
 
 test("unchanged inline detail falls back once to the exact standalone URL with the same checks", async () => {
   const originalFetch = globalThis.fetch;
-  const originalTimeout = globalThis.setTimeout;
+  const clock = fakeClock();
   const url = "https://www.zhipin.com/job_detail/a.html";
   const searchUrl = "https://www.zhipin.com/web/geek/jobs?query=AI&city=101020100";
   const job = { url, title: "AI工程师", company: "示例公司", description: "企业AI应用开发", detail: true, salaryText: "25-35K", industry: "计算机软件" };
   const reports: Array<Record<string, unknown>> = [];
   try {
-    globalThis.setTimeout = ((fn: () => void) => { queueMicrotask(fn); return 1 as unknown as ReturnType<typeof setTimeout>; }) as typeof setTimeout;
-    globalThis.fetch = (async (path: string, options: RequestInit) => {
+      globalThis.fetch = (async (path: string, options: RequestInit) => {
       if (path.endsWith("/result")) { reports.push(JSON.parse(String(options.body))); return response({ ok: true }); }
       return response({ run: { id: "r", state: "running" } });
     }) as typeof fetch;
@@ -312,7 +398,7 @@ test("unchanged inline detail falls back once to the exact standalone URL with t
         assert.equal(scriptNames.includes("extractJobs"), false);
       }
     }
-  } finally { globalThis.fetch = originalFetch; globalThis.setTimeout = originalTimeout; scriptResults = null; }
+  } finally { globalThis.fetch = originalFetch; clock.restore(); scriptResults = null; }
 });
 
 test("next never advances when paused, missing, or changed away from the commanded search", async () => {
@@ -464,7 +550,7 @@ test("scroll continuation reports new links and an explicit unchanged end, stopp
 
 test("pagination accepts new links only from the same search, retaining login and verification stops", async () => {
   const originalFetch = globalThis.fetch;
-  const originalTimeout = globalThis.setTimeout;
+  const clock = fakeClock();
   const browser = (globalThis as Record<string, any>).chrome;
   const originalScript = browser.scripting.executeScript;
   const reports: Array<Record<string, any>> = [];
@@ -474,8 +560,7 @@ test("pagination accepts new links only from the same search, retaining login an
   const oldLink = "https://www.zhipin.com/job_detail/a.html";
   const newLink = "https://www.zhipin.com/job_detail/b.html";
   try {
-    globalThis.setTimeout = ((fn: () => void) => { queueMicrotask(fn); return 1 as unknown as ReturnType<typeof setTimeout>; }) as typeof setTimeout;
-    globalThis.fetch = (async (path: string, options: RequestInit) => {
+      globalThis.fetch = (async (path: string, options: RequestInit) => {
       if (path.endsWith("/result")) { reports.push(JSON.parse(String(options.body))); return response({ ok: true }); }
       return response({ run: { id: "r", state: "running" } });
     }) as typeof fetch;
@@ -518,7 +603,7 @@ test("pagination accepts new links only from the same search, retaining login an
         }
       }
     }
-  } finally { globalThis.fetch = originalFetch; globalThis.setTimeout = originalTimeout; browser.scripting.executeScript = originalScript; }
+  } finally { globalThis.fetch = originalFetch; clock.restore(); browser.scripting.executeScript = originalScript; }
 });
 
 test("a rejected initial status check is a POST and is reported with a fixed failure", async () => {
@@ -542,12 +627,11 @@ test("a rejected initial status check is a POST and is reported with a fixed fai
 });
 
 test("failed injection is classified without exposing the raw exception", async () => {
-  const originalTimeout = globalThis.setTimeout;
+  const clock = fakeClock();
   const originalFetch = globalThis.fetch;
   const reports: Array<Record<string, unknown>> = [];
   try {
-    globalThis.setTimeout = ((fn: () => void) => { queueMicrotask(fn); return 1 as unknown as ReturnType<typeof setTimeout>; }) as typeof setTimeout;
-    globalThis.fetch = (async (path: string, options: RequestInit) => {
+      globalThis.fetch = (async (path: string, options: RequestInit) => {
       if (path.endsWith("/result")) { reports.push(JSON.parse(String(options.body))); return response({ ok: true }); }
       return response({ run: { id: "r", state: "running" } });
     }) as typeof fetch;
@@ -559,7 +643,7 @@ test("failed injection is classified without exposing the raw exception", async 
     assert.equal(JSON.stringify(reports).includes("private.example"), false);
     assert.equal(JSON.stringify(reports).includes("secret"), false);
     assert.equal(worker.classifyFailure(new Error("TypeError: value is not a function")), "script-error");
-  } finally { globalThis.setTimeout = originalTimeout; globalThis.fetch = originalFetch; scriptError = null; }
+  } finally { clock.restore(); globalThis.fetch = originalFetch; scriptError = null; }
 });
 
 test("an empty poll preserves the last fixed failure diagnostic", async () => {
@@ -570,4 +654,221 @@ test("an empty poll preserves the last fixed failure diagnostic", async () => {
     await worker.wake();
     assert.deepEqual(store.jobAssistantAutomationDiagnostic, { phase: "failed", status: "failed", reason: "page-unrecognized" });
   } finally { globalThis.fetch = originalFetch; }
+});
+
+test("collection call deadlines prevent invocation after budget expiry and discard late completion", async () => {
+  const clock = fakeClock(false);
+  try {
+    let calls = 0;
+    await assert.rejects(worker.boundedCollectionCall(() => { calls++; }, { deadline: clock.now() }), { code: "command-timeout" });
+    assert.equal(calls, 0);
+    let release: (value: unknown) => void = () => {};
+    const pending = worker.boundedCollectionCall(() => { calls++; return new Promise((resolve) => { release = resolve; }); }, { deadline: clock.now() + 60_000 });
+    const rejected = assert.rejects(pending, { code: "browser-timeout" });
+    clock.advance(3000);
+    await rejected;
+    release("late success"); await settle();
+    assert.equal(calls, 1);
+  } finally { clock.restore(); }
+});
+
+test("an unresolved detail injection reports one timeout and its late result cannot navigate or import", async () => {
+  await executionFixture(async ({ browser, clock, reports, scripts, navigations, searchUrl }) => {
+    const originalScript = browser.scripting.executeScript;
+    let release: (value: unknown) => void = () => {};
+    browser.scripting.executeScript = (options: { func: { name: string } }) => {
+      if (options.func.name === "clickAndReadSplitDetail") {
+        scripts.push(options.func.name);
+        return new Promise((resolve) => { release = resolve; });
+      }
+      return originalScript(options);
+    };
+    const pending = worker.execute({ ...command, kind: "detail", url: command.previousSignature, searchUrl }, "token");
+    await settle();
+    assert.equal(scripts.filter((name) => name === "clickAndReadSplitDetail").length, 1);
+    clock.advance(10_000); await pending;
+    assert.equal(reports.length, 1);
+    assert.equal(reports[0].diagnostic.code, "browser-timeout");
+    assert.equal(reports[0].diagnostic.stage, "reading-page");
+    release([{ result: { ok: true, job: { url: command.previousSignature, title: "Java", company: "甲", description: "开发职责", detail: true },
+      detailContext: { jobUrl: command.previousSignature, title: "Java", company: "甲" } } }]);
+    await settle();
+    assert.equal(reports.length, 1);
+    assert.equal(navigations.length, 0);
+    assert.equal(scripts.includes("extractJobs"), false);
+    assert.equal(reports[0].jobs, undefined);
+  });
+});
+
+test("an unresolved tab query exits instead of opening a replacement tab", async () => {
+  await executionFixture(async ({ browser, clock, reports, navigations, searchUrl }) => {
+    let creates = 0;
+    browser.tabs.get = () => new Promise(() => {});
+    browser.tabs.create = async () => { creates++; return tab; };
+    const pending = worker.execute({ ...command, kind: "search", url: searchUrl }, "token");
+    await settle(); clock.advance(3000); await pending;
+    assert.equal(creates, 0);
+    assert.equal(navigations.length, 0);
+    assert.equal(reports.length, 1);
+    assert.equal(reports[0].diagnostic.code, "browser-timeout");
+  });
+});
+
+test("a hung diagnostic storage write cannot prevent collection completion", async () => {
+  await executionFixture(async ({ browser, clock, reports, searchUrl }) => {
+    browser.storage.local.set = () => new Promise(() => {});
+    let done = false;
+    const pending = worker.execute({ ...command, kind: "search", url: searchUrl }, "token").finally(() => { done = true; });
+    for (let step = 0; step < 15 && !done; step++) { await settle(); clock.advance(1000); }
+    await pending;
+    assert.equal(done, true);
+    assert.equal(reports.length, 1);
+    assert.equal(reports[0].outcome, "ok");
+  });
+});
+
+test("slow resolved browser reads consume actual page-wait time instead of a fixed iteration allowance", async () => {
+  await executionFixture(async ({ browser, clock, searchUrl }) => {
+    let reads = 0;
+    const began = clock.now();
+    browser.tabs.get = async () => { reads++; clock.advance(1000); return tab; };
+    browser.scripting.executeScript = async () => {
+      clock.advance(1000);
+      return [{ result: { recognized: false, links: [], pageUrl: searchUrl } }];
+    };
+    const result = await worker.waitForUrl(7, searchUrl, "search", "token", "r");
+    assert.equal(result.ok, undefined);
+    assert.ok(clock.now() - began <= 19_000);
+    assert.ok(reads <= 7, `only ${reads} iterations fit the actual 18-second page budget`);
+  });
+});
+
+test("slow pagination reads stop at their real deadline without a second click or false success", async () => {
+  await executionFixture(async ({ browser, clock, reports, searchUrl }) => {
+    let advanced = false, clicks = 0, afterClick = 0;
+    browser.scripting.executeScript = async (options: { func: { name: string } }) => {
+      if (options.func.name === "advanceSearch") { advanced = true; clicks++; afterClick = clock.now(); return [{ result: { clicked: true } }]; }
+      if (options.func.name === "inspectSearchContinuation") return [{ result: null }];
+      if (advanced) clock.advance(2000);
+      return [{ result: { recognized: true, links: [command.previousSignature], pageUrl: searchUrl, hasNext: true } }];
+    };
+    await worker.execute({ ...command, url: searchUrl }, "token");
+    assert.equal(clicks, 1);
+    assert.equal(reports.length, 1);
+    assert.equal(reports[0].outcome, "error");
+    assert.ok(clock.now() - afterClick <= 20_000);
+  });
+});
+
+test("a command shares one 60-second budget across restored search and standalone detail fallback", async () => {
+  await executionFixture(async ({ browser, clock, reports, navigations, searchUrl }) => {
+    store.jobAssistantAutomationTabs = {};
+    const originalFetch = globalThis.fetch;
+    let statusReads = 0;
+    const began = clock.now();
+    globalThis.fetch = (async (path: string, options: RequestInit) => {
+      if (path.endsWith("/automation-status")) { statusReads++; clock.advance(Math.min(9000, Math.max(0, began + 60_000 - clock.now()))); }
+      return originalFetch(path, options);
+    }) as typeof fetch;
+    const job = { url: command.previousSignature, title: "Java", company: "甲", description: "完整开发职责", detail: true };
+    browser.scripting.executeScript = async (options: { func: { name: string } }) => {
+      if (options.func.name === "clickAndReadSplitDetail") return [{ result: { ok: true, job,
+        detailContext: { jobUrl: job.url, title: job.title, company: job.company } } }];
+      if (options.func.name === "extractJobs") return [{ result: { pageUrl: tab.url, jobs: [job] } }];
+      return [{ result: { recognized: true, links: [job.url], pageUrl: tab.url } }];
+    };
+    await worker.execute({ ...command, kind: "detail", url: job.url, searchUrl }, "token");
+    assert.ok(statusReads >= 7);
+    assert.equal(clock.now() - began, 60_000);
+    assert.equal(reports.length, 1);
+    assert.equal(reports[0].outcome, "error");
+    assert.equal(reports[0].diagnostic.code, "command-timeout");
+    assert.equal(navigations.length, 2);
+  });
+});
+
+test("a pause between tab creation and navigation stops all following browser actions", async () => {
+  await executionFixture(async ({ browser, reports, navigations, searchUrl }) => {
+    store.jobAssistantAutomationTabs = {};
+    let creates = 0, statusReads = 0;
+    browser.tabs.create = async () => { creates++; return tab; };
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (path: string, options: RequestInit) => {
+      if (path.endsWith("/automation-status")) return response({ run: { id: "r", state: ++statusReads < 3 ? "running" : "paused" } });
+      return originalFetch(path, options);
+    }) as typeof fetch;
+    await worker.execute({ ...command, kind: "search", url: searchUrl }, "token");
+    assert.equal(creates, 1);
+    assert.equal(navigations.length, 0);
+    assert.equal(reports.length, 0);
+  });
+});
+
+test("wake remains single-flight while blocked and releases after a token-read timeout without accepting its late value", async () => {
+  await executionFixture(async ({ browser, clock, requests }) => {
+    const originalGet = browser.storage.local.get;
+    let release: (value: unknown) => void = () => {};
+    browser.storage.local.get = () => new Promise((resolve) => { release = resolve; });
+    const first = worker.wake(); await settle();
+    await worker.wake();
+    assert.equal(requests.length, 0);
+    clock.advance(3000); await first;
+    release({ jobAssistantToken: "late-token" }); await settle();
+    assert.equal(requests.length, 0);
+    browser.storage.local.get = originalGet;
+    await worker.wake();
+    assert.ok(requests.some((path) => path.endsWith("diagnostic-claim")));
+    assert.ok(requests.some((path) => path.endsWith("/extension/v1/claim")));
+  });
+});
+
+test("alarms during a stalled collection do not claim concurrently and its timeout releases the next wake", async () => {
+  await executionFixture(async ({ browser, clock, reports, scripts, searchUrl }) => {
+    const originalFetch = globalThis.fetch, originalScript = browser.scripting.executeScript;
+    let claims = 0, release: (value: unknown) => void = () => {};
+    globalThis.fetch = (async (path: string, options: RequestInit) => {
+      if (path.endsWith("/extension/v1/claim")) return response({ command: ++claims === 1 ? { ...command, kind: "detail", url: command.previousSignature, searchUrl } : null });
+      return originalFetch(path, options);
+    }) as typeof fetch;
+    browser.scripting.executeScript = (options: { func: { name: string } }) => {
+      if (options.func.name === "clickAndReadSplitDetail") {
+        scripts.push(options.func.name);
+        return new Promise((resolve) => { release = resolve; });
+      }
+      return originalScript(options);
+    };
+    const first = worker.wake(); await settle(); await settle();
+    assert.equal(scripts.filter((name) => name === "clickAndReadSplitDetail").length, 1);
+    await worker.wake();
+    assert.equal(claims, 1);
+    clock.advance(10_000); await first;
+    assert.equal(reports.length, 1);
+    assert.equal(reports[0].diagnostic.code, "browser-timeout");
+    release([{ result: { ok: false } }]); await settle();
+    assert.equal(reports.length, 1);
+    const before = claims;
+    await worker.wake();
+    assert.equal(claims, before + 1);
+  });
+});
+
+test("a task paused during detail extraction cannot submit a successful import afterward", async () => {
+  await executionFixture(async ({ browser, reports }) => {
+    const originalFetch = globalThis.fetch;
+    let extracted = false;
+    globalThis.fetch = (async (path: string, options: RequestInit) => {
+      if (path.endsWith("/automation-status")) return response({ run: { id: "r", state: extracted ? "paused" : "running" } });
+      return originalFetch(path, options);
+    }) as typeof fetch;
+    browser.scripting.executeScript = async (options: { func: { name: string } }) => {
+      if (options.func.name === "extractJobs") {
+        extracted = true;
+        return [{ result: { pageUrl: tab.url, jobs: [{ url: command.previousSignature, title: "Java", company: "甲", description: "完整职责", detail: true }] } }];
+      }
+      return [{ result: { recognized: true, pageUrl: tab.url } }];
+    };
+    await worker.execute({ ...command, kind: "detail", url: command.previousSignature }, "token");
+    assert.equal(extracted, true);
+    assert.equal(reports.length, 0);
+  });
 });

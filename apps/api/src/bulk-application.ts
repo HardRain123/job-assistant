@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { z } from "zod";
 import type {
@@ -9,7 +9,7 @@ import type {
   MatchPolicy,
   Resume,
 } from "../../../packages/contracts/src/index.ts";
-import { Store } from "../../../packages/storage/src/index.ts";
+import { Store, shanghaiDate, actionCompleteForExistingContact } from "../../../packages/storage/src/index.ts";
 import { evaluateGates } from "../../../packages/matching/src/index.ts";
 
 const key = "bulk.current";
@@ -33,6 +33,7 @@ interface Options {
   resume: () => Resume | null;
   configurationKey: () => string;
   workflowAllows?: (application: Application) => boolean;
+  workflowCanResume?: (application: Application) => boolean;
   status: () => {
     paired: boolean;
     version: string | null;
@@ -51,6 +52,22 @@ type Preview = {
   applications: Application[];
   configurationKey: string;
   expiresAt: string;
+};
+type WorkflowOwner = {
+  id: string;
+  state: string;
+  configurationKey: string;
+  shanghaiDay: string;
+  childBulkId?: string | null;
+  childTotals?: { bulkId?: string }[];
+  recoveryApplications?: Application[];
+};
+export type RecoveryContext = {
+  previousBulkRunId: string;
+  dailyLimit: number;
+  configurationKey: string;
+  shanghaiDay: string;
+  ownershipHash: string;
 };
 const companyKey = (value: string) =>
   value
@@ -93,6 +110,12 @@ const outcomeKey = (
 const isolated = (run: SavedRun, application: Application) =>
   run.isolatedReviewIds?.includes(application.id) &&
   run.isolatedResultKeys?.[application.id] === outcomeKey(application);
+
+// Skipped native greetings belong to old contacts and are never message-resume
+// authorization. Only a confirmed or explicitly reconciled contact qualifies.
+const hasEstablishedContact = (application: Application) =>
+  application.actions.some((action) => action.kind === "native-greeting" &&
+    action.state !== "skipped" && actionCompleteForExistingContact(action));
 
 export function createBulkApplication(o: Options) {
   const { store } = o;
@@ -295,7 +318,7 @@ export function createBulkApplication(o: Options) {
       return false;
     }
     if (run.nextRunAt && Date.parse(run.nextRunAt) > Date.now()) return false;
-    if (store.dailyQuota().remaining <= 0) {
+    if (store.dailyQuota().remaining <= 0 && !hasEstablishedContact(application)) {
       pause("今日配置名额已用完，剩余岗位保留；次日可手动继续。");
       return false;
     }
@@ -332,6 +355,119 @@ export function createBulkApplication(o: Options) {
           (gate) => gate.status === "pass",
         ),
     );
+  };
+  const owns = (workflow: WorkflowOwner, bulkId: string) =>
+    workflow.childBulkId === bulkId ||
+    workflow.childTotals?.some((child) => child.bulkId === bulkId);
+  const workflowOwners = (bulkId: string) => {
+    const records = store.db.prepare(
+      "SELECT key,value FROM settings WHERE key='bulkWorkflow.current' OR key LIKE 'bulkWorkflow.history:%'",
+    ).all();
+    return records.map((row) => ({ key: String(row.key), run: JSON.parse(String(row.value)) as WorkflowOwner | null }))
+      .filter((entry): entry is { key: string; run: WorkflowOwner } => Boolean(entry.run && owns(entry.run, bulkId)));
+  };
+  // A paused live owner may accept reconciled work for a later explicit resume.
+  // A terminal, replaced or previous-day owner must never acquire a queued head.
+  const assertResumable = (application: Application) => {
+    const workflow = store.get<WorkflowOwner | null>("bulkWorkflow.current", null);
+    if (!application.bulkRunId) {
+      if (workflow && ["running", "paused"].includes(workflow.state))
+        throw new Error("自动补充批次仍在管理任务，暂不能接续独立投递");
+      return;
+    }
+    const run = store.get<SavedRun | null>(key, null);
+    if (!run || run.id !== application.bulkRunId || !["running", "paused"].includes(run.state))
+      throw new Error("原批量任务已结束或被替换，请预览单岗位恢复批次");
+    if (run.configurationKey !== o.configurationKey())
+      throw new Error("原批次配置已变化，无法接续");
+    if (!currentlyEligible(application))
+      throw new Error("当前岗位评分或硬条件不再符合原批次接续要求");
+    const owners = workflowOwners(run.id);
+    if (owners.some(({ key: ownerKey, run: owner }) =>
+      ownerKey !== "bulkWorkflow.current" || !["running", "paused"].includes(owner.state) ||
+      owner.childBulkId !== run.id ||
+      owner.shanghaiDay !== shanghaiDate()))
+      throw new Error("原工作流已结束、跨日或子任务已更换，不能在旧批次接续");
+    if (owners.length && (!o.workflowCanResume || !o.workflowCanResume(application)))
+      throw new Error("原工作流配置或运行条件已变化，不能在旧批次接续");
+    if (workflow && ["running", "paused"].includes(workflow.state) && workflow.childBulkId !== run.id)
+      throw new Error("另一工作流仍在管理任务，暂不能接续");
+  };
+  const recoveryContext = (application: Application): RecoveryContext => {
+    connection();
+    idle();
+    const current = store.get<SavedRun | null>(key, null);
+    const workflow = store.get<WorkflowOwner | null>("bulkWorkflow.current", null);
+    const collecting = store.get<{ state: string } | null>("automation.current", null);
+    if ((current && !["completed", "cancelled"].includes(current.state)) ||
+      (workflow && !["completed", "cancelled"].includes(workflow.state)) ||
+      (collecting && !["completed", "cancelled"].includes(collecting.state)) ||
+      store.tasks().some((task) => task.kind === "apply" && ["queued", "leased"].includes(task.status)))
+      throw new Error("请先完成或结束当前批次与采集任务，再恢复单个岗位");
+    const old = application.bulkRunId && (current?.id === application.bulkRunId ? current :
+      store.get<SavedRun | null>(`bulk.history:${application.bulkRunId}`, null));
+    if (!old || old.id !== application.bulkRunId || old.state !== "completed")
+      throw new Error("仅已结束的原批次可以创建恢复批次，已取消或缺失的批次不能恢复");
+    if (old.configurationKey !== o.configurationKey())
+      throw new Error("原批次配置已变化，请先核对原有话术与筛选条件");
+    const owners = workflowOwners(old.id);
+    if (owners.some(({ run }) => !["completed", "cancelled"].includes(run.state)))
+      throw new Error("原工作流尚未结束，不能创建恢复批次");
+    const job = store.job(application.jobId);
+    if (!job || !currentlyEligible({ ...application, job }))
+      throw new Error("当前岗位评分或硬条件不再符合自动投递要求");
+    const dailyLimit = Math.min(old.dailyLimit, store.get("bulk.dailyLimit", 150));
+    if (!Number.isInteger(dailyLimit) || dailyLimit < 1 || dailyLimit > 150)
+      throw new Error("原批次名额配置无效，无法恢复");
+    // This is a read-only recovery preview for an already attempted contact.
+    // Fresh inspection/reconciliation is still required before startRecovery.
+    if (store.dailyQuota(new Date(), dailyLimit).remaining <= 0 &&
+      !application.actions.some((action) => action.kind === "native-greeting" &&
+        (action.state === "confirmed" || (action.state === "unknown" && action.evidence === "send-unconfirmed"))))
+      throw new Error("今日配置名额已用完，仅可核对已有沟通并接续话术");
+    const ownershipHash = createHash("sha256").update(JSON.stringify({
+      bulk: { id: old.id, state: old.state, configurationKey: old.configurationKey },
+      owners: owners.map(({ key: ownerKey, run }) => ({ key: ownerKey, id: run.id, state: run.state,
+        childBulkId: run.childBulkId, childTotals: run.childTotals, configurationKey: run.configurationKey,
+        shanghaiDay: run.shanghaiDay })).sort((a, b) => a.key.localeCompare(b.key)),
+    })).digest("hex");
+    return { previousBulkRunId: old.id, dailyLimit, configurationKey: o.configurationKey(), shanghaiDay: shanghaiDate(), ownershipHash };
+  };
+  // Caller holds the transaction and has validated fresh contact evidence.
+  // Reuse the application and action IDs; never generate another native greeting.
+  const startRecovery = (application: Application, source: Application, expected: RecoveryContext) => {
+    if (!hasEstablishedContact(application))
+      throw new Error("恢复批次仅能接续已核对的联系人，不能新建沟通");
+    const context = recoveryContext(source);
+    if (JSON.stringify(context) !== JSON.stringify(expected))
+      throw new Error("恢复预览的日期、配置、额度或原归属已变化，请重新预览");
+    const current = store.get<SavedRun | null>(key, null);
+    const old = current?.id === context.previousBulkRunId ? current :
+      store.get<SavedRun>(`bulk.history:${context.previousBulkRunId}`, null!);
+    const stamp = new Date().toISOString();
+    const run: SavedRun = { id: randomUUID(), state: "running", target: 1,
+      dailyLimit: context.dailyLimit, intervalSeconds: 30, continueOnJobFailure: false,
+      consecutiveJobFailures: 0, configurationKey: context.configurationKey,
+      message: "恢复批次已创建，仅继续已核对联系人尚未发送的话术。",
+      createdAt: stamp, updatedAt: stamp, counts: { ...blankCounts(), queued: 1 } };
+    // Only moved applications are snapshotted. Other historical applications
+    // can still be reconciled normally without freezing an entire workflow.
+    for (const owner of workflowOwners(context.previousBulkRunId)) {
+      owner.run.recoveryApplications = [
+        ...(owner.run.recoveryApplications ?? []).filter((item) => item.id !== source.id), source,
+      ];
+      store.set(owner.key, owner.run);
+    }
+    if (current) store.set(`bulk.history:${current.id}`, current);
+    store.set(`bulk.history:${old.id}`, old);
+    store.audit("bulk.existingContactRecoveryStarted", {
+      id: run.id, previousBulkRunId: old.id, application: source, previousRun: old,
+      dailyLimit: run.dailyLimit, shanghaiDay: context.shanghaiDay,
+    });
+    application.bulkRunId = run.id;
+    store.set("bulk.dailyLimit", run.dailyLimit);
+    store.set(key, run);
+    return run.id;
   };
   const afterResult = (application: Application, reason?: string) => {
     if (!application.bulkRunId) return;
@@ -526,7 +662,9 @@ export function createBulkApplication(o: Options) {
         idle();
         if (run.configurationKey !== o.configurationKey())
           throw new Error("配置已变化，请结束旧批次并重新预览");
-        if (store.dailyQuota().remaining <= 0)
+        if (store.dailyQuota().remaining <= 0 && !store.applications().some((application) =>
+          application.bulkRunId === run.id && ["queued", "running"].includes(application.status) &&
+          hasEstablishedContact(application)))
           throw new Error("今日配置名额已用完");
         run.acknowledgedReviewIds = store
           .applications()
@@ -585,6 +723,6 @@ export function createBulkApplication(o: Options) {
     app.post("/api/bulk-application/start", (req) => { requireStandalone(); return start(req.body); });
     app.post("/api/bulk-application/control", (req) => { requireStandalone(); return control(req.body); });
   };
-  return { register, canClaim, allowedDuringAction, afterResult, pause, preview, start, control, state: () => publicRun(reconcile()) };
+  return { register, canClaim, allowedDuringAction, assertResumable, recoveryContext, startRecovery, afterResult, pause, preview, start, control, state: () => publicRun(reconcile()) };
 }
 export type BulkApplication = ReturnType<typeof createBulkApplication>;

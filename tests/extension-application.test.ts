@@ -8,6 +8,7 @@ import { createApp } from "../apps/api/src/app.ts";
 import {
   Store,
   actionCompleteForExistingContact,
+  shanghaiDate,
 } from "../packages/storage/src/index.ts";
 import {
   DEFAULT_POLICY,
@@ -450,6 +451,7 @@ async function fixture(
   });
   const workbench = (url: string, payload: any) =>
     app.inject({ method: "POST", url, headers: { cookie }, payload });
+  const readWorkbench = (url: string) => app.inject({ method: "GET", url, headers: { cookie } });
   const extension = (url: string, payload: any = {}) =>
     app.inject({ method: "POST", url, headers: extHeaders, payload });
   const selection = {
@@ -464,6 +466,7 @@ async function fixture(
     attachmentName,
     attachmentsDir,
     workbench,
+    readWorkbench,
     extension,
     selection,
     close: async () => {
@@ -474,15 +477,23 @@ async function fixture(
   };
 }
 
-async function stageExistingContact(f: Awaited<ReturnType<typeof fixture>>) {
+async function stageExistingContact(f: Awaited<ReturnType<typeof fixture>>, completedBulk = false) {
   const selection = { ...f.selection, acceptReview: false };
-  const preview = (
-    await f.workbench("/api/extension-application/preview", selection)
-  ).json();
-  await f.workbench("/api/extension-application/start", {
-    ...selection,
-    expectedConfigurationKey: preview.configurationKey,
-  });
+  if (completedBulk) {
+    const preview = (await f.workbench("/api/bulk-application/preview", {
+      target: 1, dailyLimit: 100, intervalSeconds: 30, continueOnJobFailure: true,
+    })).json();
+    const started = await f.workbench("/api/bulk-application/start", { previewId: preview.previewId });
+    assert.equal(started.statusCode, 200, started.body);
+  } else {
+    const preview = (
+      await f.workbench("/api/extension-application/preview", selection)
+    ).json();
+    await f.workbench("/api/extension-application/start", {
+      ...selection,
+      expectedConfigurationKey: preview.configurationKey,
+    });
+  }
   const task = (await f.extension("/extension/v1/application/claim")).json()
     .task;
   const identity = {
@@ -621,6 +632,398 @@ async function stageUncertainMessage(
   };
   return { identity, action, run, request, diagnostic };
 }
+
+function ownBatch(f: Awaited<ReturnType<typeof fixture>>, applicationId: string,
+  state: "running" | "paused" | "completed" | "cancelled" = "completed", day = shanghaiDate()) {
+  const application = f.store.application(applicationId)!;
+  let bulk = f.store.get<any>("bulk.current", null);
+  if (!application.bulkRunId) {
+    application.bulkRunId = randomUUID();
+    f.store.updateApplication(application);
+    bulk = {
+      id: application.bulkRunId, state: "paused", target: 1, dailyLimit: 100, intervalSeconds: 30,
+      configurationKey: f.store.get(`extensionApplication.configuration:${application.id}`, null),
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), message: "test",
+      counts: { queued: 0, running: 0, completed: 0, review: 1, skipped: 0, cancelled: 0 },
+    };
+    f.store.set("bulk.current", bulk);
+  }
+  const owner = {
+    id: randomUUID(), state, phase: state === "running" || state === "paused" ? "sending" : "done",
+    config: { target: 10, dailyLimit: 100, intervalSeconds: 30, keywords: ["Java"], city: "上海",
+      maxJobsPerRound: 50, maxPages: 2, maxRounds: 5 }, target: 10,
+    message: "test", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    rounds: 1, noGrowthRounds: 0, consecutiveJobFailures: 0, budgetUsed: 1,
+    counts: { planned: 1, completed: 0, review: 1, skipped: 0, queued: 0 },
+    configurationKey: fingerprint({ application: bulk.configurationKey, providers: [],
+      embedding: { enabled: false, baseUrl: "https://api.openai.com/v1", model: "" } }),
+    shanghaiDay: day, manualPaused: state === "paused",
+    childBulkId: bulk.id, childAutomationId: null, childTotals: [], currentPreviewId: null,
+    currentAutomationImported: 0, keywordIndex: 0,
+  };
+  f.store.set("bulkWorkflow.current", owner);
+  return owner;
+}
+
+async function stageAutomaticPrefix(f: Awaited<ReturnType<typeof fixture>>, uncertainIndex: 1 | 2, finished: boolean) {
+  f.store.set("template", { ...f.store.get<any>("template", null),
+    segments: ["您好，我申请{{title}}", "到岗时间：一周"], attachmentPolicy: "message-only" });
+  const preview = (await f.workbench("/api/bulk-application/preview", {
+    target: 1, dailyLimit: 1, intervalSeconds: 30, continueOnJobFailure: finished,
+  })).json();
+  const started = await f.workbench("/api/bulk-application/start", { previewId: preview.previewId });
+  assert.equal(started.statusCode, 200, started.body);
+  const task = (await f.extension("/extension/v1/application/claim")).json().task;
+  assert.ok(task);
+  const identity = { taskId: task.id, leaseToken: task.leaseToken, applicationId: task.application.id };
+  for (const action of task.application.actions.slice(0, uncertainIndex + 1)) {
+    const begin = await f.extension("/extension/v1/application/action", {
+      ...identity, actionId: action.id, state: "started", evidence: "before-action",
+    });
+    assert.equal(begin.json().execute, true, begin.body);
+    const receipt = await f.extension("/extension/v1/application/action", {
+      ...identity, actionId: action.id,
+      state: action.index === uncertainIndex ? "unknown" : "confirmed",
+      evidence: action.index === uncertainIndex ? "send-unconfirmed" : action.index === 0 ? "new-conversation" : "new-message",
+    });
+    assert.equal(receipt.statusCode, 200, receipt.body);
+  }
+  const outcome = await f.extension("/extension/v1/application/result", { ...identity, reason: "send-unconfirmed" });
+  assert.equal(outcome.json().status, "needs-review", outcome.body);
+  const inspectionRunId = randomUUID();
+  f.store.set("automation.current", {
+    id: inspectionRunId, state: "completed", phase: "done", inspectionJobId: f.job.id,
+    updatedAt: new Date().toISOString(), config: { maxJobs: 1, maxPages: 1, autoAssess: false },
+    discovered: 1, visited: 1, imported: 1, seenUrls: [], jobIds: [f.job.id],
+    fieldReadings: [{ url: f.job.url, evidence: { title: f.job.title, company: f.job.company,
+      descriptionPresent: true, headerLines: ["感兴趣 继续沟通"] } }],
+  });
+  const source = structuredClone(f.store.application(identity.applicationId)!);
+  const action = source.actions[uncertainIndex]!;
+  return { source, request: { applicationId: source.id, actionId: action.id, inspectionRunId,
+    expectedTextHash: createHash("sha256").update(action.text!).digest("hex") } };
+}
+
+test("automatic receipts can precede an uncertain message: reconcile only untouched work even at zero quota", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  for (const finished of [false, true]) for (const uncertainIndex of [1, 2] as const) {
+    const f = await fixture("eligible", undefined, "0.4.14");
+    try {
+      const { source, request } = await stageAutomaticPrefix(f, uncertainIndex, finished);
+      assert.equal(f.store.dailyQuota(new Date(), 1).remaining, 0);
+      const owner = ownBatch(f, source.id, finished ? "completed" : "paused");
+      const taskCount = f.store.tasks().length;
+      let recoveryPreviewId: string | undefined;
+      if (finished) {
+        const blocked = await f.workbench("/api/extension-application/confirm-message-and-resume", request);
+        assert.equal(blocked.statusCode, 400);
+        const preview = await f.workbench("/api/extension-application/recovery-preview", {
+          applicationId: source.id, actionId: request.actionId,
+        });
+        assert.equal(preview.statusCode, 200, preview.body);
+        assert.deepEqual(preview.json().messages, source.frozenMessages.slice(uncertainIndex));
+        recoveryPreviewId = preview.json().recoveryPreviewId;
+      }
+      const response = await f.workbench("/api/extension-application/confirm-message-and-resume",
+        { ...request, ...(recoveryPreviewId ? { recoveryPreviewId } : {}) });
+      assert.equal(response.statusCode, 200, response.body);
+      const saved = f.store.application(source.id)!;
+      assert.deepEqual(saved.actions.slice(0, uncertainIndex), source.actions.slice(0, uncertainIndex));
+      assert.equal(saved.actions[uncertainIndex]!.state, "unknown");
+      assert.equal(saved.actions[uncertainIndex]!.evidence, "send-unconfirmed");
+      assert.equal(saved.actions[uncertainIndex]!.resolution, "user-confirmed-sent");
+      assert.equal(f.store.dailyQuota(new Date(), 1).occupied, 1);
+      if (finished) {
+        assert.notEqual(saved.bulkRunId, source.bulkRunId);
+        assert.deepEqual(f.store.get<any>("bulkWorkflow.current", null).recoveryApplications, [source]);
+        assert.equal(f.store.get<any>("bulkWorkflow.current", null).id, owner.id);
+      }
+      if (uncertainIndex === 2) {
+        assert.equal(saved.status, "completed");
+        assert.equal(f.store.tasks().length, taskCount);
+        assert.equal(f.store.get<any>("bulk.current", null).state, "completed");
+        assert.equal((await f.extension("/extension/v1/application/claim")).json().task, null);
+      } else {
+        if (!finished) {
+          const resume = await f.workbench("/api/bulk-workflow/control", { action: "resume" });
+          assert.equal(resume.statusCode, 200, resume.body);
+          t.mock.timers.tick(31_000);
+        }
+        const claimed = await f.extension("/extension/v1/application/claim");
+        const task = claimed.json().task;
+        assert.ok(task, claimed.body);
+        assert.deepEqual(task.application.actions.map((item: any) => item.index), [0, 2]);
+        assert.equal(task.application.actions[0].state, "confirmed");
+        const identity = { taskId: task.id, leaseToken: task.leaseToken, applicationId: saved.id };
+        assert.equal((await f.extension("/extension/v1/application/authorize", {
+          ...identity, actionId: source.actions[0]!.id,
+        })).json().allowed, true);
+        assert.equal((await f.extension("/extension/v1/application/action", {
+          ...identity, actionId: source.actions[0]!.id, state: "started", evidence: "before-action",
+        })).statusCode, 400, "confirmed greeting cannot be sent again");
+        const remaining = source.actions[2]!;
+        assert.equal((await f.extension("/extension/v1/application/action", {
+          ...identity, actionId: remaining.id, state: "started", evidence: "before-action",
+        })).json().execute, true);
+        await f.extension("/extension/v1/application/action", {
+          ...identity, actionId: remaining.id, state: "confirmed", evidence: "new-message",
+        });
+        assert.equal((await f.extension("/extension/v1/application/result", identity)).json().status, "completed");
+      }
+      assert.equal((await f.workbench("/api/extension-application/confirm-message-and-resume",
+        { ...request, ...(recoveryPreviewId ? { recoveryPreviewId } : {}) })).statusCode, 400);
+    } finally { await f.close(); }
+  }
+});
+
+test("at zero quota a queued new contact cannot block a reconciled message behind it", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const f = await fixture("eligible", undefined, "0.4.14");
+  try {
+    const { source, request } = await stageAutomaticPrefix(f, 1, false);
+    const otherId = randomUUID();
+    const otherJob = f.store.upsertJob({ ...source.job, id: otherId, sourceJobId: otherId,
+      url: `https://www.zhipin.com/job_detail/${otherId}.html` });
+    const unattempted = { ...structuredClone(source), id: randomUUID(), job: otherJob, jobId: otherJob.id, status: "queued" as const };
+    delete unattempted.stopReason;
+    unattempted.actions = unattempted.actions.map((action) => ({ ...action, id: randomUUID(), state: "pending", evidence: null }));
+    f.store.insertApplication(unattempted);
+    f.store.enqueue("apply", unattempted);
+    f.store.set(`extensionApplication.configuration:${unattempted.id}`,
+      f.store.get(`extensionApplication.configuration:${source.id}`, null));
+    const reconciled = await f.workbench("/api/extension-application/confirm-message-and-resume", request);
+    assert.equal(reconciled.statusCode, 200, reconciled.body);
+    const resumed = await f.workbench("/api/bulk-application/control", { action: "resume" });
+    assert.equal(resumed.statusCode, 200, resumed.body);
+    t.mock.timers.tick(31_000);
+    const claimed = await f.extension("/extension/v1/application/claim");
+    assert.equal(claimed.json().task?.application.id, source.id, claimed.body);
+    assert.equal(f.store.application(unattempted.id)!.actions[0]!.state, "pending");
+    assert.equal(f.store.dailyQuota(new Date(), 1).occupied, 1);
+    assert.equal((await f.extension("/extension/v1/application/claim")).json().task, null, "only one lease is allowed");
+  } finally { await f.close(); }
+});
+
+test("paused workflow inspection and reconciliation allow only queued siblings, never live sends or unrelated work", async () => {
+  for (const scenario of ["paused", "running", "unrelated", "leased", "wrong-job"] as const) {
+    const f = await fixture("eligible", undefined, "0.4.14");
+    try {
+      const { source, request } = await stageAutomaticPrefix(f, 1, false);
+      const owner = ownBatch(f, source.id, scenario === "running" ? "running" : "paused");
+      const otherId = randomUUID();
+      const otherJob = f.store.upsertJob({ ...source.job, id: otherId, sourceJobId: otherId,
+        url: `https://www.zhipin.com/job_detail/${otherId}.html` });
+      const sibling = { ...structuredClone(source), id: randomUUID(), jobId: otherId, job: otherJob,
+        status: "queued" as const, ...(scenario === "unrelated" ? { bulkRunId: randomUUID() } : {}) };
+      delete sibling.stopReason;
+      sibling.actions = sibling.actions.map((action) => ({ ...action, id: randomUUID(), state: "pending", evidence: null }));
+      f.store.insertApplication(sibling);
+      f.store.enqueue("apply", sibling);
+      if (scenario === "leased") assert.ok(f.store.claim("extension"));
+      if (scenario === "running") f.store.set("bulk.current", { ...f.store.get<any>("bulk.current", null), state: "running" });
+      const beforeTasks = f.store.tasks();
+      const beforeInspection = f.store.get<any>("automation.current", null);
+      const response = await f.workbench("/api/automation/start", { inspectJobId: scenario === "wrong-job" ? otherId : source.jobId });
+      if (scenario === "paused") {
+        assert.equal(response.statusCode, 200, response.body);
+        assert.equal(f.store.get<any>("bulkWorkflow.current", null).state, "paused");
+        assert.equal(f.store.get<any>("bulk.current", null).state, "paused");
+        const command = (await f.extension("/extension/v1/claim")).json().command;
+        assert.equal(command.kind, "detail");
+        assert.equal(command.url, source.job.url);
+        assert.deepEqual(f.store.tasks(), beforeTasks);
+        assert.equal((await f.extension("/extension/v1/application/claim")).json().task, null);
+        assert.equal((await f.workbench("/api/bulk-workflow/control", { action: "resume" })).statusCode, 400);
+        const stopped = await f.workbench("/api/automation/control", { action: "cancel" });
+        assert.equal(stopped.statusCode, 200, stopped.body);
+        f.store.set("automation.current", beforeInspection);
+        const reconciled = await f.workbench("/api/extension-application/confirm-message-and-resume", request);
+        assert.equal(reconciled.statusCode, 200, reconciled.body);
+        assert.equal(f.store.application(sibling.id)!.actions[0]!.state, "pending");
+        assert.equal(f.store.get<any>("bulkWorkflow.current", null).id, owner.id);
+      } else {
+        assert.equal(response.statusCode, 400, scenario + response.body);
+        assert.deepEqual(f.store.get("automation.current", null), beforeInspection);
+        assert.deepEqual(f.store.tasks(), beforeTasks);
+        if (scenario !== "wrong-job") {
+          const reconciled = await f.workbench("/api/extension-application/confirm-message-and-resume", request);
+          assert.equal(reconciled.statusCode, 400, scenario + reconciled.body);
+          assert.equal(f.store.application(source.id)!.actions[1]!.resolution, undefined);
+        }
+      }
+    } finally { await f.close(); }
+  }
+});
+
+test("partial message recovery previews are bound to the action, unchanged record, and fresh contact inspection", async () => {
+  for (const scenario of ["expired", "changed-record", "wrong-action", "no-contact", "missing-manual-audit"] as const) {
+    const f = await fixture("eligible", undefined, "0.4.14");
+    try {
+      const { source, request } = await stageAutomaticPrefix(f, 2, true);
+      const preview = await f.workbench("/api/extension-application/recovery-preview", {
+        applicationId: source.id, actionId: request.actionId,
+      });
+      assert.equal(preview.statusCode, 200, preview.body);
+      const recoveryPreviewId = preview.json().recoveryPreviewId;
+      if (scenario === "expired") {
+        const key = `extensionApplication.recoveryPreview:${recoveryPreviewId}`;
+        f.store.set(key, { ...f.store.get<any>(key, null), expiresAt: new Date(Date.now() - 1000).toISOString() });
+      }
+      if (scenario === "changed-record") {
+        source.pageDiagnostic = { stage: "chat-ready", code: "loading", stableChecks: 0 };
+        f.store.updateApplication(source);
+      }
+      if (scenario === "wrong-action") request.actionId = source.actions[1]!.id;
+      if (scenario === "no-contact") {
+        const run = f.store.get<any>("automation.current", null);
+        run.fieldReadings[0].evidence.headerLines = ["立即沟通"];
+        f.store.set("automation.current", run);
+      }
+      if (scenario === "missing-manual-audit") {
+        Object.assign(source.actions[1]!, { state: "unknown", evidence: "send-unconfirmed", resolution: "user-confirmed-sent" });
+        f.store.updateApplication(source);
+        const invalid = await f.workbench("/api/extension-application/recovery-preview", {
+          applicationId: source.id, actionId: request.actionId,
+        });
+        assert.equal(invalid.statusCode, 400, invalid.body);
+      }
+      const before = f.store.application(source.id);
+      const tasks = f.store.tasks();
+      const result = await f.workbench("/api/extension-application/confirm-message-and-resume", { ...request, recoveryPreviewId });
+      assert.equal(result.statusCode, 400, scenario + ": " + result.body);
+      assert.deepEqual(f.store.application(source.id), before);
+      assert.deepEqual(f.store.tasks(), tasks);
+    } finally { await f.close(); }
+  }
+});
+
+test("all reconciliation entrances reject a terminal, replaced or previous-day workflow before queueing", async () => {
+  for (const route of ["retry", "resume-existing-contact", "confirm-message-and-resume"] as const) {
+    for (const ownerCase of ["completed", "cancelled", "previous-day", "replaced"] as const) {
+      const f = await fixture("eligible", undefined, "0.4.13");
+      try {
+        const staged = route === "confirm-message-and-resume" ? await stageUncertainMessage(f) : await stageExistingContact(f);
+        const application = f.store.application(staged.identity.applicationId)!;
+        if (route === "retry") {
+          for (const action of application.actions) {
+            action.state = "pending";
+            action.evidence = null;
+            delete action.resolution;
+          }
+          f.store.updateApplication(application);
+        }
+        const owner = ownBatch(f, application.id,
+          ownerCase === "completed" || ownerCase === "cancelled" ? ownerCase : "paused",
+          ownerCase === "previous-day" ? shanghaiDate(new Date(Date.now() - 86400000)) : shanghaiDate());
+        if (ownerCase === "replaced") {
+          f.store.set(`bulkWorkflow.history:${owner.id}`, { ...owner, state: "completed" });
+          f.store.set("bulkWorkflow.current", { ...owner, id: randomUUID(), childBulkId: randomUUID() });
+        }
+        const before = structuredClone(f.store.application(application.id));
+        const beforeTasks = f.store.tasks();
+        const request = route === "confirm-message-and-resume" ? (staged as Awaited<ReturnType<typeof stageUncertainMessage>>).request :
+          { applicationId: application.id, ...(route === "resume-existing-contact" ? { inspectionRunId: staged.run.id } : {}) };
+        const response = await f.workbench(`/api/extension-application/${route}`, request);
+        assert.equal(response.statusCode, 400, route + " " + ownerCase + " " + response.body);
+        assert.deepEqual(f.store.application(application.id), before);
+        assert.deepEqual(f.store.tasks(), beforeTasks);
+      } finally { await f.close(); }
+    }
+  }
+});
+
+test("a live paused workflow can reconcile its contact and explicitly resume without replaying greeting", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const f = await fixture("eligible", undefined, "0.4.13");
+  try {
+    const staged = await stageExistingContact(f);
+    ownBatch(f, staged.identity.applicationId, "paused");
+    const response = await f.workbench("/api/extension-application/resume-existing-contact", {
+      applicationId: staged.identity.applicationId, inspectionRunId: staged.run.id,
+    });
+    assert.equal(response.statusCode, 200, response.body);
+    assert.equal((await f.extension("/extension/v1/application/claim")).json().task, null);
+    const resumed = await f.workbench("/api/bulk-workflow/control", { action: "resume" });
+    assert.equal(resumed.statusCode, 200, resumed.body);
+    t.mock.timers.tick(31000);
+    const task = (await f.extension("/extension/v1/application/claim")).json().task;
+    assert.ok(task);
+    assert.equal(task.application.actions[0].state, "unknown");
+    assert.equal(task.application.actions[0].resolution, "contact-exists");
+  } finally { await f.close(); }
+});
+
+test("completed contact recovery explicitly adopts the same actions into one new batch and preserves historical counts", async () => {
+  for (const ownerState of ["completed", "cancelled"] as const) {
+    const f = await fixture("eligible", undefined, "0.4.13");
+    try {
+      const staged = await stageExistingContact(f, true);
+      const source = structuredClone(f.store.application(staged.identity.applicationId)!);
+      const old = f.store.get<any>("bulk.current", null);
+      assert.equal(old.state, "completed");
+      const owner = ownBatch(f, source.id, ownerState, shanghaiDate(new Date(Date.now() - 86400000)));
+      const sibling = { ...structuredClone(source), id: randomUUID(), jobId: randomUUID() };
+      sibling.actions = sibling.actions.map((action) => ({ ...action, id: randomUUID() }));
+      f.store.insertApplication(sibling);
+      f.store.set("bulk.current", { ...old, target: 2, counts: { ...old.counts, review: 2 } });
+      f.store.set("bulkWorkflow.current", { ...owner, counts: { ...owner.counts, planned: 2, review: 2 } });
+      const quotaBefore = f.store.dailyQuota();
+      const tasksBefore = f.store.tasks().length;
+      const unchanged = await f.workbench("/api/extension-application/resume-existing-contact", {
+        applicationId: source.id, inspectionRunId: staged.inspectionRunId,
+      });
+      assert.equal(unchanged.statusCode, 400);
+      assert.deepEqual(f.store.application(source.id), source);
+      assert.equal(f.store.tasks().length, tasksBefore);
+      const previewResponse = await f.workbench("/api/extension-application/recovery-preview", { applicationId: source.id });
+      assert.equal(previewResponse.statusCode, 200, previewResponse.body);
+      const preview = previewResponse.json();
+      assert.equal(preview.dailyLimit, 100);
+      assert.equal(preview.previousBulkRunId, old.id);
+      assert.deepEqual(preview.messages, source.frozenMessages);
+      assert.deepEqual(f.store.application(source.id), source);
+      assert.equal(f.store.tasks().length, tasksBefore);
+      const request = { applicationId: source.id, inspectionRunId: staged.inspectionRunId,
+        recoveryPreviewId: preview.recoveryPreviewId };
+      const response = await f.workbench("/api/extension-application/resume-existing-contact", request);
+      assert.equal(response.statusCode, 200, response.body);
+      const recovered = f.store.application(source.id)!;
+      assert.equal(recovered.id, source.id);
+      assert.notEqual(recovered.bulkRunId, old.id);
+      assert.equal(recovered.bulkRunId, response.json().bulkRunId);
+      assert.deepEqual(recovered.actions.slice(1), source.actions.slice(1));
+      assert.deepEqual(recovered.actions[0], { ...source.actions[0], resolution: "contact-exists" });
+      assert.equal(f.store.get<any>("bulk.current", null).target, 1);
+      assert.equal(f.store.get<any>("bulk.current", null).intervalSeconds, 30);
+      assert.equal(f.store.get<any>(`bulk.history:${old.id}`, null).counts.review, 2);
+      assert.equal(f.store.get<any>("bulkWorkflow.current", null).state, ownerState);
+      assert.deepEqual(f.store.get<any>("bulkWorkflow.current", null).recoveryApplications, [source]);
+      const audit = f.store.db.prepare("SELECT body FROM audit WHERE event='bulk.existingContactRecoveryStarted'").get();
+      assert.deepEqual(JSON.parse(String(audit!.body)).application, source);
+      assert.equal(f.store.tasks().length, tasksBefore + 1);
+      assert.equal((await f.workbench("/api/extension-application/resume-existing-contact", request)).statusCode, 400);
+      assert.equal(f.store.tasks().length, tasksBefore + 1);
+      assert.equal(f.store.dailyQuota().occupied, quotaBefore.occupied);
+      let history = (await f.readWorkbench("/api/bulk-workflow")).json().run;
+      assert.equal(history.counts.review, 2);
+      sibling.status = "completed";
+      f.store.updateApplication(sibling);
+      history = (await f.readWorkbench("/api/bulk-workflow")).json().run;
+      assert.equal(history.counts.completed, 1);
+      assert.equal(history.counts.review, 1);
+      const task = (await f.extension("/extension/v1/application/claim")).json().task;
+      assert.ok(task, "restored application must be claimable");
+      const identity = { taskId: task.id, leaseToken: task.leaseToken, applicationId: recovered.id };
+      assert.equal((await f.extension("/extension/v1/application/action", { ...identity,
+        actionId: source.actions[0]!.id, state: "started", evidence: "before-action" })).statusCode, 400);
+      assert.equal((await f.extension("/extension/v1/application/authorize", { ...identity,
+        actionId: source.actions[0]!.id })).json().allowed, true);
+      assert.equal((await f.extension("/extension/v1/application/action", { ...identity,
+        actionId: source.actions[1]!.id, state: "started", evidence: "before-action" })).json().execute, true);
+      assert.equal(f.store.dailyQuota().occupied, quotaBefore.occupied);
+    } finally { await f.close(); }
+  }
+});
 
 test("bounded receipt diagnostics persist without confirming or disclosing messages", async () => {
   const f = await fixture("eligible");

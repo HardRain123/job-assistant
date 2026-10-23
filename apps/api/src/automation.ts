@@ -82,9 +82,22 @@ interface Options {
     withinTransaction?: boolean,
   ) => { count: number; jobIds: string[] };
   configurationKey: () => string;
-  ensureReady: (autoAssess: boolean) => void;
+  ensureReady: (autoAssess: boolean, inspectionJobId?: string | null) => void;
   scoreJob: (id: string, signal: AbortSignal) => Promise<Assessment>;
   now?: () => number;
+}
+// A read-only inspection may run beside queued siblings only while their owning
+// batch is paused. It never changes the batch state or permits a queued send.
+export function pausedInspectionApplication(store: Store, jobId?: string | null) {
+  if (!jobId) return undefined;
+  const application = store.applications().find((item) => item.jobId === jobId &&
+    item.executor === "extension" && item.status === "needs-review" && item.bulkRunId);
+  const batch = store.get<{ id: string; state: string } | null>("bulk.current", null);
+  if (!application || !batch || batch.id !== application.bulkRunId || batch.state !== "paused") return undefined;
+  const workflow = store.get<{ state: string; childBulkId?: string } | null>("bulkWorkflow.current", null);
+  if (workflow && ["running", "paused"].includes(workflow.state) &&
+    (workflow.state !== "paused" || workflow.childBulkId !== batch.id)) return undefined;
+  return application;
 }
 export function canonicalJobUrl(value: string) {
   const u = new URL(value);
@@ -119,6 +132,8 @@ const diagnosticStages = {
 const diagnosticCodes = {
   "permission-denied": "扩展权限不足",
   "script-error": "页面脚本执行失败",
+  "browser-timeout": "浏览器调用超时，已停止本次读取",
+  "command-timeout": "本条采集执行超时，已停止后续操作",
   "tab-unavailable": "任务标签页不可用",
   "url-mismatch": "页面地址与任务不一致",
   "document-loading": "页面仍在加载",
@@ -609,7 +624,7 @@ export function createAutomation(o: Options) {
         throw new Error(
           "请刷新升级到 0.2.4 或更新的扩展，并在扩展中检查自动任务",
         );
-      o.ensureReady(config.autoAssess);
+      o.ensureReady(config.autoAssess, inspectJob?.id);
       if (previous) o.store.set(`automation.history:${previous.id}`, previous);
       const stamp = new Date(now()).toISOString();
       const r: Run = {
@@ -673,7 +688,7 @@ export function createAutomation(o: Options) {
         if (!o.extensionStatus().paired) throw new Error("请先恢复扩展连接");
         if (!supportsAutomation(o.extensionStatus().version))
           throw new Error("请先刷新升级到 0.2.4 或更新的扩展");
-        o.ensureReady(r.config.autoAssess);
+        o.ensureReady(r.config.autoAssess, r.inspectionJobId);
         scoring?.abort();
         r.lease = null;
         // Restart this keyword if the search tab was lost; seen URLs keep
@@ -703,13 +718,21 @@ export function createAutomation(o: Options) {
       run: publicRun(reconcile()),
       extension: o.extensionStatus(),
     }));
-    const requireStandalone = () => {
+    const requireStandalone = (inspectionJobId?: string | null) => {
       const workflow = o.store.get<{ state: string } | null>("bulkWorkflow.current", null);
-      if (workflow && ["running", "paused"].includes(workflow.state))
+      if (workflow && ["running", "paused"].includes(workflow.state) &&
+        !pausedInspectionApplication(o.store, inspectionJobId))
         throw new Error("自动补充批次正在管理任务，请使用该批次的暂停、继续或结束操作");
     };
-    app.post("/api/automation/start", (req) => { requireStandalone(); return start(req.body); });
-    app.post("/api/automation/control", (req) => { requireStandalone(); return control(req.body); });
+    app.post("/api/automation/start", (req) => {
+      const inspection = z.object({ inspectJobId: z.string().uuid() }).strict().safeParse(req.body);
+      requireStandalone(inspection.success ? inspection.data.inspectJobId : undefined);
+      return start(req.body);
+    });
+    app.post("/api/automation/control", (req) => {
+      requireStandalone(reconcile()?.inspectionJobId);
+      return control(req.body);
+    });
     app.post("/extension/v1/claim", claim);
     app.post("/extension/v1/result", (req) => result(req.body));
     // No personal data, provider credentials or write commands are returned.

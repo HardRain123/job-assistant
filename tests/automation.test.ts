@@ -19,6 +19,27 @@ const searchDiagnostic = {
   scrollContainers: [{ kind: "list", depth: 0, clientHeight: 800, scrollHeight: 2400, scrollTop: 0, remaining: 1600, canScroll: true, atEnd: false }],
   truncated: false,
 };
+
+test("采集超时诊断保留具体阶段且不把失败当作成功或触发发送", async () => {
+  for (const code of ["browser-timeout", "command-timeout"]) {
+    const f = await fixture();
+    try {
+      await f.start();
+      const search = await f.claim();
+      const payload = { outcome: "error", reason: "navigation-failed", diagnostic: { stage: "reading-page", code } };
+      const result = await f.result(search, payload);
+      assert.equal(result.statusCode, 200, result.body);
+      const run = await f.state();
+      assert.equal(run.state, "blocked");
+      assert.match(run.message, /超时/);
+      assert.equal(run.imported, 0);
+      assert.equal(f.store.jobs().length, 0);
+      assert.equal(f.store.applications().length, 0);
+      assert.equal((await f.result(search, payload)).statusCode, 400);
+      assert.deepEqual(await f.state(), run);
+    } finally { await f.close(); }
+  }
+});
 test("首屏没有翻页入口时保留有界列表诊断，重复和重启不丢失且不改变岗位事实", async () => {
   const f = await fixture();
   try {

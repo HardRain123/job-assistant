@@ -585,7 +585,7 @@ test("semantic header rejects conflicting links outside the job card and changed
 });
 
 test("plain recruiter names require an aligned exact employer and explicit recruiting role and stay bound across sends", async () => {
-  for (const label of ["hr", "HRBP", "招聘者", "人事", "招聘助理"]) {
+  for (const label of ["hr", "HRBP", "招聘者", "人事", "招聘助理", "招聘主管"]) {
     const f = semanticChatFixture();
     f.recruiter.innerText = "周颖";
     const role = element(label);
@@ -621,6 +621,7 @@ test("plain recruiter names require an aligned exact employer and explicit recru
 test("plain names reject missing or ambiguous roles, status text, wrong positions, hidden nodes and multiple names", async () => {
   for (const scenario of [
     "no-role",
+    "unknown-role",
     "role-only",
     "status",
     "wrong-row",
@@ -641,6 +642,7 @@ test("plain names reject missing or ambiguous roles, status text, wrong position
       bottom: 170,
     });
     if (scenario !== "no-role") f.allFields.push(role);
+    if (scenario === "unknown-role") role.innerText = "招聘主管的助理";
     if (scenario === "role-only") f.recruiter.innerText = "招聘者";
     if (scenario === "status") f.recruiter.innerText = "今日活跃";
     if (scenario === "wrong-row")
@@ -1105,6 +1107,7 @@ function runnerFixture(
     execute?: boolean;
     journal?: boolean;
     resolvedContact?: boolean;
+    confirmedContact?: boolean;
     unresolvedContact?: boolean;
     navigationError?: boolean;
     navigationHang?: boolean;
@@ -1128,9 +1131,10 @@ function runnerFixture(
       kind: "native-greeting",
       index: 0,
       state:
-        options.resolvedContact || options.unresolvedContact
+        options.confirmedContact ? "confirmed" : options.resolvedContact || options.unresolvedContact
           ? "unknown"
           : "pending",
+      evidence: options.confirmedContact ? "new-conversation" : options.resolvedContact || options.unresolvedContact ? "send-unconfirmed" : null,
       ...(options.resolvedContact ? { resolution: "contact-exists" } : {}),
     },
     {
@@ -1309,6 +1313,18 @@ function runnerFixture(
       ),
   };
 }
+test("an automatically confirmed native contact only reopens its existing conversation and never greets again", async () => {
+  for (const missingContact of [false, true]) {
+    const f = runnerFixture({ confirmedContact: true, bulk: true, messageSuccess: true, journal: true, missingContact });
+    await f.run();
+    assert.equal(f.calls.some((call) => call.body?.actionId === "greeting" && call.body?.state), false);
+    assert.equal(f.calls.filter((call) => call.mode === "contact").length, missingContact ? 0 : 1);
+    assert.equal(f.calls.filter((call) => call.mode === "message").length, missingContact ? 0 : 2);
+    if (!missingContact) assert.equal(f.calls.find((call) => call.mode === "contact").expectedExisting, true);
+    else assert.equal(f.calls.find((call) => call.path?.endsWith("/result")).body.reason, "recipient-mismatch");
+  }
+});
+
 test("runner never starts a side effect when the live job differs or a local attempt is already recorded", async () => {
   for (const options of [{ wrongJob: true }, { journal: true }]) {
     const f = runnerFixture(options);

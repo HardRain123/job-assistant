@@ -82,6 +82,7 @@ export interface BulkWorkflowPorts {
 type ChildTotals = {
   bulkId?: string;
   planned: number;
+  targetUsed?: number;
   completed: number;
   review: number;
   skipped: number;
@@ -102,6 +103,7 @@ type InternalRun = {
   budgetUsed: number;
   counts: {
     planned: number;
+    targetUsed?: number;
     completed: number;
     review: number;
     skipped: number;
@@ -113,6 +115,7 @@ type InternalRun = {
   childBulkId: string | null;
   childAutomationId: string | null;
   childTotals: ChildTotals[];
+  recoveryApplications?: Application[];
   currentPreviewId: string | null;
   currentAutomationImported: number;
   keywordIndex: number;
@@ -130,6 +133,25 @@ type Preview = {
 };
 
 const stamp = (now: () => number) => new Date(now()).toISOString();
+// Only terminal outcomes with explicit evidence that no outbound action began
+// release a target slot. Unknown results (even with missing action evidence)
+// remain occupied. The retained application still prevents candidate replay.
+const safelyReplaceable = (application: Application) => {
+  if (!application.actions.length) return false;
+  const untouched = (action: Application["actions"][number]) =>
+    action.state === "pending" && !action.evidence && !action.resolution;
+  if (application.stopReason === "existing-contact") {
+    return application.status === "cancelled" &&
+      application.actions.filter((action) => action.kind === "native-greeting").length === 1 &&
+      application.actions.every((action) => action.kind === "native-greeting"
+        ? action.state === "skipped" && action.evidence === "existing-contact" && !action.resolution
+        : untouched(action));
+  }
+  return ["needs-review", "failed"].includes(application.status) &&
+    ["recipient-mismatch", "page-unrecognized"].includes(application.stopReason ?? "") &&
+    application.actions.some((action) => action.kind === "native-greeting") &&
+    application.actions.every(untouched);
+};
 export function createBulkWorkflow(o: BulkWorkflowPorts) {
   const now = o.now ?? Date.now;
   let pumping: Promise<void> | null = null;
@@ -138,12 +160,49 @@ export function createBulkWorkflow(o: BulkWorkflowPorts) {
     run.updatedAt = stamp(now);
     o.store.set(runKey, run);
   };
-  const visibleCounts = (run: InternalRun) => {
-    if (!o.applications) return run.counts;
+  const ownedApplications = (run: InternalRun) => {
     const owned = new Set([...run.childTotals.map((child) => child.bulkId), run.childBulkId].filter(Boolean));
-    const applications = o.applications().filter((application) => owned.has(application.bulkRunId));
+    const current = (o.applications?.() ?? []).filter((application) => owned.has(application.bulkRunId));
+    return [...current, ...(run.recoveryApplications ?? []).filter((snapshot) =>
+      owned.has(snapshot.bulkRunId) && !current.some((application) => application.id === snapshot.id))];
+  };
+  const targetUsed = (run: InternalRun) => {
+    const applications = ownedApplications(run);
+    const children = [...run.childTotals];
+    const archivedPlanned = children.reduce((total, child) => total + child.planned, 0);
+    if (run.childBulkId) children.push({ bulkId: run.childBulkId,
+      planned: Math.max(0, run.counts.planned - archivedPlanned), completed: 0, review: 0, skipped: 0 });
+    let released = 0;
+    for (const child of children) {
+      if (!child.bulkId) continue;
+      const records = applications.filter((application) => application.bulkRunId === child.bulkId);
+      // Do not infer zero sends from legacy aggregate skipped/review counters.
+      // Missing histories retain all slots, including after an old-run upgrade.
+      if (records.length !== child.planned) continue;
+      released += records.filter(safelyReplaceable).length;
+    }
+    return Math.max(0, run.counts.planned - released);
+  };
+  const nextTarget = (run: InternalRun) =>
+    Math.max(0, Math.min(run.target - targetUsed(run), 300 - run.counts.planned));
+  const finishAtTargetOrBudget = (run: InternalRun) => {
+    run.counts.targetUsed = targetUsed(run);
+    if (nextTarget(run) > 0) return false;
+    run.state = "completed";
+    run.phase = "done";
+    run.message = run.counts.targetUsed >= run.target
+      ? `目标名额已占用 ${run.counts.targetUsed}/${run.target}；已确认发送 ${run.counts.completed}，待核验 ${run.counts.review}，跳过 ${run.counts.skipped}。已尝试或未知结果保留占额，不会自动重发。`
+      : `本批处理候选上限 300 已到；目标名额已占用 ${run.counts.targetUsed}/${run.target}，已确认发送 ${run.counts.completed}。保留缺额，未降低筛选门槛。`;
+    save(run);
+    return true;
+  };
+  const visibleCounts = (run: InternalRun) => {
+    const occupied = targetUsed(run);
+    if (!o.applications) return { ...run.counts, targetUsed: occupied };
+    const applications = ownedApplications(run);
     return {
       planned: run.counts.planned,
+      targetUsed: occupied,
       completed: applications.filter((application) => application.status === "completed").length,
       review: applications.filter((application) => ["needs-review", "failed"].includes(application.status) && application.stopReason !== "existing-contact").length,
       skipped: applications.filter((application) => application.stopReason === "existing-contact").length,
@@ -306,6 +365,7 @@ export function createBulkWorkflow(o: BulkWorkflowPorts) {
       delete latest.resetFailureStreakChildId;
       latest.counts.planned += started.counts.queued + started.counts.running;
       latest.counts.queued = started.counts.queued + started.counts.running;
+      latest.counts.targetUsed = targetUsed(latest);
       latest.message =
         "正在按冻结候选顺序处理投递；未知结果会保留占额且不会重发。";
       save(latest);
@@ -369,6 +429,7 @@ export function createBulkWorkflow(o: BulkWorkflowPorts) {
     );
     run.counts = {
       planned: run.counts.planned,
+      targetUsed: targetUsed(run),
       completed: old.completed + bulk.counts.completed,
       review: old.review + bulk.counts.review,
       skipped: old.skipped + bulk.counts.skipped,
@@ -404,13 +465,10 @@ export function createBulkWorkflow(o: BulkWorkflowPorts) {
         return;
       }
       if (child.state === "completed") {
+        const planned = Math.max(0, run.counts.planned - run.childTotals.reduce((n, child) => n + child.planned, 0));
         run.childTotals.push({
           bulkId: child.id,
-          planned: Math.max(
-            0,
-            run.counts.planned -
-              run.childTotals.reduce((n, v) => n + v.planned, 0),
-          ),
+          planned,
           completed: child.counts.completed,
           review: child.counts.review,
           skipped: child.counts.skipped,
@@ -418,17 +476,11 @@ export function createBulkWorkflow(o: BulkWorkflowPorts) {
         run.childBulkId = null;
         run.counts.queued = 0;
         save(run);
-        if (run.counts.planned >= run.target) {
-          run.state = "completed";
-          run.phase = "done";
-          run.message = `已规划 ${run.counts.planned}/${run.target}；已确认发送 ${run.counts.completed}，待核验 ${run.counts.review}，跳过 ${run.counts.skipped}。未知结果保留核验状态，不会自动补投。`;
-          save(run);
-          return;
-        }
+        if (finishAtTargetOrBudget(run)) return;
         try {
           const preview = o.bulk.preview({
             dailyLimit: run.config.dailyLimit,
-            target: run.target - run.counts.planned,
+            target: nextTarget(run),
             intervalSeconds: run.config.intervalSeconds,
             continueOnJobFailure: run.config.continueOnJobFailure,
           });
@@ -482,10 +534,11 @@ export function createBulkWorkflow(o: BulkWorkflowPorts) {
       if (child.state === "completed") {
         run.childAutomationId = null;
         save(run);
+        if (finishAtTargetOrBudget(run)) return;
         try {
           const preview = o.bulk.preview({
             dailyLimit: run.config.dailyLimit,
-            target: run.target - run.counts.planned,
+            target: nextTarget(run),
             intervalSeconds: run.config.intervalSeconds,
             continueOnJobFailure: run.config.continueOnJobFailure,
           });
@@ -517,10 +570,11 @@ export function createBulkWorkflow(o: BulkWorkflowPorts) {
       save(run);
       return;
     }
+    if (finishAtTargetOrBudget(run)) return;
     try {
       const preview = o.bulk.preview({
         dailyLimit: run.config.dailyLimit,
-        target: run.target - run.counts.planned,
+        target: nextTarget(run),
         intervalSeconds: run.config.intervalSeconds,
         continueOnJobFailure: run.config.continueOnJobFailure,
       });
@@ -632,7 +686,7 @@ export function createBulkWorkflow(o: BulkWorkflowPorts) {
         noGrowthRounds: 0,
         consecutiveJobFailures: 0,
         budgetUsed: 0,
-        counts: { planned: 0, completed: 0, review: 0, skipped: 0, queued: 0 },
+        counts: { planned: 0, targetUsed: 0, completed: 0, review: 0, skipped: 0, queued: 0 },
         configurationKey: preview.configurationKey,
         shanghaiDay: preview.shanghaiDay,
         manualPaused: false,
@@ -653,6 +707,7 @@ export function createBulkWorkflow(o: BulkWorkflowPorts) {
             run.phase = "sending";
             run.counts.planned = child.counts.queued + child.counts.running;
             run.counts.queued = run.counts.planned;
+            run.counts.targetUsed = run.counts.planned;
             run.message = "正在按预览冻结的候选和话术依次投递。";
           } else {
             const keyword = run.config.keywords[run.keywordIndex]!;
@@ -716,7 +771,9 @@ export function createBulkWorkflow(o: BulkWorkflowPorts) {
           throw new Error("配置已变化，请取消旧批次并重新预览");
         if (run.shanghaiDay !== o.quota(run.config.dailyLimit).date)
           throw new Error("已跨日，请取消旧批次并重新预览启动");
-        const block = globalBlock(run.config.dailyLimit);
+        // A child may already own the last daily contact slot. Its own resume
+        // check permits only established-contact continuations at zero quota.
+        const block = globalBlock(run.config.dailyLimit, Boolean(run.childBulkId));
         if (block) throw new Error(block);
         if (!childOwned(run))
           throw new Error("子任务已被替换，不能接续此工作流");
@@ -768,5 +825,17 @@ export function createBulkWorkflow(o: BulkWorkflowPorts) {
       run.shanghaiDay === o.quota(run.config.dailyLimit).date &&
       !globalBlock(run.config.dailyLimit, true);
   };
-  return { register, pump, permitsApplication };
+  // Reconciliation may queue untouched work for a paused owner, but cannot
+  // revive an ended/previous-day owner or approve a changed model configuration.
+  const permitsResumption = (application: Application): boolean => {
+    const run = load();
+    if (!run) return true;
+    if (!run.childBulkId || run.childBulkId !== application.bulkRunId)
+      return !["running", "paused"].includes(run.state);
+    return ["running", "paused"].includes(run.state) &&
+      run.configurationKey === o.configurationKey() &&
+      run.shanghaiDay === o.quota(run.config.dailyLimit).date &&
+      !globalBlock(run.config.dailyLimit, true);
+  };
+  return { register, pump, permitsApplication, permitsResumption };
 }

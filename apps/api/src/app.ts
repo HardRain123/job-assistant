@@ -38,7 +38,7 @@ import { assessJob, evaluateGates } from "../../../packages/matching/src/index.t
 import { decrypt, encrypt, equal } from "./security.ts";
 import { createExtensionAccess } from "./extension.ts";
 import { registerChatDiagnostics } from "./chat-diagnostics.ts";
-import { createAutomation } from "./automation.ts";
+import { createAutomation, pausedInspectionApplication } from "./automation.ts";
 import {
   attachmentManifest,
   registerExtensionApplication,
@@ -161,14 +161,18 @@ export async function createApp(o: AppOptions) {
         policy: policy(),
         providers: getProviders(),
       }),
-    ensureReady: (autoAssess) => {
+    ensureReady: (autoAssess, inspectionJobId) => {
+      const recovery = !autoAssess ? pausedInspectionApplication(o.store, inspectionJobId) : undefined;
       if (
         o.store
           .tasks()
           .some(
             (task) =>
               task.kind === "apply" &&
-              ["queued", "leased"].includes(task.status),
+              (task.status === "leased" || (task.status === "queued" &&
+                !(recovery && (task.payload as Application).executor === "extension" &&
+                  (task.payload as Application).id !== recovery.id &&
+                  o.store.application((task.payload as Application).id)?.bulkRunId === recovery.bulkRunId))),
           )
       )
         throw new Error("请等待投递任务结束或取消剩余批次后再采集岗位");
@@ -760,6 +764,7 @@ export async function createApp(o: AppOptions) {
     configurationKey,
     status: extension.status,
     workflowAllows: (application: Application): boolean => bulkWorkflow.permitsApplication(application),
+    workflowCanResume: (application: Application): boolean => bulkWorkflow.permitsResumption(application),
   });
   bulk.register(app);
   const bulkWorkflow = createBulkWorkflow({

@@ -1,8 +1,8 @@
 import { extractJobs } from "./extract.mjs";
+import { localApiBase } from "./connection.mjs";
 
-const API_BASE = "http://127.0.0.1:3000";
 const PAIR_CODE = /^[a-f0-9]{32}$/i;
-const state = { token: "", jobs: [] };
+const state = { token: "", port: 3000, jobs: [] };
 const el = (id) => document.getElementById(id);
 const pairPanel = el("pairPanel"),
   importPanel = el("importPanel"),
@@ -52,11 +52,12 @@ function setNotice(message, error = false) {
 function setBusy(button, busy) {
   button.disabled = busy;
 }
-async function api(path, options = {}) {
+async function api(path, options = {}, port = state.port) {
+  const apiBase = localApiBase(port);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 10_000);
   try {
-    const response = await fetch(`${API_BASE}${path}`, {
+    const response = await fetch(`${apiBase}${path}`, {
       ...options,
       credentials: "omit",
       redirect: "error",
@@ -81,11 +82,11 @@ async function api(path, options = {}) {
     clearTimeout(timer);
   }
 }
-async function persistToken(token) {
+async function persistToken(token, port) {
   await chrome.storage.local.setAccessLevel({
     accessLevel: "TRUSTED_CONTEXTS",
   });
-  await chrome.storage.local.set({ jobAssistantToken: token });
+  await chrome.storage.local.set({ jobAssistantToken: token, jobAssistantPort: port });
 }
 function showConnection(connected, expiresAt = "") {
   badge.textContent = connected ? "已连接" : "未连接";
@@ -173,14 +174,18 @@ el("pairForm").addEventListener("submit", async (event) => {
     return setNotice("配对码应为 32 位十六进制字符。", true);
   setBusy(event.submitter, true);
   try {
+    const port = Number(el("workbenchPort").value);
+    localApiBase(port);
     const paired = await api("/extension/v1/pair", {
       method: "POST",
       body: JSON.stringify({ code }),
-    });
+    }, port);
     if (!paired.token || !paired.expiresAt)
       throw new Error("本地工作台返回了不完整的配对结果。");
     state.token = paired.token;
-    await persistToken(state.token);
+    state.port = port;
+    await persistToken(state.token, port);
+    el("workbenchLink").href = `${localApiBase(port)}/`;
     chrome.runtime.sendMessage({ type: "job-assistant:automation-wake" });
     showConnection(true, paired.expiresAt);
   } catch (error) {
@@ -282,12 +287,20 @@ checkAutomationButton.addEventListener("click", async () => {
   }
 });
 retryButton.addEventListener("click", () => init());
+el("workbenchPort").addEventListener("input", () => {
+  try { el("workbenchLink").href = `${localApiBase(el("workbenchPort").value)}/`; }
+  catch { /* Only use a valid local port for the link. */ }
+});
 async function init() {
   await chrome.storage.local.setAccessLevel({
     accessLevel: "TRUSTED_CONTEXTS",
   });
-  const { jobAssistantToken = "", jobAssistantAutomationDiagnostic } =
-    await chrome.storage.local.get(["jobAssistantToken", "jobAssistantAutomationDiagnostic"]);
+  const { jobAssistantToken = "", jobAssistantPort = 3000, jobAssistantAutomationDiagnostic } =
+    await chrome.storage.local.get(["jobAssistantToken", "jobAssistantPort", "jobAssistantAutomationDiagnostic"]);
+  const apiBase = localApiBase(jobAssistantPort);
+  state.port = Number(jobAssistantPort);
+  el("workbenchPort").value = String(state.port);
+  el("workbenchLink").href = `${apiBase}/`;
   state.token = jobAssistantToken;
   showAutomationDiagnostic(jobAssistantAutomationDiagnostic);
   if (!state.token) return showConnection(false);

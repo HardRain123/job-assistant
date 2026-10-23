@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { lstatSync, readFileSync } from "node:fs";
 import { basename, extname, join } from "node:path";
 import type { FastifyInstance } from "fastify";
@@ -19,7 +19,7 @@ import {
 } from "../../../packages/storage/src/index.ts";
 import { canonicalJobUrl } from "./automation.ts";
 import { evaluateGates } from "../../../packages/matching/src/index.ts";
-import type { BulkApplication } from "./bulk-application.ts";
+import type { BulkApplication, RecoveryContext } from "./bulk-application.ts";
 import { renderTemplate } from "../../../packages/templates/src/index.ts";
 
 interface Options {
@@ -39,6 +39,14 @@ interface Options {
 }
 
 type AttachmentManifest = { name: string; size: number; sha256: string };
+type RecoveryPreview = {
+  applicationId: string;
+  applicationHash: string;
+  actionId?: string;
+  messages: string[];
+  expiresAt: string;
+  context: RecoveryContext;
+};
 function safeAttachment(
   attachmentsDir: string,
   name: string,
@@ -151,7 +159,7 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
     )
       throw new Error("请先连接并启用最新版浏览器扩展");
   };
-  const requireReady = () => {
+  const requireReady = (applicationId?: string) => {
     if (
       store.get("paused", false) ||
       store.get("takeover", false) ||
@@ -164,11 +172,18 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
     );
     if (run?.state === "running" && run.phase === "collecting")
       throw new Error("请等待当前岗位采集结束");
+    const application = applicationId ? store.application(applicationId) : undefined;
+    const batch = store.get<BulkRun | null>("bulk.current", null);
+    const pausedBatch = application?.bulkRunId && application.bulkRunId === batch?.id && batch.state === "paused";
     if (
       store
         .tasks()
         .some(
-          (t) => t.kind === "apply" && ["queued", "leased"].includes(t.status),
+          (t) => t.kind === "apply" && (t.status === "leased" ||
+            (t.status === "queued" && !(pausedBatch &&
+              (t.payload as Application).executor === "extension" &&
+              (t.payload as Application).id !== applicationId &&
+              store.application((t.payload as Application).id)?.bulkRunId === batch!.id))),
         )
     )
       throw new Error("已有投递任务等待完成");
@@ -378,6 +393,16 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
     action.state === "unknown" &&
     action.evidence === "send-unconfirmed" &&
     action.resolution === "user-confirmed-sent";
+  const automaticallyConfirmed = (action: Application["actions"][number]) =>
+    action.state === "confirmed" && !action.resolution &&
+    (action.kind === "native-greeting"
+      ? ["new-message", "new-conversation"].includes(action.evidence ?? "")
+      : action.kind === "message" && action.evidence === "new-message");
+  const resolvedNative = (action: Application["actions"][number]) =>
+    action.kind === "native-greeting" && action.index === 0 &&
+    (automaticallyConfirmed(action) ||
+      (action.state === "unknown" && action.evidence === "send-unconfirmed" &&
+        action.resolution === "contact-exists"));
   const requireMessageConfirmationAudit = (
     application: Application,
     action: Application["actions"][number],
@@ -405,6 +430,52 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
     requireFrozenJob(application);
     if (!o.bulk.allowedDuringAction(application))
       throw new Error("批量任务已暂停或结束");
+  };
+  const applicationHash = (application: Application) =>
+    createHash("sha256").update(JSON.stringify(application)).digest("hex");
+  const requireMessagePrefix = (application: Application, actionId: string) => {
+    const action = application.actions.find((item) => item.id === actionId);
+    const native = application.actions[0];
+    if (application.status !== "needs-review" || application.stopReason !== "send-unconfirmed" ||
+      !action || action.kind !== "message" || action.state !== "unknown" ||
+      action.evidence !== "send-unconfirmed" || action.resolution || !action.text)
+      throw new Error("只能确认内容一致且发送结果未知的话术");
+    if (!native || !resolvedNative(native))
+      throw new Error("原生沟通尚未确认，不能接续话术");
+    const earlier = application.actions.filter((item) => item.index < action.index);
+    const later = application.actions.filter((item) => item.index > action.index);
+    if (!earlier.length || earlier.some((item) => item.id !== native.id &&
+      !automaticallyConfirmed(item) && !manuallyConfirmedMessage(item)) ||
+      application.actions.length !== 1 + application.frozenMessages.length +
+        (application.attachmentPolicy === "send-after-messages" ? 1 : 0) ||
+      application.actions.some((item, index) => item.index !== index ||
+        (index > 0 && index <= application.frozenMessages.length &&
+          (item.kind !== "message" || item.text !== application.frozenMessages[index - 1]))) ||
+      later.some((item) => item.state !== "pending" || item.evidence || item.resolution))
+      throw new Error("前序动作未核对，或后续动作已执行，无法安全接续");
+    if (native.resolution === "contact-exists") requireExistingContactAudit(application);
+    for (const item of earlier.filter(manuallyConfirmedMessage))
+      requireMessageConfirmationAudit(application, item);
+    return { action, native, earlier, later };
+  };
+  const requireRecoverableMessages = (application: Application | undefined, actionId?: string) => {
+    const native = application?.actions[0];
+    if (!application || application.executor !== "extension" || application.status !== "needs-review" ||
+      !application.bulkRunId || application.attachmentPolicy !== "message-only" || application.resumeAttachment ||
+      !application.frozenMessages.length)
+      throw new Error("仅纯话术批次的待核对岗位可以单独恢复");
+    if (actionId) requireMessagePrefix(application, actionId);
+    else if (!native || native.kind !== "native-greeting" || native.index !== 0 || native.state !== "unknown" ||
+      native.evidence !== "send-unconfirmed" || (native.resolution && native.resolution !== "contact-exists") ||
+      application.actions.length !== application.frozenMessages.length + 1 ||
+      application.actions.slice(1).some((action, index) => action.kind !== "message" || action.index !== index + 1 ||
+        action.state !== "pending" || action.evidence || action.resolution || action.text !== application.frozenMessages[index]))
+      throw new Error("仅原生招呼结果未知且全部话术尚未执行的纯话术批次可以恢复");
+    const current = store.job(application.jobId);
+    if (!current || current.status !== "active" || !sameBusinessFacts(application.job, current))
+      throw new Error("岗位业务信息已变化，请重新核对");
+    requireConfig(application);
+    return application;
   };
 
   app.post("/api/extension-application/preview", (req) => {
@@ -451,7 +522,7 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
       .parse(req.body);
     requireConnection();
     return store.transaction(() => {
-      requireReady();
+      requireReady(body.applicationId);
       const application = store.application(body.applicationId);
       if (
         !application ||
@@ -471,6 +542,7 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
         throw new Error("只有所有动作尚未执行的失败任务可以重试");
       requireConfig(application);
       requireFrozenJob(application);
+      o.bulk.assertResumable(application);
       if (application.bulkRunId) {
         const run = store.get<(BulkRun & { configurationKey: string }) | null>(
           "bulk.current",
@@ -500,17 +572,36 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
       return { applicationId: application.id };
     });
   });
+  app.post("/api/extension-application/recovery-preview", (req) => {
+    const body = z.object({ applicationId: z.string().uuid(), actionId: z.string().uuid().optional() }).strict().parse(req.body);
+    requireConnection([0, 4, 2]);
+    return store.transaction(() => {
+      requireReady();
+      const application = requireRecoverableMessages(store.application(body.applicationId), body.actionId);
+      const context = o.bulk.recoveryContext(application);
+      const recoveryPreviewId = randomUUID();
+      const expiresAt = new Date(Date.now() + 5 * 60000).toISOString();
+      const messages = application.actions.filter((action) => action.kind === "message" && action.state === "pending")
+        .map((action) => action.text!);
+      store.set(`extensionApplication.recoveryPreview:${recoveryPreviewId}`, {
+        applicationId: application.id, applicationHash: applicationHash(application), actionId: body.actionId, messages, expiresAt, context,
+      } satisfies RecoveryPreview);
+      return { recoveryPreviewId, expiresAt, applicationId: application.id,
+        previousBulkRunId: context.previousBulkRunId, dailyLimit: context.dailyLimit, messages };
+    });
+  });
   app.post("/api/extension-application/resume-existing-contact", (req) => {
     const body = z
       .object({
         applicationId: z.string().uuid(),
         inspectionRunId: z.string().uuid(),
+        recoveryPreviewId: z.string().uuid().optional(),
       })
       .strict()
       .parse(req.body);
     requireConnection([0, 3, 4]);
     return store.transaction(() => {
-      requireReady();
+      requireReady(body.applicationId);
       const application = store.application(body.applicationId);
       if (
         !application ||
@@ -538,6 +629,18 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
       )
         throw new Error("已有联系人任务仅页面识别失败时可再次接续");
       requireConfig(application);
+      const recovery = body.recoveryPreviewId ? store.get<RecoveryPreview | null>(
+        `extensionApplication.recoveryPreview:${body.recoveryPreviewId}`, null) : null;
+      if (body.recoveryPreviewId) {
+        requireRecoverableMessages(application);
+        if (!recovery || recovery.actionId || recovery.applicationId !== application.id ||
+          Date.parse(recovery.expiresAt) < Date.now() ||
+          recovery.applicationHash !== applicationHash(application) ||
+          JSON.stringify(recovery.messages) !== JSON.stringify(application.frozenMessages))
+          throw new Error("恢复预览已失效或投递记录已变化，请重新预览");
+        if (JSON.stringify(o.bulk.recoveryContext(application)) !== JSON.stringify(recovery.context))
+          throw new Error("恢复预览的日期、配置、额度或原归属已变化，请重新预览");
+      }
       if (!previouslyResolved) {
         const prior = o.assessment(application.job);
         if (
@@ -567,6 +670,7 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
         )
       )
         throw new Error("当前岗位硬条件未通过，请人工核对");
+      if (!recovery) o.bulk.assertResumable({ ...application, job: current });
       const run = requireContactInspection(
         application,
         current,
@@ -574,11 +678,16 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
       );
       const oldHash = application.job.contentHash;
       const previousStopReason = application.stopReason ?? null;
+      const original = structuredClone(application);
       native!.resolution = "contact-exists";
       application.job = current;
       application.status = "queued";
       delete application.stopReason;
       delete application.pageDiagnostic;
+      if (recovery) {
+        o.bulk.startRecovery(application, original, recovery.context);
+        store.set(`extensionApplication.recoveryPreview:${body.recoveryPreviewId}`, null);
+      }
       store.updateApplication(application);
       store.enqueue("apply", application);
       store.audit("extensionApplication.existingContactResumed", {
@@ -591,7 +700,7 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
         oldHash,
         currentHash: current.contentHash,
       });
-      return { applicationId: application.id };
+      return { applicationId: application.id, ...(recovery ? { bulkRunId: application.bulkRunId } : {}) };
     });
   });
   app.post("/api/extension-application/confirm-message-and-resume", (req) => {
@@ -601,6 +710,7 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
         actionId: z.string().uuid(),
         expectedTextHash: z.string().regex(/^[a-f0-9]{64}$/),
         inspectionRunId: z.string().uuid(),
+        recoveryPreviewId: z.string().uuid().optional(),
         updatedTemplate: z
           .object({
             version: z.number().int().positive(),
@@ -617,7 +727,7 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
       .parse(req.body);
     requireConnection([0, 3, 4]);
     return store.transaction(() => {
-      requireReady();
+      requireReady(body.applicationId);
       const application = store.application(body.applicationId);
       if (
         !application ||
@@ -640,45 +750,24 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
           body.expectedTextHash
       )
         throw new Error("只能确认内容一致且发送结果未知的话术");
-      const native = application.actions[0];
-      if (
-        !native ||
-        native.kind !== "native-greeting" ||
-        native.index !== 0 ||
-        native.state !== "unknown" ||
-        native.evidence !== "send-unconfirmed" ||
-        native.resolution !== "contact-exists"
-      )
-        throw new Error("当前扩展仅支持已核对的既有联系人接续");
-      const earlier = application.actions.filter(
-        (item) => item.index < action.index,
-      );
-      const later = application.actions.filter(
-        (item) => item.index > action.index,
-      );
-      if (
-        !earlier.length ||
-        earlier.some((item) => !actionCompleteForExistingContact(item)) ||
-        earlier.some(
-          (item) => item.id !== native.id && !manuallyConfirmedMessage(item),
-        ) ||
-        application.actions.length !==
-          1 +
-            application.frozenMessages.length +
-            (application.attachmentPolicy === "send-after-messages" ? 1 : 0) ||
-        application.actions.some(
-          (item) =>
-            item.kind === "message" &&
-            item.text !== application.frozenMessages[item.index - 1],
-        ) ||
-        later.some((item) => item.state !== "pending" || item.resolution)
-      )
-        throw new Error("前序动作未核对，或后续动作已执行，无法安全接续");
+      const { later } = requireMessagePrefix(application, action.id);
+      const recovery = body.recoveryPreviewId ? store.get<RecoveryPreview | null>(
+        `extensionApplication.recoveryPreview:${body.recoveryPreviewId}`, null) : null;
+      if (body.recoveryPreviewId) {
+        requireRecoverableMessages(application, action.id);
+        if (body.updatedTemplate || !recovery || recovery.applicationId !== application.id ||
+          recovery.actionId !== action.id || Date.parse(recovery.expiresAt) < Date.now() ||
+          recovery.applicationHash !== applicationHash(application) ||
+          JSON.stringify(recovery.messages) !== JSON.stringify(later.map((item) => item.text)))
+          throw new Error("恢复预览已失效或投递记录已变化，请重新预览");
+        if (JSON.stringify(o.bulk.recoveryContext(application)) !== JSON.stringify(recovery.context))
+          throw new Error("恢复预览的日期、配置、额度或原归属已变化，请重新预览");
+      }
       // Reconciliation only queues untouched work. A paused batch must be
       // resolvable before it can resume; actual claims/actions still require a
       // running batch. Never resurrect a cancelled, completed or replaced run.
       requireFrozenJob(application);
-      if (application.bulkRunId) {
+      if (application.bulkRunId && !recovery) {
         const run = store.get<BulkRun | null>("bulk.current", null);
         if (
           !run ||
@@ -775,9 +864,7 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
         store.set("bulk.current", batch);
       }
       requireConfig(application);
-      requireExistingContactAudit(application);
-      for (const item of earlier.filter(manuallyConfirmedMessage))
-        requireMessageConfirmationAudit(application, item);
+      if (!recovery) o.bulk.assertResumable(application);
       const current = store.job(application.jobId)!;
       const resume = store.get<Resume | null>("resume", null);
       if (
@@ -794,6 +881,7 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
       );
       const previousDiagnostic = application.pageDiagnostic ?? null;
       const previousStopReason = application.stopReason;
+      const original = structuredClone(application);
       // A user's observation resolves whether to proceed, without rewriting the
       // missing browser receipt as an automatically confirmed send.
       action.resolution = "user-confirmed-sent";
@@ -801,6 +889,10 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
       application.status = later.length ? "queued" : "completed";
       delete application.stopReason;
       delete application.pageDiagnostic;
+      if (recovery) {
+        o.bulk.startRecovery(application, original, recovery.context);
+        store.set(`extensionApplication.recoveryPreview:${body.recoveryPreviewId}`, null);
+      }
       store.audit("extensionApplication.messageConfirmedAndResumed", {
         applicationId: application.id,
         actionId: action.id,
@@ -822,15 +914,24 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
   });
   app.post("/extension/v1/application/claim", () => {
     requireConnection();
-    const candidate = store
+    store.recoverExpired();
+    const candidates = store
       .tasks()
       .reverse()
-      .find(
+      .filter(
         (t) =>
           t.status === "queued" &&
           t.kind === "apply" &&
           (t.payload as Application).executor === "extension",
       );
+    const limit = store.get<BulkRun | null>("bulk.current", null)?.dailyLimit ??
+      store.get("bulk.dailyLimit", 150);
+    const candidate = (store.dailyQuota(new Date(), limit).remaining <= 0
+      ? candidates.find((task) => {
+          const application = store.application((task.payload as Application).id);
+          return application?.actions[0] && resolvedNative(application.actions[0]);
+        })
+      : null) ?? candidates[0];
     if (candidate) {
       const application = store.application(
         (candidate.payload as Application).id,
@@ -839,6 +940,8 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
         requireConnection([0, 4, 2]);
         if (!o.bulk.canClaim(application)) return { task: null };
       }
+      if (application?.actions[0] && automaticallyConfirmed(application.actions[0]))
+        requireConnection([0, 4, 14]);
       let current = false;
       try {
         if (application) {
@@ -869,11 +972,12 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
         return { task: null };
       }
     }
-    const task = store.claim("extension");
+    if (!candidate) return { task: null };
+    const task = store.claim("extension", candidate.id);
     if (!task) return { task: null };
     const application = store.application((task.payload as Application).id)!;
-    // The installed extension only accepts pending work and its existing-contact
-    // navigation action. Keep reconciled messages in storage and the task payload.
+    // Keep original receipts in storage. The wire task contains only untouched
+    // messages plus the native action used to reopen the verified conversation.
     return {
       task: {
         id: task.id,
@@ -881,7 +985,8 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
         application: {
           ...application,
           actions: application.actions.filter(
-            (action) => !manuallyConfirmedMessage(action),
+            (action) => !(action.kind === "message" &&
+              (manuallyConfirmedMessage(action) || automaticallyConfirmed(action))),
           ),
         },
       },
@@ -919,7 +1024,7 @@ export function registerExtensionApplication(app: FastifyInstance, o: Options) {
       (action.state !== "started" &&
         !(
           action.kind === "native-greeting" &&
-          ((action.state === "skipped" &&
+          (resolvedNative(action) || (action.state === "skipped" &&
             action.evidence === "existing-contact") ||
             (action.state === "unknown" &&
               action.evidence === "send-unconfirmed" &&

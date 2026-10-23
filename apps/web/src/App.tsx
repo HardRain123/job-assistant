@@ -4,6 +4,7 @@ import { ExtensionPanel } from "./ExtensionPanel";
 import { AutomationPanel } from "./AutomationPanel";
 import { BulkPanel } from "./BulkPanel";
 import { ChatDiagnosticPanel } from "./ChatDiagnosticPanel";
+import { ExistingContactRecovery } from "./ExistingContactRecovery";
 import type {
   Application as StoredApplication,
   ConversationProbe,
@@ -1813,6 +1814,11 @@ function ConfirmSentMessage({
     configurationKey: string;
     messages: string[];
   } | null>(null);
+  const [recovery, setRecovery] = useState<{
+    recoveryPreviewId: string;
+    expiresAt: string;
+    messages: string[];
+  } | null>(null);
   const mounted = useRef(true);
   useEffect(() => {
     mounted.current = true;
@@ -1833,15 +1839,18 @@ function ConfirmSentMessage({
     action.evidence !== "send-unconfirmed" ||
     !action.text ||
     native?.kind !== "native-greeting" ||
-    native.state !== "unknown" ||
-    native.resolution !== "contact-exists" ||
+    !((native.state === "confirmed" && !native.resolution &&
+      ["new-message", "new-conversation"].includes(native.evidence ?? "")) ||
+      (native.state === "unknown" && native.evidence === "send-unconfirmed" &&
+        native.resolution === "contact-exists")) ||
     application.actions.some(
       (previous) =>
         previous.index > 0 &&
         previous.index < action.index &&
         (previous.kind !== "message" ||
-          previous.state !== "unknown" ||
-          previous.resolution !== "user-confirmed-sent"),
+          !((previous.state === "confirmed" && previous.evidence === "new-message" && !previous.resolution) ||
+            (previous.state === "unknown" && previous.evidence === "send-unconfirmed" &&
+              previous.resolution === "user-confirmed-sent"))),
     ) ||
     application.actions.some(
       (later) => later.index > action.index && later.state !== "pending",
@@ -1857,6 +1866,8 @@ function ConfirmSentMessage({
     setBusy(true);
     setError("");
     try {
+      if (recovery && Date.parse(recovery.expiresAt) <= Date.now())
+        throw new Error("接续预览已过期，请重新生成。");
       type Inspection = { id: string; state: string; imported: number };
       const started = await api<{ run: Inspection }>(
         "/api/automation/start",
@@ -1902,6 +1913,7 @@ function ConfirmSentMessage({
             .map((byte) => byte.toString(16).padStart(2, "0"))
             .join(""),
           inspectionRunId: run.id,
+          ...(recovery ? { recoveryPreviewId: recovery.recoveryPreviewId } : {}),
           ...(latest
             ? {
                 updatedTemplate: {
@@ -1926,7 +1938,7 @@ function ConfirmSentMessage({
       <button
         className="quiet"
         disabled={paused || busy}
-        onClick={() => setOpen(true)}
+        onClick={() => { setRecovery(null); setLatest(null); setError(""); setOpen(true); }}
       >
         核对已发送的消息
       </button>
@@ -1951,7 +1963,25 @@ function ConfirmSentMessage({
               ? "确认后记录为“人工核对已发送”，保留原始未知回执，只将未发送的后续步骤排队。该消息不会重发。"
               : "确认后完成本条投递记录，保留原始未知回执及人工核对标记，不再执行任何发送。"}
           </p>
-          {application.bulkRunId && hasPending && (
+          {application.bulkRunId && (
+            <>
+              <button className="quiet" disabled={busy} onClick={() => {
+                setBusy(true); setError(""); setLatest(null); setRecovery(null);
+                void api<{ recoveryPreviewId: string; expiresAt: string; messages: string[] }>(
+                  "/api/extension-application/recovery-preview", "POST",
+                  { applicationId: application.id, actionId: action.id },
+                ).then((preview) => { if (mounted.current) setRecovery(preview); })
+                  .catch((e) => { if (mounted.current) setError(e instanceof Error ? e.message : "预览失败"); })
+                  .finally(() => { if (mounted.current) setBusy(false); });
+              }}>原批次已结束：预览单独接续</button>
+              {recovery && <div>
+                <p>{recovery.messages.length ? "核对上方消息后，仅发送以下未执行的话术：" : "核对后仅完成记录，不再发送消息。"}</p>
+                {recovery.messages.map((message, index) => <blockquote key={index} style={{ whiteSpace: "pre-wrap" }}>{message}</blockquote>)}
+                <p>预览有效期至 {new Date(recovery.expiresAt).toLocaleTimeString("zh-CN")}，历史记录保留。</p>
+              </div>}
+            </>
+          )}
+          {application.bulkRunId && hasPending && !recovery && (
             <>
               <p>若批次已暂停，核对后请到“批量投递”页继续批次。</p>
               <button
@@ -2206,6 +2236,7 @@ function Records({
                   paused={s.paused}
                   mutate={mutate}
                 />
+                <ExistingContactRecovery application={a} paused={s.paused} mutate={mutate} />
               </div>
               <div>
                 {a.actions.map((x, i) => (

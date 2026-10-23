@@ -300,8 +300,10 @@ export async function runExtensionApplication(api, token) {
       throw new Error("page-unrecognized");
     const resolvedContact = (action) =>
       action.kind === "native-greeting" &&
-      action.state === "unknown" &&
-      action.resolution === "contact-exists";
+      ((action.state === "unknown" && action.evidence === "send-unconfirmed" &&
+        action.resolution === "contact-exists") ||
+       (action.state === "confirmed" && !action.resolution &&
+        ["new-message", "new-conversation"].includes(action.evidence)));
     if (
       application.actions.some(
         (action) => action.state !== "pending" && !resolvedContact(action),

@@ -299,7 +299,7 @@ export class Store {
       }
     }
   }
-  claim(executor: "worker" | "extension" = "worker"): Task | null {
+  claim(executor: "worker" | "extension" = "worker", taskId?: string): Task | null {
     return this.transaction(() => {
       this.recoverExpired();
       if (this.get("paused", false) || this.get("takeover", false)) return null;
@@ -308,10 +308,10 @@ export class Store {
       const row = this.db
         .prepare(
           executor === "extension"
-            ? "SELECT * FROM tasks WHERE status='queued' AND kind='apply' AND json_extract(payload,'$.executor')='extension' ORDER BY created_at, rowid LIMIT 1"
-            : "SELECT * FROM tasks WHERE status='queued' AND (kind!='apply' OR coalesce(json_extract(payload,'$.executor'),'worker')='worker') ORDER BY created_at, rowid LIMIT 1",
+            ? "SELECT * FROM tasks WHERE status='queued' AND kind='apply' AND json_extract(payload,'$.executor')='extension' AND (? IS NULL OR id=?) ORDER BY created_at, rowid LIMIT 1"
+            : "SELECT * FROM tasks WHERE status='queued' AND (kind!='apply' OR coalesce(json_extract(payload,'$.executor'),'worker')='worker') AND (? IS NULL OR id=?) ORDER BY created_at, rowid LIMIT 1",
         )
-        .get();
+        .get(taskId ?? null, taskId ?? null);
       if (!row) return null;
       const task = this.taskRow(row);
       task.status = "leased";

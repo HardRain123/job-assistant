@@ -168,6 +168,93 @@ test("真实工作流最后一个沟通名额占用后仍允许本岗位两段�
   } finally { await f.close(); }
 });
 
+test("真实工作流耗尽额度后可暂停恢复已有联系人的话术，仍不新增沟通", async () => {
+  const f = await fixture();
+  try {
+    f.addJob("额度耗尽接续公司");
+    await f.start({ dailyLimit: 1, target: 1 });
+    const task = await f.claim();
+    await f.action(task, 0, "started", "before-action");
+    await f.action(task, 0, "confirmed", "new-conversation");
+    assert.equal(f.store.dailyQuota().remaining, 0);
+    assert.equal((await f.workbench("/api/bulk-workflow/control", { action: "pause" })).statusCode, 200);
+    const resumed = await f.workbench("/api/bulk-workflow/control", { action: "resume" });
+    assert.equal(resumed.statusCode, 200, resumed.body);
+    for (const index of [1, 2]) {
+      await f.action(task, index, "started", "before-action");
+      await f.authorize(task, index);
+      await f.action(task, index, "confirmed", "new-message");
+    }
+    await f.result(task);
+    const ended = await waitFor(f.state, (run) => run.state === "completed", "额度耗尽的已有会话收尾");
+    assert.equal(ended.counts.completed, 1);
+    assert.equal(f.store.dailyQuota().occupied, 1);
+    f.addJob("不能超额开启的公司");
+    const preview = await f.workbench("/api/bulk-workflow/preview", { ...workflowConfig, dailyLimit: 1 });
+    assert.equal(preview.statusCode, 200, preview.body);
+    assert.equal(preview.json().applications.length, 0);
+    const beyondQuota = await f.workbench("/api/bulk-workflow/start", { previewId: preview.json().previewId });
+    assert.equal(beyondQuota.statusCode, 400, beyondQuota.body);
+    assert.match(beyondQuota.body, /额度已用完/);
+    assert.equal(f.store.applications().length, 1);
+  } finally { await f.close(); }
+});
+
+test("真实工作流替补已有联系人和未执行前置失败，保留记录去重后达到目标", async () => {
+  const f = await fixture();
+  try {
+    f.addJob("已沟通无需重发公司");
+    await f.start({ target: 1 });
+    const first = await f.claim();
+    await f.action(first, 0, "skipped", "existing-contact");
+    f.addJob("发送前页面不匹配公司");
+    await f.result(first, "existing-contact");
+    await waitFor(f.state, (run) => run.counts.planned === 2, "跳过旧联系人后补一个目标");
+    const second = await f.claim();
+    assert.notEqual(second.application.jobId, first.application.jobId);
+    f.addJob("实际发送成功公司");
+    await f.result(second, "recipient-mismatch");
+    await waitFor(f.state, (run) => run.counts.planned === 3, "全部动作未开始的失败后补目标");
+    const third = await f.claim();
+    assert.ok(![first.application.jobId, second.application.jobId].includes(third.application.jobId));
+    for (const index of [0, 1, 2]) {
+      await f.action(third, index, "started", "before-action");
+      await f.action(third, index, "confirmed", index === 0 ? "new-conversation" : "new-message");
+    }
+    await f.result(third);
+    const done = await waitFor(f.state, (run) => run.state === "completed", "补足一个真实尝试目标后结束");
+    assert.equal(done.counts.planned, 3);
+    assert.equal(done.counts.targetUsed, 1);
+    assert.equal(done.counts.completed, 1);
+    assert.equal(done.counts.skipped, 1);
+    assert.equal(done.counts.review, 1);
+    assert.equal(f.store.dailyQuota().occupied, 1);
+    assert.equal(f.store.applications().length, 3);
+    assert.ok(f.store.application(first.application.id)!.actions.slice(1).every((action) => action.state === "pending"));
+    assert.ok(f.store.application(second.application.id)!.actions.every((action) => action.state === "pending"));
+  } finally { await f.close(); }
+});
+
+test("真实工作流结果未知保留目标占额，即使有新候选也不补投", async () => {
+  const f = await fixture();
+  try {
+    f.addJob("结果未知公司");
+    await f.start({ target: 1 });
+    const task = await f.claim();
+    await f.action(task, 0, "started", "before-action");
+    await f.action(task, 0, "unknown", "send-unconfirmed");
+    f.addJob("不能用于替换未知结果公司");
+    await f.result(task, "send-unconfirmed");
+    const done = await waitFor(f.state, (run) => run.state === "completed", "未知动作保留目标而不补投");
+    assert.equal(done.counts.targetUsed, 1);
+    assert.equal(done.counts.completed, 0);
+    assert.equal(done.counts.review, 1);
+    assert.equal(f.store.applications().length, 1);
+    assert.equal(f.store.dailyQuota().occupied, 1);
+    assert.equal(await f.claim(), null);
+  } finally { await f.close(); }
+});
+
 test("真实工作流全局暂停和配置变化同步暂停实际投递子任务", async () => {
   for (const trigger of ["queue", "configuration"]) {
     const f = await fixture();
@@ -322,7 +409,9 @@ test("同一工作流跨三个单岗位子批次累计失败，SQLite 重启保�
     await waitFor(f.state, (run) => run.counts.planned === 4, "人工继续后启动第四个岗位");
     assert.equal((await child()).consecutiveJobFailures, 0);
     const fourth = await f.claim();
-    await f.result(fourth, "page-unrecognized");
+    await f.action(fourth, 0, "started", "before-action");
+    await f.action(fourth, 0, "unknown", "send-unconfirmed");
+    await f.result(fourth, "send-unconfirmed");
     const completed = await waitFor(f.state, (run) => run.state === "completed", "第四个岗位单次失败保留核验并收尾");
     assert.equal((await child()).consecutiveJobFailures, 1);
     assert.equal(completed.counts.review, 4);
@@ -347,7 +436,11 @@ test("跨子批次失败期间有完整成功，后续连续失败从零重新�
           await f.action(task, actionIndex, "confirmed", actionIndex === 0 ? "new-conversation" : "new-message");
         }
         await f.result(task);
-      } else await f.result(task, "recipient-mismatch");
+      } else {
+        await f.action(task, 0, "started", "before-action");
+        await f.action(task, 0, "unknown", "send-unconfirmed");
+        await f.result(task, "send-unconfirmed");
+      }
       if (index < 3) {
         await waitFor(f.state, (run) => run.counts.planned === index + 2, "下一子批次继承更新的失败计数");
         assert.equal((await child()).consecutiveJobFailures, index === 1 ? 0 : 1);

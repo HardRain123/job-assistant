@@ -51,7 +51,7 @@ services:
       - attachments:/attachments
       - evidence:/evidence
     ports:
-      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:${JOB_ASSISTANT_PORT:-3000}:3000"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     read_only: true

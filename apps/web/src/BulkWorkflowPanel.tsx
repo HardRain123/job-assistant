@@ -8,7 +8,7 @@ type Workflow = {
   rounds: number;
   budgetUsed: number;
   message: string;
-  counts: { planned: number; completed: number; review: number; skipped: number; queued: number };
+  counts: { planned: number; targetUsed?: number; completed: number; review: number; skipped: number; queued: number };
 };
 type Preview = {
   previewId: string;
@@ -69,12 +69,12 @@ export function BulkWorkflowPanel({ onActiveChange, onChanged }: {
   });
   return <section className="card">
     <div className="card-title"><h2>自动补充并投递</h2></div>
-    <p>按当前筛选条件和话术处理岗位，候选不足时自动采集、评分后继续。目标按尝试处理的岗位数计算；结果未知仍保留，不会为了凑成功数重复发送。</p>
+    <p>按当前筛选条件和话术处理岗位，候选不足时自动采集、评分后继续。已沟通跳过和明确未发送的失败不占目标，会补充新岗位；已尝试但结果未知的岗位保留名额，等待核对。</p>
     <p className="muted">单岗位异常保留待核验并继续；连续三次异常、登录、验证码或平台额度限制会暂停。最多补采五轮，累计采集入库三百个岗位，不会降低筛选门槛。不发送附件或图片。</p>
     {error && <p className="notice" role="alert">{error}</p>}
     {run && <div aria-live="polite">
       <p>{run.state === "running" ? (run.phase === "collecting" ? "正在采集和评分" : "正在依次发送") : run.state === "paused" ? "已暂停" : run.state === "completed" ? "本次处理结束" : "本次已取消"}：{run.message}</p>
-      <p>已规划 {run.counts.planned} / {run.target} 个 · 话术完成 {run.counts.completed} · 待核验 {run.counts.review} · 已沟通跳过 {run.counts.skipped} · 排队 {run.counts.queued}；补采 {run.rounds} 轮，累计入库 {run.budgetUsed} 个岗位。</p>
+      <p>目标占用 {run.counts.targetUsed ?? run.counts.planned} / {run.target} 个 · 话术完成 {run.counts.completed} · 待核验 {run.counts.review} · 已沟通跳过 {run.counts.skipped} · 排队 {run.counts.queued}；累计处理候选 {run.counts.planned} 个，补采 {run.rounds} 轮，累计入库 {run.budgetUsed} 个岗位。</p>
       {active && <div className="button-row">
         <button disabled={busy} onClick={() => void control(run.state === "paused" ? "resume" : "pause")}>{run.state === "paused" ? "继续自动批次" : "暂停自动批次"}</button>
         <button className="quiet danger" disabled={busy} onClick={() => void control("cancel")}>结束自动批次</button>
