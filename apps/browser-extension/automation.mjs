@@ -4,7 +4,7 @@ import { runExtensionApplication } from "./application.mjs";
 import { runChatDiagnostic } from "./chat-diagnostics.mjs";
 import { connectionApiBase } from "./connection.mjs";
 
-const VERSION = "0.4.14";
+const VERSION = "0.4.15";
 const STATE_KEY = "jobAssistantAutomationTabs";
 const DIAGNOSTIC_KEY = "jobAssistantAutomationDiagnostic";
 const ALARM = "job-assistant-automation-poll";
@@ -605,11 +605,12 @@ export async function execute(command, tokenValue) {
       } else page.hasNext = true;
       return continuation;
     };
-    if (command.kind === "search" && !page.hasNext && searchDiagnostic?.scrollContainers?.some((container) => container.canScroll && !container.atEnd)) {
-      const continuation = await scrollList();
-      if (!continuation) return;
-      if (continuation.stop) return await report(tokenValue, command, continuation.stop);
-    }
+    // Commit the already verified first screen before attempting continuation.
+    // A later scroll timeout must not discard these usable job links. hasNext
+    // here schedules a bounded attempt; only a next result can confirm the end.
+    if (command.kind === "search" && page.links?.length &&
+        searchDiagnostic?.scrollContainers?.some((container) => container.canScroll))
+      page = { ...page, hasNext: true };
     if (command.kind === "next") {
       if (!(await permit())) return;
       if (await actualUrl(tabId, budget) !== command.url || !isSearchUrl(command.url)) return await report(tokenValue, command, { outcome: "error", url: await actualUrl(tabId, budget) || command.url, reason: "navigation-failed" });

@@ -414,8 +414,10 @@ export function createAutomation(o: Options) {
     }
     if (b.outcome !== "ok") {
       const message = reasons[b.reason ?? "page-unrecognized"]!;
+      const continuationLimit = cmd.kind === "next" && b.diagnostic?.stage === "advancing-page" &&
+        ["continuation-time-limit", "continuation-step-limit", "continuation-control-limit", "continuation-scroll-stuck"].includes(b.diagnostic?.code ?? "");
       if (cmd.kind !== "detail" && b.outcome === "error" &&
-          b.reason === "page-unrecognized" && b.diagnostic?.code === "dom-unrecognized") {
+          b.reason === "page-unrecognized" && (b.diagnostic?.code === "dom-unrecognized" || continuationLimit)) {
         const actual = new URL(b.url);
         const expected = new URL(cmd.url);
         if (actual.origin !== "https://www.zhipin.com" || actual.username || actual.password ||
@@ -432,7 +434,9 @@ export function createAutomation(o: Options) {
           } else {
             (r.unreadableSearches ??= []).push({
               url: cmd.url,
-              reason: cmd.kind === "next"
+              reason: continuationLimit
+                ? "列表续载达到本次等待或操作上限；已保留已采集岗位，未确认列表结束。"
+                : cmd.kind === "next"
                 ? "翻页后的列表未识别，未再次点击翻页；已保留前面采集的岗位。"
                 : "重新打开后仍无法识别列表，已跳过该搜索词；不代表没有岗位。",
             });

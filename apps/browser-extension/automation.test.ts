@@ -473,6 +473,31 @@ test("search reports read-only continuation evidence even at the final page and 
   } finally { globalThis.fetch = originalFetch; browser.scripting.executeScript = originalScript; }
 });
 
+test("first-screen links are reported before scrolling, including a tall list with truncated control diagnostics", async () => {
+  await executionFixture(async ({ browser, reports, scripts, searchUrl }) => {
+    const links = Array.from({ length: 14 }, (_, i) => `https://www.zhipin.com/job_detail/first-${i}.html`);
+    const original = browser.scripting.executeScript;
+    browser.scripting.executeScript = async (options: { func: { name: string } }) => {
+      scripts.push(options.func.name);
+      if (options.func.name === "inspectSearchContinuation") return [{ result: {
+        version: 1, linkCount: 14, pagination: { matched: 0, visible: 0, enabled: 0, disabled: 0, ambiguous: false, truncated: true },
+        lists: { matched: 1, visible: 1, truncated: false }, truncated: true,
+        scrollContainers: [{ kind: "document", depth: 0, clientHeight: 825, scrollHeight: 3103, scrollTop: 0, remaining: 2278, canScroll: true, atEnd: false }],
+      } }];
+      if (options.func.name === "advanceSearchList") throw new Error("first-screen collection must not scroll");
+      return [{ result: { recognized: true, links, pageUrl: searchUrl, hasNext: false } }];
+    };
+    await worker.execute({ ...command, kind: "search", url: searchUrl }, "token");
+    assert.equal(reports.length, 1);
+    assert.equal(reports[0].outcome, "ok");
+    assert.deepEqual(reports[0].links, links);
+    assert.equal(reports[0].hasNext, true);
+    assert.equal(reports[0].continuationEnded, undefined);
+    assert.ok(!scripts.includes("advanceSearchList"));
+    browser.scripting.executeScript = original;
+  });
+});
+
 test("scroll continuation reports new links and an explicit unchanged end, stopping on limits or changed pages", async () => {
   const originalFetch = globalThis.fetch;
   const browser = (globalThis as Record<string, any>).chrome;
@@ -507,7 +532,7 @@ test("scroll continuation reports new links and an explicit unchanged end, stopp
       tab = { ...tab, url, status: "complete" };
       browser.scripting.executeScript = async (options: { func: { name: string }; args?: unknown[] }) => {
         if (options.func.name === "inspectSearchContinuation") return [{ result: evidence }];
-        if (options.func.name === "advanceSearch") { clicked++; return [{ result: { clicked: false } }]; }
+        if (options.func.name === "advanceSearch") { clicked++; return [{ result: { clicked: scenario === "next-control" } }]; }
         if (options.func.name === "advanceSearchList") {
           scrolled++;
           assert.deepEqual(options.args, [url, oldLink]);
@@ -517,12 +542,12 @@ test("scroll continuation reports new links and an explicit unchanged end, stopp
             pageUrl: scenario === "wrong-query" ? url.replace("query=Java", "query=Python") : url,
             links: outcome === "end" ? [oldLink] : [oldLink, newLink], hasNext: outcome !== "end" } }];
         }
-        return [{ result: { recognized: true, links: [oldLink], pageUrl: url, hasNext: false } }];
+        return [{ result: { recognized: true, links: clicked ? [oldLink, newLink] : [oldLink], pageUrl: url, hasNext: false } }];
       };
-      await worker.execute({ ...command, kind: ["end", "next-changed"].includes(scenario) ? "next" : "search", url, previousSignature: oldLink }, "token");
+      await worker.execute({ ...command, kind: "next", url, previousSignature: oldLink }, "token");
       assert.equal(scrolled, 1, scenario);
       assert.equal(activations, 1, scenario);
-      assert.equal(clicked, 0, scenario);
+      assert.equal(clicked, scenario === "next-control" ? 1 : 0, scenario);
       if (scenario === "paused") { assert.equal(reports.length, 0); continue; }
       assert.equal(reports.length, 1);
       if (["changed", "next-changed"].includes(scenario)) {
@@ -532,8 +557,7 @@ test("scroll continuation reports new links and an explicit unchanged end, stopp
         assert.equal(reports[0].continuationEnded, undefined);
       } else if (scenario === "next-control") {
         assert.equal(reports[0].outcome, "ok");
-        assert.deepEqual(reports[0].links, [oldLink]);
-        assert.equal(reports[0].hasNext, true);
+        assert.deepEqual(reports[0].links, [oldLink, newLink]);
       } else if (scenario === "end") {
         assert.equal(reports[0].outcome, "ok");
         assert.deepEqual(reports[0].links, [oldLink]);

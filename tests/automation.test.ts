@@ -260,6 +260,70 @@ test("翻页后无法识别不再次点击翻页，跳过该词保留岗位，�
   } finally { await f.close(); }
 });
 
+test("续载达到上限时保留已读取的14个岗位并评分，明确记录未读部分而非整轮阻塞", async () => {
+  for (const code of ["continuation-time-limit", "continuation-step-limit", "continuation-control-limit", "continuation-scroll-stuck"]) {
+    const f = await fixture();
+    try {
+      await f.start({ keywords: ["Java"], maxJobs: 50, autoAssess: true });
+      const ids = Array.from({ length: 14 }, (_, i) => `first-${i}`);
+      await f.result(await f.claim(), { links: ids.map(url), hasNext: true });
+      for (const id of ids) {
+        const detail = await f.claim();
+        assert.equal(detail.kind, "detail");
+        await f.result(detail, { jobs: [job(id)] });
+      }
+      const next = await f.claim();
+      assert.equal(next.kind, "next");
+      const failure = { outcome: "error", reason: "page-unrecognized", diagnostic: { stage: "advancing-page", code } };
+      assert.equal((await f.result(next, failure)).statusCode, 200);
+      assert.equal((await f.result(next, failure)).statusCode, 200);
+      await f.restart();
+      let run = await f.state();
+      assert.equal(run.phase, "scoring");
+      assert.equal(run.imported, 14);
+      assert.equal(run.unreadableSearches.length, 1);
+      assert.match(run.unreadableSearches[0].reason, /未确认列表结束/);
+      assert.equal(await f.claim(), null);
+      for (let i = 0; i < 16; i++) await f.pump();
+      run = await f.state();
+      assert.equal(run.state, "completed");
+      assert.equal(run.scored, 14);
+      assert.equal(f.store.applications().length, 0);
+    } finally { await f.close(); }
+  }
+});
+
+test("续载上限不放行错误搜索、首屏错误或登录验证，也不伪造成功回执", async () => {
+  for (const scenario of ["wrong-url", "first-screen", "login-required", "verification-required", "wrong-stage"]) {
+    const f = await fixture();
+    try {
+      await f.start({ keywords: ["Java"], autoAssess: true });
+      let command = await f.claim();
+      if (scenario !== "first-screen") {
+        await f.result(command, { links: [url("a")], hasNext: true });
+        await f.result(await f.claim(), { jobs: [job("a")] });
+        command = await f.claim();
+      }
+      const failure = { outcome: "error", reason: "page-unrecognized",
+        diagnostic: { stage: "advancing-page", code: "continuation-time-limit" } };
+      if (scenario === "wrong-url") {
+        for (const actualUrl of ["https://evil.example/web/geek/jobs", command.url.replace("101020100", "100010000"), command.url.replace("query=", "query=changed")])
+          assert.equal((await f.result(command, { ...failure, url: actualUrl })).statusCode, 400);
+        assert.equal((await f.state()).unreadableSearches.length, 0);
+        assert.equal((await f.state()).state, "running");
+      } else {
+        const extra = ["login-required", "verification-required"].includes(scenario) ? { outcome: "blocked", reason: scenario } :
+          scenario === "wrong-stage" ? { diagnostic: { ...failure.diagnostic, stage: "reading-page" } } : {};
+        assert.equal((await f.result(command, { ...failure, ...extra })).statusCode, 200);
+        assert.equal((await f.state()).state, "blocked");
+        assert.equal((await f.state()).unreadableSearches.length, 0);
+        assert.equal((await f.state()).scored, 0);
+      }
+      assert.equal(f.store.applications().length, 0);
+    } finally { await f.close(); }
+  }
+});
+
 async function fixture(scoreJob: (id: string, signal: AbortSignal) => Promise<Assessment> = async () => ({ decision: "eligible" }) as Assessment) {
   const store = new Store(":memory:");
   let time = Date.UTC(2026, 0, 1), fingerprint = "private-resume-provider-key";
